@@ -16,16 +16,16 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 # Implementation Checklist
 
 ## 1. Core Rendering Pipeline
-- [ ] Device query + context setup (print GPU name, compute capability, SM count)
-- [ ] `vec3`/`float3` math library (add/sub/scale/dot/cross/normalize/reflect/refract)
-- [ ] `ray` type + camera-to-ray generation
+- [ x ] Device query + context setup (print GPU name, compute capability, SM count)
+- [ x ] `vec3`/`float3` math library (add/sub/scale/dot/cross/normalize/reflect/refract)
+- [ x ] `ray` type + camera-to-ray generation
 - [ ] Pinhole camera (position, look-at, FOV, aspect ratio)
 - [ ] Thin-lens camera model — aperture + focus distance (depth of field)
 - [ ] HDR framebuffer (float3/float4 per pixel), accumulated across samples
 - [ ] Progressive rendering loop (N samples/pixel, accumulate + save incrementally)
 
 ## 2. Scene Representation & Acceleration Structures
-- [ ] Primitive types: sphere, and at least one more (triangle recommended — opens the door to real meshes)
+- [ x ] Primitive types: sphere, and at least one more 
 - [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access
 - [ ] BVH construction (host-side) — even a simple median-split builder is fine
 - [ ] BVH traversal (device-side, iterative, stack-based — no recursion)
@@ -66,7 +66,6 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] **(stretch)** Simple denoiser pass (even a basic bilateral/edge-aware filter counts) to demonstrate you understand the variance-reduction vs. denoising trade-off
 
 ## 7. Tooling & Validation
-- [ ] Reference comparison against the CPU RayTracer project (pixel diff on a shared test scene) to catch correctness bugs, not just "looks right"
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [ ] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo
 - [ ] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag)
