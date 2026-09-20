@@ -19,10 +19,10 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ x ] Device query + context setup (print GPU name, compute capability, SM count)
 - [ x ] `vec3`/`float3` math library (add/sub/scale/dot/cross/normalize/reflect/refract)
 - [ x ] `ray` type + camera-to-ray generation
-- [ ] Pinhole camera (position, look-at, FOV, aspect ratio)
-- [ ] Thin-lens camera model — aperture + focus distance (depth of field)
-- [ ] HDR framebuffer (float3/float4 per pixel), accumulated across samples
-- [ ] Progressive rendering loop (N samples/pixel, accumulate + save incrementally)
+- [ x ] Pinhole camera (position, look-at, FOV, aspect ratio)
+- [ x ] Thin-lens camera model — aperture + focus distance (depth of field)
+- [ x ] HDR framebuffer (float3/float4 per pixel), accumulated across samples
+- [ x ] Progressive rendering loop (N samples/pixel, accumulate + save incrementally)
 
 ## 2. Scene Representation & Acceleration Structures
 - [ x ] Primitive types: sphere, and at least one more 
