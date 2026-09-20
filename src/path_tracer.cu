@@ -4,8 +4,10 @@
     #include <cstdio>
     #include <cstdlib>
     #include <iostream>
-    #include "cuda_runtime.h"
     #include <vector>
+    #include "cuda_runtime.h"
+    #include <curand_kernel.h>
+    
 
     #define MONOCUDA_PI 3.14159265358979323846f
     // ==============================================================================
@@ -118,9 +120,11 @@
 
     struct triangle {
         vec3 v0, v1, v2;
+        vec3 albedo;
 
         __host__ __device__ triangle() {}
         __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_) : v0(v0_), v1(v1_), v2(v2_) {}
+        __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_,vec3 albedo_) : v0(v0_), v1(v1_), v2(v2_), albedo(albedo_) {}
     };
     __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
         vec3 edge1 = tri.v1 - tri.v0;
@@ -153,10 +157,11 @@
     struct sphere {
         vec3 center;
         float radius;
-        
+        vec3 albedo;
 
         __host__ __device__ sphere(){}
         __host__ __device__ sphere(vec3 center_,double radius_) : center(center_), radius(radius_){}
+        __host__ __device__ sphere(vec3 center_,double radius_,vec3 albedo_) : center(center_), radius(radius_), albedo(albedo_){} 
     };
 
     __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float& intersectionDistance) {
@@ -197,6 +202,7 @@
         float closestDistance = 1e30f;
         vec3 hitPoint;
         vec3 hitNormal;
+        vec3 albedo;
     };
 
     __device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
@@ -212,6 +218,7 @@
                     nearestHit.closestDistance = t;
                     nearestHit.hitPoint = rayOrig + rayDir * t;
                     nearestHit.hitNormal = (nearestHit.hitPoint - sphereArray[i].center).normalize();
+                    nearestHit.albedo = sphereArray[i].albedo;
                 }
             }
         }
@@ -223,6 +230,7 @@
                 nearestHit.didHit = true;
                 nearestHit.closestDistance = t;
                 nearestHit.hitPoint = rayOrig + rayDir * t;
+                nearestHit.albedo = triangleArray[i].albedo;
 
                 vec3 edge1 = triangleArray[i].v1 - triangleArray[i].v0;
                 vec3 edge2 = triangleArray[i].v2 - triangleArray[i].v0;
@@ -249,7 +257,7 @@
 
     class Camera {
     public:
-        float aspec_ratio = 1.f;
+        float aspect_ratio = 1.f;
         int image_width = 100;
         int image_height;
         int samples_per_pixel = 10;
@@ -265,6 +273,8 @@
         vec3 pixel_delta_u, pixel_delta_v;
         vec3 u, v, w;
 
+        float aperture;
+        float lens_radius;
         float focus_distance = 10;
 
         __host__ __device__ Camera(){}
@@ -273,8 +283,8 @@
             w = (look_from - look_at).normalize();
             u = up.cross(w).normalize();
             v = w.cross(u);
-
-            image_height = int(image_width / aspec_ratio);
+            lens_radius = aperture / 2.;
+            image_height = int(image_width / aspect_ratio);
             center = look_from;
 
             float theta = degrees_to_radians(vfov);
@@ -292,10 +302,26 @@
             pixel00_location = viewport_upper_left + (pixel_delta_u + pixel_delta_v) * 0.5f;
         }
 
-        __device__ ray getRay(int i,int j) const{
-            vec3 pixelCenter = pixel00_location + (pixel_delta_u * float(i)) + (pixel_delta_v * float(j));
-            vec3 rayDirection = (pixelCenter - center).normalize();
-            return ray(center,rayDirection);
+        __device__ vec3 random_in_unit_disk(curandState* rngState) const{
+            while(true){
+                    float randomX = curand_uniform(rngState) * 2.f - 1.f;
+                    float randomY = curand_uniform(rngState) * 2.f - 1.f;
+                    vec3 candidatePoint = vec3(randomX,randomY,0.0f);
+                    if(candidatePoint.length_squared() < 1.0f){
+                        return candidatePoint;
+                    }
+            }
+        }
+
+        __device__ ray getRay(int pixelX,int pixelY,curandState* rngState) const{
+            vec3 pixelCenter = pixel00_location + (pixel_delta_u * float(pixelX)) + (pixel_delta_v * float(pixelY));
+            
+            vec3 randomPointOnLens = random_in_unit_disk(rngState) * lens_radius;
+            vec3 lensOffSetInWorldSpace = u * randomPointOnLens.x + v * randomPointOnLens.y;
+            vec3 rayOriginOnLens = center + lensOffSetInWorldSpace;
+
+            vec3 rayDirection = (pixelCenter - rayOriginOnLens).normalize();
+            return ray(rayOriginOnLens,rayDirection);
         }
     };
 
@@ -315,11 +341,12 @@
     __host__ hostScene setup_scene() {
         hostScene scene;
 
-        scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f));
-        scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f));
-        scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f));
+        scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f, vec3(0.8f, 0.3f, 0.3f)));   // red
+        scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, vec3(0.3f, 0.3f, 0.8f)));   // blue
+        scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, vec3(0.8f, 0.8f, 0.3f)));  // yellow
+        scene.spheres.push_back(sphere(vec3(0, -100.5f, -1), 100.0f, vec3(0.5f, 1.0f, 0.5f)));  // green floor
 
-        scene.triangles.push_back(triangle(vec3(-2,-0.5,-2), vec3(2,-0.5,-2), vec3(0,2,-2)));
+        scene.triangles.push_back(triangle(vec3(-2,-0.5,-2), vec3(2,-0.5,-2), vec3(0,2,-2), vec3(0.9f, 0.6f, 0.2f)));  // orange
 
         return scene;
     }
@@ -330,21 +357,31 @@
     // === RENDER ===
     // ============================================================================
 
-    __global__ void render_kernel(vec3* h_fb,Camera camera,sphere* spheres,int sphereCount,triangle* triangles,int triangleCount,int maximumX, int maximumY ){
+    __global__ void render_kernel(vec3* h_fb,Camera camera,sphere* spheres,int sphereCount,triangle* triangles,int triangleCount
+                                    ,int maximumX, int maximumY,unsigned long long seed ){
         int i = threadIdx.x + blockIdx.x * blockDim.x;
         int j = threadIdx.y + blockIdx.y * blockDim.y;
         
         if((i >= maximumX) || (j >= maximumY)) return;
-        ray r = camera.getRay(i,j);
-        hitRecord hit = find_nearest_hit(r.origin, r.direction,spheres, sphereCount,triangles, triangleCount);
         int pixel_index = maximumX * j + i;
-        if (hit.didHit) {
-            h_fb[pixel_index] = (hit.hitNormal + vec3(1.0f, 1.0f, 1.0f)) * 0.5f;
-        } else {
-            vec3 unitDir = r.direction.normalize();
-            float t = 0.5f * (unitDir.y + 1.0f);
-            h_fb[pixel_index] = vec3(1.0f, 1.0f, 1.0f) * (1.0f - t) + vec3(0.5f, 0.7f, 1.0f) * t;
+
+        curandState rngState;
+        curand_init(seed, pixel_index, 0, &rngState);
+
+        vec3 pixelColor(0.0f, 0.0f, 0.0f);
+        for (int s = 0; s < camera.samples_per_pixel; s++) {
+            ray r = camera.getRay(i, j, &rngState);
+            hitRecord hit = find_nearest_hit(r.origin, r.direction, spheres, sphereCount, triangles, triangleCount);
+
+            if (hit.didHit) {
+                pixelColor = pixelColor + hit.albedo;
+            } else {
+                vec3 unitDir = r.direction.normalize();
+                float t = 0.5f * (unitDir.y + 1.0f);
+                pixelColor = pixelColor + vec3(1.0f, 1.0f, 1.0f) * (1.0f - t) + vec3(0.5f, 0.7f, 1.0f) * t;
+            }
         }
+        h_fb[pixel_index] = pixelColor / float(camera.samples_per_pixel);
     }
     // ============================================================================
 
@@ -374,7 +411,7 @@
 
         // initialize camera
         Camera cam;
-        cam.aspec_ratio = numberOfPixels_X / float(numberOfPixels_Y);
+        cam.aspect_ratio = numberOfPixels_X / float(numberOfPixels_Y);
         cam.image_width = numberOfPixels_X;
         cam.samples_per_pixel = 50;
         cam.max_depth = 20;
@@ -382,8 +419,11 @@
         cam.look_from = vec3(0, 1, 3);
         cam.look_at = vec3(0, 0, 0);
         cam.up = vec3(0, 1, 0);
+        cam.aperture = 0.1f;
+        cam.focus_distance = 3.5f;
         cam.initialize();
 
+        // scene setup
         hostScene scene = setup_scene();
 
         // call the render_kernel
@@ -397,7 +437,7 @@
         CUDA_CHECK(cudaMalloc(&d_triangles, triangleCount * sizeof(triangle)));
         CUDA_CHECK(cudaMemcpy(d_triangles, scene.triangles.data(),triangleCount * sizeof(triangle), cudaMemcpyHostToDevice));
 
-        render_kernel<<<grid, block>>>(device_frameBuffer, cam,d_spheres, sphereCount,d_triangles, triangleCount,numberOfPixels_X, numberOfPixels_Y);
+        render_kernel<<<grid, block>>>(device_frameBuffer, cam,d_spheres, sphereCount,d_triangles, triangleCount,numberOfPixels_X, numberOfPixels_Y,1234ULL);
         CUDA_CHECK_KERNEL();
         CUDA_CHECK(cudaMemcpy(host_frameBuffer,device_frameBuffer,frameBufferSize,cudaMemcpyDeviceToHost));
 
