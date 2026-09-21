@@ -1,6 +1,5 @@
 build/
 *.ppm
-*.png
 *.o
 *.obj
 *.exe
