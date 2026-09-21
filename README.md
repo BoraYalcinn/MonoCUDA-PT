@@ -34,7 +34,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] **(stretch)** Basic OBJ mesh loading so you can render more than primitives
 
 ## 3. Materials / BSDFs
-- [ ] Lambertian (diffuse) BSDF — cosine-weighted hemisphere sampling
+- [ x ] Lambertian (diffuse) BSDF — cosine-weighted hemisphere sampling
 - [ ] Specular/mirror reflection
 - [ ] Dielectric (glass) BSDF — Fresnel + refraction (Schlick approximation)
 - [ ] Rough conductor (metal) BSDF — at least a fuzz/roughness parameter
@@ -43,7 +43,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] **(stretch)** Energy-conserving material blending (e.g. dielectric-coated diffuse)
 
 ## 4. Light Transport & Sampling
-- [ ] Monte Carlo path integration — iterative bounce loop, not recursive
+- [ x ] Monte Carlo path integration — iterative bounce loop, not recursive
 - [ ] Russian roulette path termination (unbiased early exit)
 - [ ] Next event estimation (NEE) — explicitly sample lights each bounce instead of relying on BSDF sampling alone to find them
 - [ ] Multiple importance sampling (MIS) between light sampling and BSDF sampling — this is the single biggest noise-reduction feature a "real" path tracer has that a weekend project usually skips
