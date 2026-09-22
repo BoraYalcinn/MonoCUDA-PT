@@ -1,4 +1,8 @@
 // ==============================================================================
+// This project is fully written by Bora Yalçın (Undergraduate CSE Student at Yeditepe University)
+// Checkout out my website for related blogs : https://borayalcinn.github.io/
+// Checkout the related repository           : https://github.com/BoraYalcinn/MonoCUDA-PT 
+// ==============================================================================
 // === INCLUDE AND MACROS ===
 // ==============================================================================
 #include <cstdio>
@@ -92,14 +96,14 @@ class vec3{
         }
 
         __host__ __device__ float length() const {
-            return __sqrtf(this->length_squared());
+            return sqrtf(this->length_squared());
         }
 
         __host__ __device__ vec3 cross(const vec3& other) const {
             return { y*other.z - z*other.y ,
                     z*other.x - x*other.z ,
                     x*other.y - y*other.x}; 
-            }
+        }
         __host__ __device__ float dot(const vec3& other) const {
             return x*other.x + y*other.y + z*other.z;
         }
@@ -108,6 +112,29 @@ class vec3{
             float length = sqrtf(this->length_squared());
             return vec3{x/length,y/length,z/length};
         }
+
+        __host__ __device__ vec3 reflect(const vec3& surfaceNormal) {
+            return *this - surfaceNormal * (2.0f * this->dot(surfaceNormal));
+        }
+
+        __host__ __device__ vec3 refract(const vec3& surfaceNormal,float refraction_cof){
+            vec3 direction = this->normalize();
+            float cosTheta1 = fminf((-direction).dot(surfaceNormal), 1.0f);   // acos'a güvenli argüman
+            float theta1 = acosf(cosTheta1);
+
+            float sinTheta2 = sinf(theta1) / refraction_cof; 
+            if (sinTheta2 > 1.0f) {
+                return direction.reflect(surfaceNormal);   
+            }
+            float theta2 = asinf(sinTheta2);
+            vec3 tangent = direction + surfaceNormal * cosTheta1;
+            float tangentLength = tangent.length();
+            if (tangentLength > 1e-8f) {
+                tangent = tangent / tangentLength;
+            }
+
+            return tangent * sinf(theta2) - surfaceNormal * cosf(theta2);
+        }
 };
 
 // ============================================================================
@@ -115,6 +142,12 @@ class vec3{
 // ============================================================================
 // === MATERIALS ===
 // ============================================================================
+__device__ float schlick_approx(float cosine,float refraction_cof){
+    float r0 = (1.f - refraction_cof) / (1.f + refraction_cof);
+    r0 *= r0;
+    return r0 + (1.f - r0) * powf((1-cosine),5.f); 
+}
+
 enum class MaterialType {Lambertian, Dielectric, Conductor,Emissive};
 
 struct Material{
@@ -148,6 +181,28 @@ __device__ vec3 lambertian_scatter_direction(const vec3& surfaceNormal, curandSt
     }
     return randomDirection.normalize();
 }
+
+__device__ vec3 specular_scatter_direction(const vec3& incomingLightDirection,const vec3& surfaceNormal){
+    return incomingLightDirection.normalize().reflect(surfaceNormal);
+}
+
+__device__ vec3 dielectric_scatter_direction(const vec3& incomingLightDirection,const vec3& surfaceNormal,float refraction_cof,curandState* rngState){
+    vec3 unitDirection = incomingLightDirection.normalize();
+    float cosTheta = fminf((-unitDirection).dot(surfaceNormal), 1.0f);
+    float sinTheta = sqrtf(1.0f - cosTheta * cosTheta);
+
+    bool cannotRefract = (refraction_cof * sinTheta) > 1.0f;
+    float reflectProbability;
+    if(cannotRefract){
+        reflectProbability = 1.0f;
+    }else{
+        schlick_approx(cosTheta, refraction_cof);
+    }
+    if (curand_uniform(rngState) < reflectProbability) {
+        return unitDirection.reflect(surfaceNormal);
+    }
+    return unitDirection.refract(surfaceNormal, refraction_cof);
+}
 // ============================================================================
 
 
@@ -161,12 +216,11 @@ __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
 
 struct triangle {
     vec3 v0, v1, v2;
-    vec3 albedo;
     Material mat;
 
     __host__ __device__ triangle() {}
     __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_) : v0(v0_), v1(v1_), v2(v2_) {}
-    __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_,vec3 albedo_) : v0(v0_), v1(v1_), v2(v2_), albedo(albedo_) {}
+    __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_,Material mat_) : v0(v0_), v1(v1_), v2(v2_), mat(mat_) {}
 };
 __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
     vec3 edge1 = tri.v1 - tri.v0;
@@ -199,15 +253,14 @@ __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3&
 struct sphere {
     vec3 center;
     float radius;
-    vec3 albedo;
     Material mat;
 
     __host__ __device__ sphere(){}
     __host__ __device__ sphere(vec3 center_,double radius_) : center(center_), radius(radius_){}
-    __host__ __device__ sphere(vec3 center_,double radius_,vec3 albedo_) : center(center_), radius(radius_), albedo(albedo_){} 
+    __host__ __device__ sphere(vec3 center_,double radius_,Material mat_) : center(center_), radius(radius_), mat(mat_){} 
 };
 
-__device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float& intersectionDistance) {
+__device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float& intersectionDistance,bool& frontFace, vec3& outwardNormal) {
     vec3 vectorFromRayOriginToSphereCenter = targetSphere.center - rayOrigin;
     float distanceToClosestPointOnRay =  vectorFromRayOriginToSphereCenter.dot(rayDirection) / rayDirection.dot(rayDirection);
     vec3 closestPointOnRay = rayOrigin + rayDirection * distanceToClosestPointOnRay;
@@ -219,7 +272,17 @@ __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, con
         return false;   
     }
     float halfChordLength = sqrtf(discriminant);
-    intersectionDistance = distanceToClosestPointOnRay - halfChordLength;
+    float nearRoot = distanceToClosestPointOnRay - halfChordLength;
+    float farRoot = distanceToClosestPointOnRay + halfChordLength;
+    float t = nearRoot;
+    if (t < 0.0001f) t = farRoot;      // if ray starts from inside
+    if (t < 0.0001f) return false;
+
+    vec3 hitPoint = rayOrigin + rayDirection * t;
+    outwardNormal = (hitPoint - targetSphere.center).normalize();
+    frontFace = rayDirection.dot(outwardNormal) < 0.0f;   // is ray coming from outside
+
+    intersectionDistance = t;
     return true;
 }
 // ============================================================================
@@ -245,7 +308,8 @@ struct hitRecord{
     float closestDistance = 1e30f;
     vec3 hitPoint;
     vec3 hitNormal;
-    vec3 albedo;
+    Material mat;
+    bool frontFace = true;
 };
 
 __device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
@@ -253,15 +317,23 @@ __device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
                                         const triangle* triangleArray,const int triangleCount){
     hitRecord nearestHit;
 
+    bool frontFace;
+    vec3 outwardNormal;
     for(int i = 0; i < sphereCount;i++ ){
         float t;
-        if(hit_sphere(sphereArray[i],rayOrig,rayDir,t)){
+        if(hit_sphere(sphereArray[i],rayOrig,rayDir,t,frontFace,outwardNormal)){
             if(t < nearestHit.closestDistance && t > 0.0001f){
                 nearestHit.didHit = true;
                 nearestHit.closestDistance = t;
                 nearestHit.hitPoint = rayOrig + rayDir * t;
                 nearestHit.hitNormal = (nearestHit.hitPoint - sphereArray[i].center).normalize();
-                nearestHit.albedo = sphereArray[i].albedo;
+                nearestHit.mat = sphereArray[i].mat;
+                nearestHit.frontFace = frontFace;
+                if(frontFace){
+                    nearestHit.hitNormal = outwardNormal;
+                }else{
+                    nearestHit.hitNormal = -outwardNormal;
+                }
             }
         }
     }
@@ -273,7 +345,7 @@ __device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
             nearestHit.didHit = true;
             nearestHit.closestDistance = t;
             nearestHit.hitPoint = rayOrig + rayDir * t;
-            nearestHit.albedo = triangleArray[i].albedo;
+            nearestHit.mat = triangleArray[i].mat;
 
             vec3 edge1 = triangleArray[i].v1 - triangleArray[i].v0;
             vec3 edge2 = triangleArray[i].v2 - triangleArray[i].v0;
@@ -379,12 +451,16 @@ struct hostScene {
 __host__ hostScene setup_scene() {
     hostScene scene;
 
-    scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f, vec3(0.8f, 0.3f, 0.3f)));   // red
-    scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, vec3(0.3f, 0.3f, 0.8f)));   // blue
-    scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, vec3(0.8f, 0.8f, 0.3f)));  // yellow
-    scene.spheres.push_back(sphere(vec3(0, -100.5f, -1), 100.0f, vec3(0.5f, 1.0f, 0.5f)));  // green floor
+    Material redDiffuse{MaterialType::Lambertian, vec3(0.8f,0.3f,0.3f), vec3(0,0,0), 0.f, 0.f};
+    Material groundMat{MaterialType::Lambertian, vec3(0.5f,1.0f,0.5f), vec3(0,0,0), 0.f, 0.f};
+    Material mirrorMat{MaterialType::Conductor, vec3(0.9f,0.9f,0.9f), vec3(0,0,0), 0.f, 0.f};
+    Material glassMat{MaterialType::Dielectric, vec3(1.0f,1.0f,1.0f), vec3(0,0,0), 0.f, 1.5f};
 
-    scene.triangles.push_back(triangle(vec3(-2,-0.5,-2), vec3(2,-0.5,-2), vec3(0,2,-2), vec3(0.9f, 0.6f, 0.2f)));  // orange
+    scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f, redDiffuse));
+    scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, mirrorMat));
+    scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, glassMat));
+    scene.spheres.push_back(sphere(vec3(0, -100.5f, -1), 100.0f, groundMat));
+
 
     return scene;
 }
@@ -420,7 +496,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* sph
             sampleColor = attenuation * skyColor;
             break;
         }
-        attenuation =  attenuation * hit.albedo;
+        attenuation =  attenuation * hit.mat.albedo;
         if(depth > 3){
             float maxComponent = fmaxf(attenuation.x , fmaxf(attenuation.y,attenuation.z)); 
             float continueProbability =  fminf(maxComponent,0.95f);
@@ -429,10 +505,27 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* sph
             attenuation = attenuation / continueProbability;
         }
 
-        vec3 newDirection = lambertian_scatter_direction(hit.hitNormal, &rngState);
+        vec3 newDirection;
+        switch (hit.mat.type) {
+            case MaterialType::Conductor:
+                newDirection = specular_scatter_direction(r.direction, hit.hitNormal);
+                break;
+            case MaterialType::Dielectric:
+                float ratio;
+                if(hit.frontFace){
+                    ratio = 1.0f / hit.mat.refractionIndex;
+                }else{
+                    ratio = hit.mat.refractionIndex;
+                }
+                newDirection = dielectric_scatter_direction(r.direction, hit.hitNormal, ratio, &rngState);
+                break;
+            case MaterialType::Lambertian:
+            default:
+                newDirection = lambertian_scatter_direction(hit.hitNormal, &rngState);
+                break;
+        }
         r = Ray(hit.hitPoint, newDirection);
     }
-
     accumBuffer[pixel_index] = accumBuffer[pixel_index] + sampleColor;
 }
 
@@ -476,12 +569,12 @@ int main() {
     cam.image_width = numberOfPixels_X;
     cam.samples_per_pixel = 50;
     cam.max_depth = 20;
-    cam.vfov = 90.0f;
-    cam.look_from = vec3(0, 1, 2);
-    cam.look_at = vec3(0, 0, 0);
+    cam.vfov = 50.0f;
+    cam.look_from = vec3(0, 0.5f, 1.6f);   
+    cam.look_at = vec3(0, 0, -1);           
     cam.up = vec3(0, 1, 0);
     cam.aperture = 0.1f;
-    cam.focus_distance = 3.5f;
+    cam.focus_distance = 1.8f;
     cam.initialize();
 
     // scene setup
