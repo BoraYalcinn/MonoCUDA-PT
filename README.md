@@ -35,7 +35,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 
 ## 3. Materials / BSDFs
 - [ x ] Lambertian (diffuse) BSDF — cosine-weighted hemisphere sampling
-- [ ] Specular/mirror reflection
+- [ x ] Specular/mirror reflection
 - [ ] Dielectric (glass) BSDF — Fresnel + refraction (Schlick approximation)
 - [ ] Rough conductor (metal) BSDF — at least a fuzz/roughness parameter
 - [ ] Emissive materials (area light sources built from geometry)
@@ -44,9 +44,9 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 
 ## 4. Light Transport & Sampling
 - [ x ] Monte Carlo path integration — iterative bounce loop, not recursive
-- [ ] Russian roulette path termination (unbiased early exit)
+- [ x ] Russian roulette path termination (unbiased early exit)
 - [ ] Next event estimation (NEE) — explicitly sample lights each bounce instead of relying on BSDF sampling alone to find them
-- [ ] Multiple importance sampling (MIS) between light sampling and BSDF sampling — this is the single biggest noise-reduction feature a "real" path tracer has that a weekend project usually skips
+- [ ] Multiple importance sampling (MIS) between light sampling and BSDF sampling 
 - [ ] Cosine-weighted / importance-sampled BSDF sampling (not uniform hemisphere)
 - [ ] **(stretch)** Environment map (HDRI) lighting with importance sampling
 - [ ] **(stretch)** Stratified or low-discrepancy sampling (e.g. Sobol/blue-noise) instead of pure `curand` uniform — measurably reduces noise at equal sample count
