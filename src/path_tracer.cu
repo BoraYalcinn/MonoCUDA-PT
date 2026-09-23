@@ -121,7 +121,7 @@ class vec3{
             float theta1 = acosf(cosTheta1);
 
             float sinTheta2 = sinf(theta1) * refraction_cof; 
-            if (sinTheta2 < 1.f) {
+            if (sinTheta2 > 1.f) {
                 return direction.reflect(surfaceNormal);   
             }
             float theta2 = asinf(sinTheta2);
@@ -589,11 +589,12 @@ int main() {
     cam.samples_per_pixel = 50;
     cam.max_depth = 20;
     cam.vfov = 50.0f;
-    cam.look_from = vec3(0, 0.5f, 1.6f);   
-    cam.look_at = vec3(0, 0, -1);           
-    cam.up = vec3(0, 1, 0);
+    cam.look_from = vec3(-1.9f, 0.6f, 1.2f);   
+    cam.look_at = vec3(0, 0, -1);               
+    cam.vfov = 45.0f;
+    cam.focus_distance = 2.73f;                 
     cam.aperture = 0.1f;
-    cam.focus_distance = 1.8f;
+  
     cam.initialize();
 
     // scene setup
