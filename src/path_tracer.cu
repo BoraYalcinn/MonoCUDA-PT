@@ -71,8 +71,6 @@ void fetchDeviceInfo(){
 // ============================================================================
 
 
-
-
 // ============================================================================
 // === MATH CLASSES ===
 // ============================================================================
@@ -119,11 +117,11 @@ class vec3{
 
         __host__ __device__ vec3 refract(const vec3& surfaceNormal,float refraction_cof){
             vec3 direction = this->normalize();
-            float cosTheta1 = fminf((-direction).dot(surfaceNormal), 1.0f);   // acos'a güvenli argüman
+            float cosTheta1 = fminf((-direction).dot(surfaceNormal), 1.0f);   
             float theta1 = acosf(cosTheta1);
 
-            float sinTheta2 = sinf(theta1) / refraction_cof; 
-            if (sinTheta2 > 1.0f) {
+            float sinTheta2 = sinf(theta1) * refraction_cof; 
+            if (sinTheta2 < 1.f) {
                 return direction.reflect(surfaceNormal);   
             }
             float theta2 = asinf(sinTheta2);
@@ -144,7 +142,7 @@ class vec3{
 // ============================================================================
 __device__ float schlick_approx(float cosine,float refraction_cof){
     float r0 = (1.f - refraction_cof) / (1.f + refraction_cof);
-    r0 *= r0;
+    r0 = r0 * r0;
     return r0 + (1.f - r0) * powf((1-cosine),5.f); 
 }
 
@@ -196,19 +194,37 @@ __device__ vec3 dielectric_scatter_direction(const vec3& incomingLightDirection,
     if(cannotRefract){
         reflectProbability = 1.0f;
     }else{
-        schlick_approx(cosTheta, refraction_cof);
+        reflectProbability = schlick_approx(cosTheta, refraction_cof);
     }
     if (curand_uniform(rngState) < reflectProbability) {
         return unitDirection.reflect(surfaceNormal);
     }
     return unitDirection.refract(surfaceNormal, refraction_cof);
 }
+
+// Constructors for material types
+__host__ __device__ Material make_lambertian(vec3 albedo) {
+    return Material{MaterialType::Lambertian, albedo, vec3(0,0,0), 0.f, 0.f};
+}
+
+__host__ __device__ Material make_conductor(vec3 albedo, float fuzz) {
+    return Material{MaterialType::Conductor, albedo, vec3(0,0,0), fuzz < 1 ? fuzz : 1.f, 0.f};
+}
+
+__host__ __device__ Material make_dielectric(float refractionIndex) {
+    return Material{MaterialType::Dielectric, vec3(1,1,1), vec3(0,0,0), 0.f, refractionIndex};
+}
+
+__host__ __device__ Material make_emissive(vec3 emittedColor) {
+    return Material{MaterialType::Emissive, vec3(0,0,0), emittedColor, 0.f, 0.f};
+}
+
 // ============================================================================
 
 
 
 // ============================================================================
-// === Mesh & Primitive Types ===
+// === MESH & PRIMITIVE TYPES ===
 // ============================================================================
 __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
@@ -370,7 +386,7 @@ public:
     float aspect_ratio = 1.f;
     int image_width = 100;
     int image_height;
-    int samples_per_pixel = 10;
+    int samples_per_pixel = 20;
     int max_depth = 10;
 
     float vfov = 90.f;
@@ -451,10 +467,10 @@ struct hostScene {
 __host__ hostScene setup_scene() {
     hostScene scene;
 
-    Material redDiffuse{MaterialType::Lambertian, vec3(0.8f,0.3f,0.3f), vec3(0,0,0), 0.f, 0.f};
-    Material groundMat{MaterialType::Lambertian, vec3(0.5f,1.0f,0.5f), vec3(0,0,0), 0.f, 0.f};
-    Material mirrorMat{MaterialType::Conductor, vec3(0.9f,0.9f,0.9f), vec3(0,0,0), 0.f, 0.f};
-    Material glassMat{MaterialType::Dielectric, vec3(1.0f,1.0f,1.0f), vec3(0,0,0), 0.f, 1.5f};
+    Material redDiffuse = make_lambertian(vec3(0.8f, 0.3f, 0.3f));
+    Material groundMat  = make_lambertian(vec3(0.5f, 1.0f, 0.5f));
+    Material mirrorMat  = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.3f);
+    Material glassMat   = make_dielectric(1.5f);
 
     scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f, redDiffuse));
     scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, mirrorMat));
@@ -507,10 +523,12 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* sph
 
         vec3 newDirection;
         switch (hit.mat.type) {
-            case MaterialType::Conductor:
-                newDirection = specular_scatter_direction(r.direction, hit.hitNormal);
+            case MaterialType::Conductor:{
+                vec3 reflected = specular_scatter_direction(r.direction, hit.hitNormal);
+                newDirection = (reflected + random_unit_vector(&rngState) * hit.mat.fuzz).normalize();
                 break;
-            case MaterialType::Dielectric:
+            }
+            case MaterialType::Dielectric:{
                 float ratio;
                 if(hit.frontFace){
                     ratio = 1.0f / hit.mat.refractionIndex;
@@ -519,6 +537,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* sph
                 }
                 newDirection = dielectric_scatter_direction(r.direction, hit.hitNormal, ratio, &rngState);
                 break;
+            }
             case MaterialType::Lambertian:
             default:
                 newDirection = lambertian_scatter_direction(hit.hitNormal, &rngState);
@@ -623,9 +642,16 @@ int main() {
     for (int j = 0; j < numberOfPixels_Y; j++) {
         for (int i = 0; i < numberOfPixels_X; i++) {
             size_t pixel_index = numberOfPixels_X * j + i;
-            int r = int(255.99 * host_frameBuffer[pixel_index].x);
-            int g = int(255.99 * host_frameBuffer[pixel_index].y);
-            int b = int(255.99 * host_frameBuffer[pixel_index].z);
+            
+            vec3 c = host_frameBuffer[pixel_index];
+            // NaN shield
+            float rf = isfinite(c.x) ? fminf(fmaxf(c.x, 0.0f), 1.0f) : 0.0f;
+            float gf = isfinite(c.y) ? fminf(fmaxf(c.y, 0.0f), 1.0f) : 0.0f;
+            float bf = isfinite(c.z) ? fminf(fmaxf(c.z, 0.0f), 1.0f) : 0.0f;
+
+            int r = int(255.99 * rf);
+            int g = int(255.99 * gf);
+            int b = int(255.99 * bf);
             fprintf(out, "%d %d %d\n", r, g, b);
         }
     }

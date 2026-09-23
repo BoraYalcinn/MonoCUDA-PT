@@ -36,10 +36,10 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 ## 3. Materials / BSDFs
 - [ x ] Lambertian (diffuse) BSDF — cosine-weighted hemisphere sampling
 - [ x ] Specular/mirror reflection
-- [ ] Dielectric (glass) BSDF — Fresnel + refraction (Schlick approximation)
-- [ ] Rough conductor (metal) BSDF — at least a fuzz/roughness parameter
+- [ x ] Dielectric (glass) BSDF — Fresnel + refraction (Schlick approximation)
+- [ x ] Rough conductor (metal) BSDF — at least a fuzz/roughness parameter
 - [ ] Emissive materials (area light sources built from geometry)
-- [ ] **(stretch)** Real microfacet BSDF (GGX distribution) instead of ad-hoc fuzz — this is the actual difference between a toy renderer and a physically based one
+- [ ] **(stretch)** Real microfacet BSDF (GGX distribution) instead of ad-hoc fuzz 
 - [ ] **(stretch)** Energy-conserving material blending (e.g. dielectric-coated diffuse)
 
 ## 4. Light Transport & Sampling
