@@ -259,12 +259,12 @@ public:
     int primitiveCount;
 
 
-    __host__ __device__ void generateHierarchy(){
+    __host__ void generateHierarchy(const unsigned int* sortedMortonCodes, const int* sortedPrimitiveIDs, int primitiveCount){
 
     }
 
-    __host__ __device__ void traverseHierarchy(){
-
+    __device__ void traverseHierarchy(const PrimitiveRef* d_primitiveRefs, int queryObjectIdx) const {
+    
     }
 
     __host__ void free(){
@@ -292,8 +292,11 @@ __host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& righ
     return mergedAABB;
 }
 
-__global__ void findCollisions(const BVH* bvh){
-
+__global__ void findCollisions(const PrimitiveRef* d_primitiveRefs, BVH* d_bvh, int primitiveCount){
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if(idx < primitiveCount){
+        d_bvh->traverseHierarchy(d_primitiveRefs, idx);
+    }
 }
 
 // ============================================================================
@@ -408,6 +411,21 @@ __host__ __device__ inline unsigned int expandBits(const unsigned int point){
         expandedPoint |= (bit << (3 * i));
     }
     return expandedPoint;
+}
+
+__host__ __device__ inline unsigned int quantize(float value, float minVal, float maxVal){
+    float normalized = (value - minVal) / (maxVal - minVal);   
+    return (unsigned int)(normalized * 1023.0f);                
+}
+
+__host__ __device__ inline unsigned int morton3D(const vec3& centroid, const AABB& sceneBounds){
+    unsigned int clampedX = quantize(centroid.x, sceneBounds.minInterval.x, sceneBounds.maxInterval.x);
+    unsigned int clampedY = quantize(centroid.y, sceneBounds.minInterval.y, sceneBounds.maxInterval.y);
+    unsigned int clampedZ = quantize(centroid.z, sceneBounds.minInterval.z, sceneBounds.maxInterval.z);
+    clampedX = expandBits(clampedX);
+    clampedY = expandBits(clampedY);
+    clampedZ = expandBits(clampedZ);
+    return clampedX | clampedY << 1| clampedZ << 2;
 }
 
 // ============================================================================
@@ -569,19 +587,28 @@ public:
 // ============================================================================
 // === SCENE SETUP ===
 // ============================================================================
+struct PrimitiveRef {
+    AABB bounds;
+    vec3 centroid;
+    int  primitiveType;   
+    int  primitiveIndex;  
+    unsigned int mortonCode;   
+};
 
 struct hostScene {
     std::vector<sphere> spheres;
     std::vector<triangle> triangles;
+    std::vector<PrimitiveRef> primitiveRefs;
+    AABB bounds;
 };
 
 __host__ hostScene setup_scene() {
     hostScene scene;
 
     Material redDiffuse = make_lambertian(vec3(0.8f, 0.3f, 0.3f));
-    Material groundMat  = make_lambertian(vec3(0.5f, 1.0f, 0.5f));
-    Material mirrorMat  = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.3f);
-    Material glassMat   = make_dielectric(1.5f);
+    Material groundMat = make_lambertian(vec3(0.5f, 1.0f, 0.5f));
+    Material mirrorMat = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.3f);
+    Material glassMat = make_dielectric(1.5f);
     Material lightMat = make_emissive(vec3(4.0f, 4.0f, 4.0f));
 
     scene.spheres.push_back(sphere(vec3(0, 1.6f, -1), 0.3f, lightMat));
@@ -590,10 +617,34 @@ __host__ hostScene setup_scene() {
     scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, glassMat));
     scene.spheres.push_back(sphere(vec3(0, -100.5f, -1), 100.0f, groundMat));
 
+    for (int i = 0; i < scene.spheres.size(); i++) scene.spheres[i].calculate_bounding_box();
+    for (int i = 0; i < scene.triangles.size(); i++) scene.triangles[i].calculate_bounding_box();
 
+    AABB sceneBounds = scene.spheres[0].aabb;
+    for (int i = 1; i < scene.spheres.size(); i++)   sceneBounds = merge(sceneBounds, scene.spheres[i].aabb);
+    for (int i = 0; i < scene.triangles.size(); i++) sceneBounds = merge(sceneBounds, scene.triangles[i].aabb);
+    scene.bounds = sceneBounds;
+
+    for (int i = 0; i < scene.spheres.size(); i++) {
+        PrimitiveRef ref;
+        ref.bounds = scene.spheres[i].aabb;
+        ref.centroid = scene.spheres[i].center;
+        ref.primitiveType  = 0;
+        ref.primitiveIndex = i;
+        scene.primitiveRefs.push_back(ref);
+        ref.mortonCode = morton3D(ref.centroid,scene.bounds);
+    }
+    for (int i = 0; i < scene.triangles.size(); i++) {
+        PrimitiveRef ref;
+        ref.bounds = scene.triangles[i].aabb;
+        ref.centroid = scene.triangles[i].calculateCentroid();
+        ref.primitiveType  = 1;
+        ref.primitiveIndex = i;
+        scene.primitiveRefs.push_back(ref);
+        ref.mortonCode = morton3D(ref.centroid,scene.bounds);
+    }
     return scene;
 }
-
 // ============================================================================
 
 // ============================================================================
