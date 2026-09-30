@@ -38,7 +38,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ x ] Specular/mirror reflection
 - [ x ] Dielectric (glass) BSDF — Fresnel + refraction (Schlick approximation)
 - [ x ] Rough conductor (metal) BSDF — at least a fuzz/roughness parameter
-- [ ] Emissive materials (area light sources built from geometry)
+- [ x ] Emissive materials (area light sources built from geometry)
 - [ ] **(stretch)** Real microfacet BSDF (GGX distribution) instead of ad-hoc fuzz 
 - [ ] **(stretch)** Energy-conserving material blending (e.g. dielectric-coated diffuse)
 

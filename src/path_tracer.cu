@@ -133,6 +133,10 @@ class vec3{
 
             return tangent * sinf(theta2) - surfaceNormal * cosf(theta2);
         }
+
+        __host__ float calculateDistanceTo(const vec3& other){
+            return sqrtf((x - other.x)*(x - other.x) + (y - other.y)*(y - other.y) + (z - other.z)*(z - other.z));
+        }
 };
 
 // ============================================================================
@@ -222,6 +226,77 @@ __host__ __device__ Material make_emissive(vec3 emittedColor) {
 // ============================================================================
 
 
+// ============================================================================
+// === AABB & BOUNDING VOLUME HIERARCHY ===
+// ============================================================================
+
+class AABB{
+public:
+    vec3 minInterval;
+    vec3 maxInterval;
+    vec3 centroid;
+
+    __host__ __device__ AABB(){}
+    __host__ __device__ AABB(const vec3& minInterval_,const vec3& maxInterval_) : minInterval(minInterval_) , maxInterval(maxInterval_){}
+
+
+};
+
+struct BVH_Node{
+    AABB bounds;
+    int  leftChild;  
+    int  rightChild;
+    int  parent;       
+    int  primitiveIndex; 
+    bool isLeaf;
+};
+
+class BVH{
+
+public:
+    BVH_Node* d_internalNodes = nullptr;
+    BVH_Node* d_leafNode = nullptr; 
+    int primitiveCount;
+
+
+    __host__ __device__ void generateHierarchy(){
+
+    }
+
+    __host__ __device__ void traverseHierarchy(){
+
+    }
+
+    __host__ void free(){
+
+    }
+
+
+};
+
+__host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide){
+    if (leftHandSide.maxInterval.x < rightHandSide.minInterval.x || rightHandSide.maxInterval.x < leftHandSide.minInterval.x) { return false; }
+    if (leftHandSide.maxInterval.y < rightHandSide.minInterval.y || rightHandSide.maxInterval.y < leftHandSide.minInterval.y) { return false; }
+    if (leftHandSide.maxInterval.z < rightHandSide.minInterval.z || rightHandSide.maxInterval.z < leftHandSide.minInterval.z) { return false; }
+    return true;
+}
+
+__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide){
+    AABB mergedAABB;
+    mergedAABB.maxInterval.x = fmaxf(leftHandSide.maxInterval.x ,rightHandSide.maxInterval.x);
+    mergedAABB.maxInterval.y = fmaxf(leftHandSide.maxInterval.y ,rightHandSide.maxInterval.y);
+    mergedAABB.maxInterval.z = fmaxf(leftHandSide.maxInterval.z ,rightHandSide.maxInterval.z);
+    mergedAABB.minInterval.x = fminf(leftHandSide.minInterval.x ,rightHandSide.minInterval.x);
+    mergedAABB.minInterval.y = fminf(leftHandSide.minInterval.y ,rightHandSide.minInterval.y);
+    mergedAABB.minInterval.z = fminf(leftHandSide.minInterval.z ,rightHandSide.minInterval.z);
+    return mergedAABB;
+}
+
+__global__ void findCollisions(const BVH* bvh){
+
+}
+
+// ============================================================================
 
 // ============================================================================
 // === MESH & PRIMITIVE TYPES ===
@@ -233,11 +308,25 @@ __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
 struct triangle {
     vec3 v0, v1, v2;
     Material mat;
+    AABB aabb;
 
     __host__ __device__ triangle() {}
     __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_) : v0(v0_), v1(v1_), v2(v2_) {}
     __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_,Material mat_) : v0(v0_), v1(v1_), v2(v2_), mat(mat_) {}
+
+    __host__ __device__ vec3 calculateCentroid(){
+        return (v0 + v1 + v2)/3.;
+    }
+
+    __host__ __device__ void calculate_bounding_box(){
+    aabb.minInterval = { fminf(v0.x, fminf(v1.x, v2.x)),  fminf(v0.y, fminf(v1.y, v2.y)),fminf(v0.z, fminf(v1.z, v2.z)) };
+    aabb.maxInterval = { fmaxf(v0.x, fmaxf(v1.x, v2.x)),fmaxf(v0.y, fmaxf(v1.y, v2.y)),fmaxf(v0.z, fmaxf(v1.z, v2.z)) };
+    }
+
+    __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
+
+
 __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
     vec3 edge1 = tri.v1 - tri.v0;
     vec3 edge2 = tri.v2 - tri.v0;
@@ -270,10 +359,20 @@ struct sphere {
     vec3 center;
     float radius;
     Material mat;
+    AABB aabb;
 
     __host__ __device__ sphere(){}
     __host__ __device__ sphere(vec3 center_,double radius_) : center(center_), radius(radius_){}
     __host__ __device__ sphere(vec3 center_,double radius_,Material mat_) : center(center_), radius(radius_), mat(mat_){} 
+
+    __host__ __device__ vec3 calculateCentroid(){
+        return center;
+    }
+    __host__ __device__ void calculate_bounding_box(){
+        aabb.minInterval = {(center.x - radius),(center.y - radius),(center.z - radius)};
+        aabb.maxInterval = {(center.x + radius),(center.y + radius),(center.z + radius)};
+    }
+    __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
 
 __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float& intersectionDistance,bool& frontFace, vec3& outwardNormal) {
@@ -301,6 +400,16 @@ __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, con
     intersectionDistance = t;
     return true;
 }
+
+__host__ __device__ inline unsigned int expandBits(const unsigned int point){
+    unsigned int expandedPoint = 0;
+    for(int i = 0; i < 10; i++){
+        unsigned int  bit = (point >> i ) & 1;
+        expandedPoint |= (bit << (3 * i));
+    }
+    return expandedPoint;
+}
+
 // ============================================================================
 
 
@@ -372,6 +481,8 @@ __device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
     return nearestHit;
 }
 // ============================================================================
+
+
 
 
 // ============================================================================
@@ -471,7 +582,9 @@ __host__ hostScene setup_scene() {
     Material groundMat  = make_lambertian(vec3(0.5f, 1.0f, 0.5f));
     Material mirrorMat  = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.3f);
     Material glassMat   = make_dielectric(1.5f);
+    Material lightMat = make_emissive(vec3(4.0f, 4.0f, 4.0f));
 
+    scene.spheres.push_back(sphere(vec3(0, 1.6f, -1), 0.3f, lightMat));
     scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f, redDiffuse));
     scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, mirrorMat));
     scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, glassMat));
@@ -509,10 +622,17 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* sph
             vec3 unitDir = r.direction.normalize();
             float t = 0.5f * (unitDir.y + 1.0f);
             vec3 skyColor = vec3(1.0f, 1.0f, 1.0f) * (1.0f - t) + vec3(0.5f, 0.7f, 1.0f) * t;
-            sampleColor = attenuation * skyColor;
+            sampleColor = sampleColor + attenuation * skyColor;
             break;
         }
+        sampleColor = sampleColor + attenuation * hit.mat.emittedColor;
+
+        if (hit.mat.type == MaterialType::Emissive) {
+            break;   
+        }
+
         attenuation =  attenuation * hit.mat.albedo;
+        
         if(depth > 3){
             float maxComponent = fmaxf(attenuation.x , fmaxf(attenuation.y,attenuation.z)); 
             float continueProbability =  fminf(maxComponent,0.95f);
@@ -588,10 +708,9 @@ int main() {
     cam.image_width = numberOfPixels_X;
     cam.samples_per_pixel = 50;
     cam.max_depth = 20;
-    cam.vfov = 50.0f;
     cam.look_from = vec3(-1.9f, 0.6f, 1.2f);   
     cam.look_at = vec3(0, 0, -1);               
-    cam.vfov = 45.0f;
+    cam.vfov = 70.0f;
     cam.focus_distance = 2.73f;                 
     cam.aperture = 0.1f;
   
