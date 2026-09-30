@@ -25,7 +25,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ x ] Progressive rendering loop (N samples/pixel, accumulate + save incrementally)
 
 ## 2. Scene Representation & Acceleration Structures
-- [ x ] Primitive types: sphere, and at least one more 
+- [ x ] Primitive types: sphere, and at least one more
 - [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access
 - [ ] BVH construction (host-side) — even a simple median-split builder is fine
 - [ ] BVH traversal (device-side, iterative, stack-based — no recursion)
@@ -39,19 +39,42 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ x ] Dielectric (glass) BSDF — Fresnel + refraction (Schlick approximation)
 - [ x ] Rough conductor (metal) BSDF — at least a fuzz/roughness parameter
 - [ x ] Emissive materials (area light sources built from geometry)
-- [ ] **(stretch)** Real microfacet BSDF (GGX distribution) instead of ad-hoc fuzz 
+- [ ] **(stretch)** Real microfacet BSDF (GGX distribution) instead of ad-hoc fuzz
 - [ ] **(stretch)** Energy-conserving material blending (e.g. dielectric-coated diffuse)
 
-## 4. Light Transport & Sampling
+## 4. Textures & Surface Detail
+- [ ] UV coordinates on primitives (spherical mapping for sphere, barycentric for triangle)
+- [ ] Image loading (e.g. `stb_image`) — PNG/JPG/HDR into host memory
+- [ ] Hardware-accelerated sampling via `cudaTextureObject_t` (bilinear filtering on the GPU, not a manual lerp)
+- [ ] Albedo/diffuse texture map, wired into existing materials
+- [ ] **(stretch)** Normal mapping (tangent-space perturbation of the shading normal)
+- [ ] **(stretch)** Roughness/metallic texture maps for the conductor BSDF
+
+## 5. Light Transport & Sampling
 - [ x ] Monte Carlo path integration — iterative bounce loop, not recursive
 - [ x ] Russian roulette path termination (unbiased early exit)
+- [ ] Light list construction — collect emissive primitives from the scene into a separate array
+- [ ] Light sampling — pick a point on a light (solid-angle sampling for sphere, area sampling for triangle) and compute its PDF
+- [ ] Light selection strategy for multiple lights (uniform, or power-weighted)
 - [ ] Next event estimation (NEE) — explicitly sample lights each bounce instead of relying on BSDF sampling alone to find them
-- [ ] Multiple importance sampling (MIS) between light sampling and BSDF sampling 
+- [ ] Multiple importance sampling (MIS) between light sampling and BSDF sampling
 - [ ] Cosine-weighted / importance-sampled BSDF sampling (not uniform hemisphere)
 - [ ] **(stretch)** Environment map (HDRI) lighting with importance sampling
 - [ ] **(stretch)** Stratified or low-discrepancy sampling (e.g. Sobol/blue-noise) instead of pure `curand` uniform — measurably reduces noise at equal sample count
 
-## 5. GPU Architecture-Specific Design
+## 6. Volumetric Rendering
+- [ ] Homogeneous participating media (constant-density fog/smoke)
+- [ ] Ray marching through volume bounds — absorption + scattering along the path
+- [ ] Henyey-Greenstein phase function for scattering direction
+- [ ] **(stretch)** Heterogeneous volumes (3D voxel grid for density — real smoke/cloud data)
+
+## 7. Motion Blur
+- [ ] Per-sample time value on each ray (random within the shutter interval)
+- [ ] Time-interpolated primitive transforms (e.g. `center0`/`center1` lerp'ed by `time` for a moving sphere)
+- [ ] BVH handling for moving primitives — expanded bounding box covering the full motion range
+- [ ] **(stretch)** Proper motion-aware BVH instead of a single expanded box per moving primitive
+
+## 8. GPU Architecture-Specific Design
 - [ ] Iterative (not recursive) kernels throughout — verify with register usage report (`nvcc --ptxas-options=-v`)
 - [ ] Persistent per-pixel RNG state, not reinitialized per sample
 - [ ] Memory access audit: confirm scene/material reads go through `__ldg`/`const __restrict__`
@@ -59,14 +82,13 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything")
 - [ ] **(stretch)** Material-sorted shading — sort active paths by material ID before shading to reduce warp divergence
 
-## 6. Image Output & Post-Processing
+## 9. Image Output & Post-Processing
 - [ ] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp)
 - [ ] Gamma correction (linear → sRGB)
 - [ ] PNG output (not just PPM) so renders are shareable without conversion
 - [ ] **(stretch)** Simple denoiser pass (even a basic bilateral/edge-aware filter counts) to demonstrate you understand the variance-reduction vs. denoising trade-off
 
-## 7. Tooling & Validation
+## 10. Tooling & Validation
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [ ] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo
 - [ ] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag)
-
