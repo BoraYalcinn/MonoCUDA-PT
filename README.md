@@ -27,9 +27,9 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 ## 2. Scene Representation & Acceleration Structures
 - [ x ] Primitive types: sphere, and at least one more
 - [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access
-- [ ] BVH construction (host-side) — even a simple median-split builder is fine
-- [ ] BVH traversal (device-side, iterative, stack-based — no recursion)
-- [ ] Bounding-box (AABB) intersection + slab test
+- [ x ] BVH construction (GPU-side LBVH build via Morton codes + Karras parallel radix-tree algorithm)
+- [ x ] BVH traversal (device-side, iterative, stack-based — no recursion)
+- [ x ] Bounding-box (AABB) intersection + slab test
 - [ ] **(stretch)** SAH (surface area heuristic) BVH build for better traversal quality
 - [ ] **(stretch)** Basic OBJ mesh loading so you can render more than primitives
 
@@ -92,3 +92,11 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [ ] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo
 - [ ] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag)
+
+## References
+
+- Peter Shirley, Trevor David Black, Steve Hollasch — *Ray Tracing in One Weekend* / *Ray Tracing: The Next Week* / *Ray Tracing: The Rest of Your Life* (https://raytracing.github.io/)
+- NVIDIA Developer Blog — "Accelerated Ray Tracing in One Weekend in CUDA" (https://developer.nvidia.com/blog/accelerated-ray-tracing-cuda/)
+- Tero Karras, NVIDIA Developer Blog — "Thinking Parallel, Part II: Tree Traversal on the GPU" (https://developer.nvidia.com/blog/thinking-parallel-part-ii-tree-traversal-gpu/)
+- Tero Karras, NVIDIA Developer Blog — "Thinking Parallel, Part III: Tree Construction on the GPU" (https://developer.nvidia.com/blog/thinking-parallel-part-iii-tree-construction-gpu/)
+- ToruNiina/lbvh (https://github.com/ToruNiina/lbvh) — used as a reference while designing and debugging MonoCUDA-PT's own LBVH construction and traversal; not used as source code

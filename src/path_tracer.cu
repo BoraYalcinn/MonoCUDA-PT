@@ -230,7 +230,7 @@ __host__ __device__ Material make_emissive(vec3 emittedColor) {
 
 
 // ============================================================================
-// === AABB & BOUNDING VOLUME HIERARCHY ===
+// === AABB ===
 // ============================================================================
 
 class AABB{
@@ -244,282 +244,6 @@ public:
 
 
 };
-
-struct BVH_Node{
-    AABB bounds;
-    int  leftChild;  
-    int  rightChild;
-    bool leftIsLeaf;     
-    bool rightIsLeaf;
-    int  parent;       
-    int  primitiveIndex; 
-    bool isLeaf;
-};
-struct PrimitiveRef {
-    AABB bounds;
-    vec3 centroid;
-    int  primitiveType;   
-    int  primitiveIndex;  
-    unsigned int mortonCode;   
-};
-
-// == FORWARD DECLERATIONS =======================================================
-__global__ void buildLeavesKernel(BVH_Node* d_leafNode, const int* sortedPrimitiveIDs, const AABB* sortedBounds, int numObjects);
-__global__ void buildInternalNodesKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, const unsigned int* sortedMortonCodes, int numObjects);
-__global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, int* d_atomicCounters, int numObjects);
-__host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide);   
-__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide);          
-// ===============================================================================
-class BVH{
-
-public:
-    BVH_Node* d_internalNodes = nullptr;
-    BVH_Node* d_leafNode = nullptr; 
-    int primitiveCount;
-
-
-        __host__ void generateHierarchy(const unsigned int* d_sortedMortonCodes, const int* d_sortedPrimitiveIDs,const AABB* d_sortedBounds, int numObjects){
-        primitiveCount = numObjects;
-
-        CUDA_CHECK(cudaMalloc(&d_leafNode, numObjects * sizeof(BVH_Node)));
-        CUDA_CHECK(cudaMalloc(&d_internalNodes, (numObjects - 1) * sizeof(BVH_Node)));
-
-        int* d_atomicCounters;
-        CUDA_CHECK(cudaMalloc(&d_atomicCounters, (numObjects - 1) * sizeof(int)));
-        CUDA_CHECK(cudaMemset(d_atomicCounters, 0, (numObjects - 1) * sizeof(int)));
-
-        int blockSize = 256;
-        buildLeavesKernel<<<(numObjects + blockSize - 1) / blockSize, blockSize>>>(d_leafNode, d_sortedPrimitiveIDs, d_sortedBounds, numObjects);
-        CUDA_CHECK_KERNEL();
-
-        buildInternalNodesKernel<<<(numObjects - 1 + blockSize - 1) / blockSize, blockSize>>>( d_internalNodes, d_leafNode, d_sortedMortonCodes, numObjects);
-        CUDA_CHECK_KERNEL();
-
-        int rootParent = -1;
-        CUDA_CHECK(cudaMemcpy(&d_internalNodes[0].parent, &rootParent, sizeof(int), cudaMemcpyHostToDevice));
-
-        refitBoundsKernel<<<(numObjects + blockSize - 1) / blockSize, blockSize>>>(d_internalNodes, d_leafNode, d_atomicCounters, numObjects);
-        CUDA_CHECK_KERNEL();
-
-        CUDA_CHECK(cudaFree(d_atomicCounters));
-    }
-
-    __device__ void traverseHierarchy(const PrimitiveRef* d_primitiveRefs, int queryObjectIdx, int* d_collisionCounts) const {
-        AABB queryBounds = d_primitiveRefs[queryObjectIdx].bounds;
-        int  querySelfIdx = d_primitiveRefs[queryObjectIdx].primitiveIndex;
-        const int MAX_STACK = 64;
-        int  stackIdx[MAX_STACK];
-        bool stackIsLeaf[MAX_STACK];
-        int  stackPtr = 0;
-
-        int  nodeIdx = 0;      // root = d_internalNodes[0]
-        bool nodeIsLeaf = false;
-
-        while (true) {
-            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
-
-            int  childLIdx = node.leftChild;
-            bool childLIsLeaf = node.leftIsLeaf;
-            int  childRIdx = node.rightChild;
-            bool childRIsLeaf = node.rightIsLeaf;
-
-            AABB childLBounds = childLIsLeaf ? d_leafNode[childLIdx].bounds : d_internalNodes[childLIdx].bounds;
-            AABB childRBounds = childRIsLeaf ? d_leafNode[childRIdx].bounds : d_internalNodes[childRIdx].bounds;
-
-            bool overlapL = intersects(queryBounds, childLBounds);
-            bool overlapR = intersects(queryBounds, childRBounds);
-
-            if (overlapL && childLIsLeaf) {
-                int hitPrimitiveIdx = d_leafNode[childLIdx].primitiveIndex;
-                if (hitPrimitiveIdx != querySelfIdx) {
-                    atomicAdd(&d_collisionCounts[queryObjectIdx], 1);
-                }
-            }
-            if (overlapR && childRIsLeaf) {
-                int hitPrimitiveIdx = d_leafNode[childRIdx].primitiveIndex;
-                if (hitPrimitiveIdx != querySelfIdx) {
-                    atomicAdd(&d_collisionCounts[queryObjectIdx], 1);
-                }
-            }
-
-            bool traverseL = overlapL && !childLIsLeaf;
-            bool traverseR = overlapR && !childRIsLeaf;
-
-            if (!traverseL && !traverseR) {
-                if (stackPtr == 0) break;      // stack boş, bitti
-                stackPtr--;
-                nodeIdx = stackIdx[stackPtr];
-                nodeIsLeaf = stackIsLeaf[stackPtr];
-            } else {
-                if (traverseL && traverseR) {
-                    stackIdx[stackPtr] = childRIdx;
-                    stackIsLeaf[stackPtr] = childRIsLeaf;
-                    stackPtr++;
-                }
-                nodeIdx = traverseL ? childLIdx : childRIdx;
-                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
-            }
-        }
-    }
-
-    __host__ void free(){
-        if (d_internalNodes) CUDA_CHECK(cudaFree(d_internalNodes));
-        if (d_leafNode) CUDA_CHECK(cudaFree(d_leafNode));
-        d_internalNodes = nullptr;
-        d_leafNode = nullptr;
-    }
-
-
-};
-
-
-
-__device__ inline int delta(const unsigned int* sortedMortonCodes, int numObjects, int i, int j){
-    if (j < 0 || j >= numObjects) return -1;
-
-    unsigned int codeI = sortedMortonCodes[i];
-    unsigned int codeJ = sortedMortonCodes[j];
-
-    if (codeI == codeJ){
-        return 32 + __clz((unsigned int)(i ^ j));
-    }
-    return __clz(codeI ^ codeJ);
-}
-
-__device__ inline int2 determineRange(const unsigned int* sortedMortonCodes, int numObjects, int idx){
-    int d = (delta(sortedMortonCodes, numObjects, idx, idx+1) -
-             delta(sortedMortonCodes, numObjects, idx, idx-1)) >= 0 ? 1 : -1;
-
-    int deltaMin = delta(sortedMortonCodes, numObjects, idx, idx - d);
-
-    int lmax = 2;
-    while (delta(sortedMortonCodes, numObjects, idx, idx + lmax * d) > deltaMin){
-        lmax *= 2;
-    }
-
-    int l = 0;
-    for (int t = lmax / 2; t >= 1; t /= 2){
-        if (delta(sortedMortonCodes, numObjects, idx, idx + (l + t) * d) > deltaMin){
-            l += t;
-        }
-    }
-
-    int jdx = idx + l * d;
-    int first = min(idx, jdx);
-    int last  = max(idx, jdx);
-    return make_int2(first, last);
-}
-
-__device__ inline int findSplit(const unsigned int* sortedMortonCodes, int first, int last){
-    unsigned int firstCode = sortedMortonCodes[first];
-    unsigned int lastCode  = sortedMortonCodes[last];
-
-    if (firstCode == lastCode) return (first + last) >> 1;
-
-    int commonPrefix = __clz(firstCode ^ lastCode);
-
-    int split = first;
-    int step  = last - first;
-    do {
-        step = (step + 1) >> 1;
-        int newSplit = split + step;
-        if (newSplit < last){
-            unsigned int splitCode = sortedMortonCodes[newSplit];
-            int splitPrefix = __clz(firstCode ^ splitCode);
-            if (splitPrefix > commonPrefix) split = newSplit;
-        }
-    } while (step > 1);
-
-    return split;
-}
-// KERNEL FUNCTIONS FOR GENERATING THE HIERARCHY 
-__global__ void buildLeavesKernel(BVH_Node* d_leafNode, const int* sortedPrimitiveIDs, const AABB* sortedBounds, int numObjects){
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= numObjects) return;
-    d_leafNode[idx].primitiveIndex = sortedPrimitiveIDs[idx];
-    d_leafNode[idx].bounds = sortedBounds[idx];
-    d_leafNode[idx].isLeaf = true;
-    d_leafNode[idx].leftChild  = -1;
-    d_leafNode[idx].rightChild = -1;
-}
-
-__global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, int* d_atomicCounters, int numObjects){
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= numObjects) return;
-
-    int currentParent = d_leafNode[idx].parent;
-
-    while (currentParent != -1) {
-        int old = atomicAdd(&d_atomicCounters[currentParent], 1);
-        if (old == 0) return;   
-
-        BVH_Node& node = d_internalNodes[currentParent];
-        AABB leftBounds  = node.leftIsLeaf  ? d_leafNode[node.leftChild].bounds  : d_internalNodes[node.leftChild].bounds;
-        AABB rightBounds = node.rightIsLeaf ? d_leafNode[node.rightChild].bounds : d_internalNodes[node.rightChild].bounds;
-        node.bounds = merge(leftBounds, rightBounds);
-
-        currentParent = node.parent;
-    }
-}
-
-__global__ void buildInternalNodesKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode,const unsigned int* sortedMortonCodes, int numObjects){
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= numObjects - 1) return;
-
-    int2 range = determineRange(sortedMortonCodes, numObjects, idx);
-    int first = range.x;
-    int last  = range.y;
-    int split = findSplit(sortedMortonCodes, first, last);
-
-    d_internalNodes[idx].isLeaf = false;
-
-    if (split == first){
-        d_internalNodes[idx].leftChild = split;
-        d_internalNodes[idx].leftIsLeaf = true;
-        d_leafNode[split].parent = idx;
-    } else {
-        d_internalNodes[idx].leftChild = split;
-        d_internalNodes[idx].leftIsLeaf = false;
-        d_internalNodes[split].parent = idx;
-    }
-
-    if (split + 1 == last){
-        d_internalNodes[idx].rightChild = split + 1;
-        d_internalNodes[idx].rightIsLeaf = true;
-        d_leafNode[split + 1].parent = idx;
-    } else {
-        d_internalNodes[idx].rightChild = split + 1;
-        d_internalNodes[idx].rightIsLeaf = false;
-        d_internalNodes[split + 1].parent = idx;
-    }
-}
-
-__host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide){
-    if (leftHandSide.maxInterval.x < rightHandSide.minInterval.x || rightHandSide.maxInterval.x < leftHandSide.minInterval.x) { return false; }
-    if (leftHandSide.maxInterval.y < rightHandSide.minInterval.y || rightHandSide.maxInterval.y < leftHandSide.minInterval.y) { return false; }
-    if (leftHandSide.maxInterval.z < rightHandSide.minInterval.z || rightHandSide.maxInterval.z < leftHandSide.minInterval.z) { return false; }
-    return true;
-}
-
-__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide){
-    AABB mergedAABB;
-    mergedAABB.maxInterval.x = fmaxf(leftHandSide.maxInterval.x ,rightHandSide.maxInterval.x);
-    mergedAABB.maxInterval.y = fmaxf(leftHandSide.maxInterval.y ,rightHandSide.maxInterval.y);
-    mergedAABB.maxInterval.z = fmaxf(leftHandSide.maxInterval.z ,rightHandSide.maxInterval.z);
-    mergedAABB.minInterval.x = fminf(leftHandSide.minInterval.x ,rightHandSide.minInterval.x);
-    mergedAABB.minInterval.y = fminf(leftHandSide.minInterval.y ,rightHandSide.minInterval.y);
-    mergedAABB.minInterval.z = fminf(leftHandSide.minInterval.z ,rightHandSide.minInterval.z);
-    return mergedAABB;
-}
-
-__global__ void findCollisions(const PrimitiveRef* d_primitiveRefs, BVH* d_bvh, int primitiveCount, int* d_collisionCounts){
-    int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    if(idx < primitiveCount){
-        d_bvh->traverseHierarchy(d_primitiveRefs, idx, d_collisionCounts);
-    }
-}
-
-// ============================================================================
 
 // ============================================================================
 // === MESH & PRIMITIVE TYPES ===
@@ -722,6 +446,414 @@ __device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
 
 
 
+// ============================================================================
+// === BVH ===
+// ============================================================================
+
+struct BVH_Node{
+    AABB bounds;
+    int  leftChild;  
+    int  rightChild;
+    bool leftIsLeaf;     
+    bool rightIsLeaf;
+    int  parent;       
+    int  primitiveIndex; 
+    bool isLeaf;
+};
+struct PrimitiveRef {
+    AABB bounds;
+    vec3 centroid;
+    int  primitiveType;   
+    int  primitiveIndex;  
+    unsigned int mortonCode;   
+};
+
+// == FORWARD DECLERATIONS =======================================================
+__global__ void buildLeavesKernel(BVH_Node* d_leafNode, const int* sortedPrimitiveIDs, const AABB* sortedBounds, int numObjects);
+__global__ void buildInternalNodesKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, const unsigned int* sortedMortonCodes, int numObjects);
+__global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, int* d_atomicCounters, int numObjects);
+__host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide);   
+__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide);          
+__host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance);
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
+// ===============================================================================
+class BVH{
+
+public:
+    BVH_Node* d_internalNodes = nullptr;
+    BVH_Node* d_leafNode = nullptr;
+    int* d_primitiveTypes = nullptr;
+    int primitiveCount;
+
+
+    __host__ void generateHierarchy(const unsigned int* d_sortedMortonCodes, const int* d_sortedPrimitiveIDs, const AABB* d_sortedBounds, const int* d_sortedPrimitiveTypes, int numObjects){
+        primitiveCount = numObjects;
+
+        CUDA_CHECK(cudaMalloc(&d_leafNode, numObjects * sizeof(BVH_Node)));
+        CUDA_CHECK(cudaMalloc(&d_internalNodes, (numObjects - 1) * sizeof(BVH_Node)));
+
+        CUDA_CHECK(cudaMalloc(&d_primitiveTypes, numObjects * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_primitiveTypes, d_sortedPrimitiveTypes, numObjects * sizeof(int), cudaMemcpyDeviceToDevice));
+
+        int* d_atomicCounters;
+        CUDA_CHECK(cudaMalloc(&d_atomicCounters, (numObjects - 1) * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_atomicCounters, 0, (numObjects - 1) * sizeof(int)));
+
+        int blockSize = 256;
+        buildLeavesKernel<<<(numObjects + blockSize - 1) / blockSize, blockSize>>>(d_leafNode, d_sortedPrimitiveIDs, d_sortedBounds, numObjects);
+        CUDA_CHECK_KERNEL();
+
+        buildInternalNodesKernel<<<(numObjects - 1 + blockSize - 1) / blockSize, blockSize>>>(d_internalNodes, d_leafNode, d_sortedMortonCodes, numObjects);
+        CUDA_CHECK_KERNEL();
+
+        int rootParent = -1;
+        CUDA_CHECK(cudaMemcpy(&d_internalNodes[0].parent, &rootParent, sizeof(int), cudaMemcpyHostToDevice));
+
+        refitBoundsKernel<<<(numObjects + blockSize - 1) / blockSize, blockSize>>>(d_internalNodes, d_leafNode, d_atomicCounters, numObjects);
+        CUDA_CHECK_KERNEL();
+
+        CUDA_CHECK(cudaFree(d_atomicCounters));
+    }
+
+    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles) const {
+        hitRecord nearestHit;
+
+        const int MAX_STACK = 64;
+        int stackIdx[MAX_STACK];
+        bool stackIsLeaf[MAX_STACK];
+        int stackPtr = 0;
+
+        int nodeIdx = 0;
+        bool nodeIsLeaf = false;
+
+        while (true) {
+            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+
+            int childLIdx = node.leftChild;
+            bool childLIsLeaf = node.leftIsLeaf;
+            int childRIdx = node.rightChild;
+            bool childRIsLeaf = node.rightIsLeaf;
+
+            AABB childLBounds = childLIsLeaf ? d_leafNode[childLIdx].bounds : d_internalNodes[childLIdx].bounds;
+            AABB childRBounds = childRIsLeaf ? d_leafNode[childRIdx].bounds : d_internalNodes[childRIdx].bounds;
+
+            float nearL = 0.0001f;
+            float farL = nearestHit.closestDistance;
+            bool overlapL = hit_aabb(childLBounds, rayOrigin, rayDirection, nearL, farL);
+
+            float nearR = 0.0001f;
+            float farR = nearestHit.closestDistance;
+            bool overlapR = hit_aabb(childRBounds, rayOrigin, rayDirection, nearR, farR);
+
+            if (overlapL && childLIsLeaf) {
+                int primitiveIdx = d_leafNode[childLIdx].primitiveIndex;
+                int primitiveType = d_primitiveTypes[childLIdx];
+                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection, spheres, triangles, nearestHit);
+            }
+            if (overlapR && childRIsLeaf) {
+                int primitiveIdx = d_leafNode[childRIdx].primitiveIndex;
+                int primitiveType = d_primitiveTypes[childRIdx];
+                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection, spheres, triangles, nearestHit);
+            }
+
+
+            bool traverseL = overlapL && !childLIsLeaf;
+            bool traverseR = overlapR && !childRIsLeaf;
+
+            if (!traverseL && !traverseR) {
+                if (stackPtr == 0) break;
+                stackPtr--;
+                nodeIdx = stackIdx[stackPtr];
+                nodeIsLeaf = stackIsLeaf[stackPtr];
+            } else {
+                if (traverseL && traverseR) {
+                    stackIdx[stackPtr] = childRIdx;
+                    stackIsLeaf[stackPtr] = childRIsLeaf;
+                    stackPtr++;
+                }
+                nodeIdx = traverseL ? childLIdx : childRIdx;
+                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
+            }
+        }
+
+        return nearestHit;
+    }
+
+    __device__ void traverseHierarchy(const PrimitiveRef* d_primitiveRefs, int queryObjectIdx, int* d_collisionCounts) const {
+        AABB queryBounds = d_primitiveRefs[queryObjectIdx].bounds;
+        int  querySelfIdx = d_primitiveRefs[queryObjectIdx].primitiveIndex;
+        const int MAX_STACK = 64;
+        int  stackIdx[MAX_STACK];
+        bool stackIsLeaf[MAX_STACK];
+        int  stackPtr = 0;
+
+        int  nodeIdx = 0;      // root = d_internalNodes[0]
+        bool nodeIsLeaf = false;
+
+        while (true) {
+            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+
+            int  childLIdx = node.leftChild;
+            bool childLIsLeaf = node.leftIsLeaf;
+            int  childRIdx = node.rightChild;
+            bool childRIsLeaf = node.rightIsLeaf;
+
+            AABB childLBounds = childLIsLeaf ? d_leafNode[childLIdx].bounds : d_internalNodes[childLIdx].bounds;
+            AABB childRBounds = childRIsLeaf ? d_leafNode[childRIdx].bounds : d_internalNodes[childRIdx].bounds;
+
+            bool overlapL = intersects(queryBounds, childLBounds);
+            bool overlapR = intersects(queryBounds, childRBounds);
+
+            if (overlapL && childLIsLeaf) {
+                int hitPrimitiveIdx = d_leafNode[childLIdx].primitiveIndex;
+                if (hitPrimitiveIdx != querySelfIdx) {
+                    atomicAdd(&d_collisionCounts[queryObjectIdx], 1);
+                }
+            }
+            if (overlapR && childRIsLeaf) {
+                int hitPrimitiveIdx = d_leafNode[childRIdx].primitiveIndex;
+                if (hitPrimitiveIdx != querySelfIdx) {
+                    atomicAdd(&d_collisionCounts[queryObjectIdx], 1);
+                }
+            }
+
+            bool traverseL = overlapL && !childLIsLeaf;
+            bool traverseR = overlapR && !childRIsLeaf;
+
+            if (!traverseL && !traverseR) {
+                if (stackPtr == 0) break;      
+                stackPtr--;
+                nodeIdx = stackIdx[stackPtr];
+                nodeIsLeaf = stackIsLeaf[stackPtr];
+            } else {
+                if (traverseL && traverseR) {
+                    stackIdx[stackPtr] = childRIdx;
+                    stackIsLeaf[stackPtr] = childRIsLeaf;
+                    stackPtr++;
+                }
+                nodeIdx = traverseL ? childLIdx : childRIdx;
+                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
+            }
+        }
+    }
+
+    __host__ void free(){
+        if (d_internalNodes) CUDA_CHECK(cudaFree(d_internalNodes));
+        if (d_leafNode) CUDA_CHECK(cudaFree(d_leafNode));
+        if (d_primitiveTypes) CUDA_CHECK(cudaFree(d_primitiveTypes));
+        d_internalNodes = nullptr;
+        d_leafNode = nullptr;
+        d_primitiveTypes = nullptr;
+    }
+
+
+};
+
+
+__device__ inline int delta(const unsigned int* sortedMortonCodes, int numObjects, int i, int j){
+    if (j < 0 || j >= numObjects) return -1;
+
+    unsigned int codeI = sortedMortonCodes[i];
+    unsigned int codeJ = sortedMortonCodes[j];
+
+    if (codeI == codeJ){
+        return 32 + __clz((unsigned int)(i ^ j));
+    }
+    return __clz(codeI ^ codeJ);
+}
+
+__device__ inline int2 determineRange(const unsigned int* sortedMortonCodes, int numObjects, int idx){
+    int d = (delta(sortedMortonCodes, numObjects, idx, idx+1) -
+             delta(sortedMortonCodes, numObjects, idx, idx-1)) >= 0 ? 1 : -1;
+
+    int deltaMin = delta(sortedMortonCodes, numObjects, idx, idx - d);
+
+    int lmax = 2;
+    while (delta(sortedMortonCodes, numObjects, idx, idx + lmax * d) > deltaMin){
+        lmax *= 2;
+    }
+
+    int l = 0;
+    for (int t = lmax / 2; t >= 1; t /= 2){
+        if (delta(sortedMortonCodes, numObjects, idx, idx + (l + t) * d) > deltaMin){
+            l += t;
+        }
+    }
+
+    int jdx = idx + l * d;
+    int first = min(idx, jdx);
+    int last  = max(idx, jdx);
+    return make_int2(first, last);
+}
+
+__device__ inline int findSplit(const unsigned int* sortedMortonCodes, int first, int last){
+    unsigned int firstCode = sortedMortonCodes[first];
+    unsigned int lastCode  = sortedMortonCodes[last];
+
+    if (firstCode == lastCode) return (first + last) >> 1;
+
+    int commonPrefix = __clz(firstCode ^ lastCode);
+
+    int split = first;
+    int step  = last - first;
+    do {
+        step = (step + 1) >> 1;
+        int newSplit = split + step;
+        if (newSplit < last){
+            unsigned int splitCode = sortedMortonCodes[newSplit];
+            int splitPrefix = __clz(firstCode ^ splitCode);
+            if (splitPrefix > commonPrefix) split = newSplit;
+        }
+    } while (step > 1);
+
+    return split;
+}
+// KERNEL FUNCTIONS FOR GENERATING THE HIERARCHY 
+__global__ void buildLeavesKernel(BVH_Node* d_leafNode, const int* sortedPrimitiveIDs, const AABB* sortedBounds, int numObjects){
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= numObjects) return;
+    d_leafNode[idx].primitiveIndex = sortedPrimitiveIDs[idx];
+    d_leafNode[idx].bounds = sortedBounds[idx];
+    d_leafNode[idx].isLeaf = true;
+    d_leafNode[idx].leftChild  = -1;
+    d_leafNode[idx].rightChild = -1;
+}
+
+__global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, int* d_atomicCounters, int numObjects){
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= numObjects) return;
+
+    int currentParent = d_leafNode[idx].parent;
+
+    while (currentParent != -1) {
+        int old = atomicAdd(&d_atomicCounters[currentParent], 1);
+        if (old == 0) return;   
+
+        BVH_Node& node = d_internalNodes[currentParent];
+        AABB leftBounds  = node.leftIsLeaf  ? d_leafNode[node.leftChild].bounds  : d_internalNodes[node.leftChild].bounds;
+        AABB rightBounds = node.rightIsLeaf ? d_leafNode[node.rightChild].bounds : d_internalNodes[node.rightChild].bounds;
+        node.bounds = merge(leftBounds, rightBounds);
+
+        currentParent = node.parent;
+    }
+}
+
+__global__ void buildInternalNodesKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode,const unsigned int* sortedMortonCodes, int numObjects){
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= numObjects - 1) return;
+
+    int2 range = determineRange(sortedMortonCodes, numObjects, idx);
+    int first = range.x;
+    int last  = range.y;
+    int split = findSplit(sortedMortonCodes, first, last);
+
+    d_internalNodes[idx].isLeaf = false;
+
+    if (split == first){
+        d_internalNodes[idx].leftChild = split;
+        d_internalNodes[idx].leftIsLeaf = true;
+        d_leafNode[split].parent = idx;
+    } else {
+        d_internalNodes[idx].leftChild = split;
+        d_internalNodes[idx].leftIsLeaf = false;
+        d_internalNodes[split].parent = idx;
+    }
+
+    if (split + 1 == last){
+        d_internalNodes[idx].rightChild = split + 1;
+        d_internalNodes[idx].rightIsLeaf = true;
+        d_leafNode[split + 1].parent = idx;
+    } else {
+        d_internalNodes[idx].rightChild = split + 1;
+        d_internalNodes[idx].rightIsLeaf = false;
+        d_internalNodes[split + 1].parent = idx;
+    }
+}
+
+__host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide){
+    if (leftHandSide.maxInterval.x < rightHandSide.minInterval.x || rightHandSide.maxInterval.x < leftHandSide.minInterval.x) { return false; }
+    if (leftHandSide.maxInterval.y < rightHandSide.minInterval.y || rightHandSide.maxInterval.y < leftHandSide.minInterval.y) { return false; }
+    if (leftHandSide.maxInterval.z < rightHandSide.minInterval.z || rightHandSide.maxInterval.z < leftHandSide.minInterval.z) { return false; }
+    return true;
+}
+
+__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide){
+    AABB mergedAABB;
+    mergedAABB.maxInterval.x = fmaxf(leftHandSide.maxInterval.x ,rightHandSide.maxInterval.x);
+    mergedAABB.maxInterval.y = fmaxf(leftHandSide.maxInterval.y ,rightHandSide.maxInterval.y);
+    mergedAABB.maxInterval.z = fmaxf(leftHandSide.maxInterval.z ,rightHandSide.maxInterval.z);
+    mergedAABB.minInterval.x = fminf(leftHandSide.minInterval.x ,rightHandSide.minInterval.x);
+    mergedAABB.minInterval.y = fminf(leftHandSide.minInterval.y ,rightHandSide.minInterval.y);
+    mergedAABB.minInterval.z = fminf(leftHandSide.minInterval.z ,rightHandSide.minInterval.z);
+    return mergedAABB;
+}
+
+__host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance){
+    for (int axisIndex = 0; axisIndex < 3; axisIndex++) {
+        float originOnAxis = (axisIndex == 0) ? rayOrigin.x : (axisIndex == 1) ? rayOrigin.y : rayOrigin.z;
+        float directionOnAxis = (axisIndex == 0) ? rayDirection.x : (axisIndex == 1) ? rayDirection.y : rayDirection.z;
+        float boxMinOnAxis = (axisIndex == 0) ? box.minInterval.x : (axisIndex == 1) ? box.minInterval.y : box.minInterval.z;
+        float boxMaxOnAxis = (axisIndex == 0) ? box.maxInterval.x : (axisIndex == 1) ? box.maxInterval.y : box.maxInterval.z;
+
+        float inverseDirection = 1.0f / directionOnAxis;
+        float entryDistance = (boxMinOnAxis - originOnAxis) * inverseDirection;
+        float exitDistance = (boxMaxOnAxis - originOnAxis) * inverseDirection;
+        if (inverseDirection < 0.0f) {
+            float swapTemp = entryDistance;
+            entryDistance = exitDistance;
+            exitDistance = swapTemp;
+        }
+
+        nearestEntryDistance = fmaxf(nearestEntryDistance, entryDistance);
+        farthestExitDistance = fminf(farthestExitDistance, exitDistance);
+        if (farthestExitDistance <= nearestEntryDistance) return false;
+    }
+    return true;
+}
+
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit){
+    if (primitiveType == 0) {
+        float intersectionDistance;
+        bool frontFace;
+        vec3 outwardNormal;
+        if (hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, intersectionDistance, frontFace, outwardNormal)) {
+            if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
+                nearestHit.didHit = true;
+                nearestHit.closestDistance = intersectionDistance;
+                nearestHit.hitPoint = rayOrigin + rayDirection * intersectionDistance;
+                nearestHit.mat = spheres[primitiveIdx].mat;
+                nearestHit.frontFace = frontFace;
+                nearestHit.hitNormal = frontFace ? outwardNormal : -outwardNormal;
+            }
+        }
+    } else {
+        float intersectionDistance;
+        if (hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) {
+            if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
+                nearestHit.didHit = true;
+                nearestHit.closestDistance = intersectionDistance;
+                nearestHit.hitPoint = rayOrigin + rayDirection * intersectionDistance;
+                nearestHit.mat = triangles[primitiveIdx].mat;
+
+                vec3 edge1 = triangles[primitiveIdx].v1 - triangles[primitiveIdx].v0;
+                vec3 edge2 = triangles[primitiveIdx].v2 - triangles[primitiveIdx].v0;
+                nearestHit.hitNormal = edge1.cross(edge2).normalize();
+            }
+        }
+    }
+}
+
+__global__ void findCollisions(const PrimitiveRef* d_primitiveRefs, BVH* d_bvh, int primitiveCount, int* d_collisionCounts){
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if(idx < primitiveCount){
+        d_bvh->traverseHierarchy(d_primitiveRefs, idx, d_collisionCounts);
+    }
+}
+
+
+
+// ============================================================================
+
 
 // ============================================================================
 // === CAMERA ===
@@ -800,6 +932,8 @@ public:
     }
 };
 
+
+
 // ============================================================================
 
 
@@ -829,6 +963,30 @@ __host__ hostScene setup_scene() {
     scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, mirrorMat));
     scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, glassMat));
     scene.spheres.push_back(sphere(vec3(0, -100.5f, -1), 100.0f, groundMat));
+
+    srand(42);
+    for (int a = -8; a < 8; a++) {
+        for (int b = -9; b < 1; b++) {
+            float chooseMat = rand() / (float)RAND_MAX;
+            vec3 center(a + 0.9f * (rand() / (float)RAND_MAX), -0.3f, -1.0f + b * 0.9f + (rand() / (float)RAND_MAX) * 0.5f);
+
+            if ((center - vec3(0, -0.3f, -1)).length() < 1.3f) continue;
+
+            Material randomMat;
+            if (chooseMat < 0.8f) {
+                vec3 albedo(rand() / (float)RAND_MAX, rand() / (float)RAND_MAX, rand() / (float)RAND_MAX);
+                randomMat = make_lambertian(albedo);
+            } else if (chooseMat < 0.95f) {
+                vec3 albedo(0.5f + 0.5f * (rand() / (float)RAND_MAX), 0.5f + 0.5f * (rand() / (float)RAND_MAX), 0.5f + 0.5f * (rand() / (float)RAND_MAX));
+                float fuzz = 0.5f * (rand() / (float)RAND_MAX);
+                randomMat = make_conductor(albedo, fuzz);
+            } else {
+                randomMat = make_dielectric(1.5f);
+            }
+
+            scene.spheres.push_back(sphere(center, 0.2f, randomMat));
+        }
+    }
 
     for (size_t i = 0; i < scene.spheres.size(); i++) scene.spheres[i].calculate_bounding_box();
     for (size_t i = 0; i < scene.triangles.size(); i++) scene.triangles[i].calculate_bounding_box();
@@ -866,8 +1024,8 @@ __host__ hostScene setup_scene() {
 // === RENDER ===
 // ============================================================================
 
-__global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* spheres,int sphereCount,triangle* triangles,int triangleCount,
-                                    int maximumX,int maximumY,unsigned long long seed,int sampleIndex){
+__global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, sphere* spheres, int sphereCount, triangle* triangles, int triangleCount,
+                                    int maximumX, int maximumY, unsigned long long seed, int sampleIndex){
 
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -882,7 +1040,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* sph
     vec3 sampleColor(0.0f, 0.0f, 0.0f);
 
     for(int depth = 0 ; depth < camera.max_depth;depth++){
-        hitRecord hit = find_nearest_hit(r.origin, r.direction,spheres,sphereCount,triangles,triangleCount);
+        hitRecord hit = bvh.traverseRay(r.origin, r.direction, spheres, triangles);
         
         if(!hit.didHit){
             vec3 unitDir = r.direction.normalize();
@@ -942,6 +1100,7 @@ __global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int m
 
     outputBuffer[pixel_index] = accumBuffer[pixel_index] / float(samplesSoFar);
 }
+
 // ============================================================================
 
 // ============================================================================
@@ -995,31 +1154,37 @@ int main() {
     std::vector<unsigned int> sortedMortonCodes(numPrimitives);
     std::vector<int> sortedPrimitiveIDs(numPrimitives);
     std::vector<AABB> sortedBounds(numPrimitives);
+    std::vector<int> sortedPrimitiveTypes(numPrimitives);       
 
     for (int i = 0; i < numPrimitives; i++) {
         sortedMortonCodes[i] = scene.primitiveRefs[i].mortonCode;
         sortedPrimitiveIDs[i] = scene.primitiveRefs[i].primitiveIndex;
         sortedBounds[i] = scene.primitiveRefs[i].bounds;
+        sortedPrimitiveTypes[i] = scene.primitiveRefs[i].primitiveType;   
     }
 
     unsigned int* d_sortedMortonCodes;
     int* d_sortedPrimitiveIDs;
     AABB* d_sortedBounds;
+    int* d_sortedPrimitiveTypes;                                    
 
     CUDA_CHECK(cudaMalloc(&d_sortedMortonCodes, numPrimitives * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&d_sortedPrimitiveIDs, numPrimitives * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_sortedBounds, numPrimitives * sizeof(AABB)));
+    CUDA_CHECK(cudaMalloc(&d_sortedPrimitiveTypes, numPrimitives * sizeof(int)));  
 
     CUDA_CHECK(cudaMemcpy(d_sortedMortonCodes, sortedMortonCodes.data(), numPrimitives * sizeof(unsigned int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_sortedPrimitiveIDs, sortedPrimitiveIDs.data(), numPrimitives * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_sortedBounds, sortedBounds.data(), numPrimitives * sizeof(AABB), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sortedPrimitiveTypes, sortedPrimitiveTypes.data(), numPrimitives * sizeof(int), cudaMemcpyHostToDevice));   
 
     BVH bvh;
-    bvh.generateHierarchy(d_sortedMortonCodes, d_sortedPrimitiveIDs, d_sortedBounds, numPrimitives);
+    bvh.generateHierarchy(d_sortedMortonCodes, d_sortedPrimitiveIDs, d_sortedBounds, d_sortedPrimitiveTypes, numPrimitives);   
 
     CUDA_CHECK(cudaFree(d_sortedMortonCodes));
     CUDA_CHECK(cudaFree(d_sortedPrimitiveIDs));
     CUDA_CHECK(cudaFree(d_sortedBounds));
+    CUDA_CHECK(cudaFree(d_sortedPrimitiveTypes));   
 
     // call the render_kernel
     sphere* d_spheres;
@@ -1038,7 +1203,7 @@ int main() {
     
     auto renderStart = std::chrono::steady_clock::now();
     for (int s = 0; s < cam.samples_per_pixel; s++) {
-        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, d_spheres, sphereCount,d_triangles, triangleCount,numberOfPixels_X, numberOfPixels_Y,1234ULL, s);
+        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, 1234ULL, s);
         CUDA_CHECK_KERNEL();
 
         resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1);
