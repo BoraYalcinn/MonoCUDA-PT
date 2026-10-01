@@ -2,6 +2,7 @@
 // This project is fully written by Bora Yalçın (Undergraduate CSE Student at Yeditepe University)
 // Checkout out my website for related blogs : https://borayalcinn.github.io/
 // Checkout the related repository           : https://github.com/BoraYalcinn/MonoCUDA-PT 
+// I have shared the sources such as papers, websites and learning courses etc. under the README.md
 // ==============================================================================
 // === INCLUDE AND MACROS ===
 // ==============================================================================
@@ -10,11 +11,13 @@
 #include <iostream>
 #include <chrono>
 #include <vector>
+#include <algorithm>
 #include "cuda_runtime.h"
 #include <curand_kernel.h>
 
 
 #define MONOCUDA_PI 3.14159265358979323846f
+
 // ==============================================================================
 
 // ==============================================================================
@@ -133,6 +136,10 @@ class vec3{
 
             return tangent * sinf(theta2) - surfaceNormal * cosf(theta2);
         }
+
+        __host__ float calculateDistanceTo(const vec3& other){
+            return sqrtf((x - other.x)*(x - other.x) + (y - other.y)*(y - other.y) + (z - other.z)*(z - other.z));
+        }
 };
 
 // ============================================================================
@@ -222,6 +229,21 @@ __host__ __device__ Material make_emissive(vec3 emittedColor) {
 // ============================================================================
 
 
+// ============================================================================
+// === AABB ===
+// ============================================================================
+
+class AABB{
+public:
+    vec3 minInterval;
+    vec3 maxInterval;
+    vec3 centroid;
+
+    __host__ __device__ AABB(){}
+    __host__ __device__ AABB(const vec3& minInterval_,const vec3& maxInterval_) : minInterval(minInterval_) , maxInterval(maxInterval_){}
+
+
+};
 
 // ============================================================================
 // === MESH & PRIMITIVE TYPES ===
@@ -233,11 +255,25 @@ __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
 struct triangle {
     vec3 v0, v1, v2;
     Material mat;
+    AABB aabb;
 
     __host__ __device__ triangle() {}
     __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_) : v0(v0_), v1(v1_), v2(v2_) {}
     __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_,Material mat_) : v0(v0_), v1(v1_), v2(v2_), mat(mat_) {}
+
+    __host__ __device__ vec3 calculateCentroid(){
+        return (v0 + v1 + v2)/3.;
+    }
+
+    __host__ __device__ void calculate_bounding_box(){
+    aabb.minInterval = { fminf(v0.x, fminf(v1.x, v2.x)),  fminf(v0.y, fminf(v1.y, v2.y)),fminf(v0.z, fminf(v1.z, v2.z)) };
+    aabb.maxInterval = { fmaxf(v0.x, fmaxf(v1.x, v2.x)),fmaxf(v0.y, fmaxf(v1.y, v2.y)),fmaxf(v0.z, fmaxf(v1.z, v2.z)) };
+    }
+
+    __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
+
+
 __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
     vec3 edge1 = tri.v1 - tri.v0;
     vec3 edge2 = tri.v2 - tri.v0;
@@ -270,10 +306,20 @@ struct sphere {
     vec3 center;
     float radius;
     Material mat;
+    AABB aabb;
 
     __host__ __device__ sphere(){}
     __host__ __device__ sphere(vec3 center_,double radius_) : center(center_), radius(radius_){}
     __host__ __device__ sphere(vec3 center_,double radius_,Material mat_) : center(center_), radius(radius_), mat(mat_){} 
+
+    __host__ __device__ vec3 calculateCentroid(){
+        return center;
+    }
+    __host__ __device__ void calculate_bounding_box(){
+        aabb.minInterval = {(center.x - radius),(center.y - radius),(center.z - radius)};
+        aabb.maxInterval = {(center.x + radius),(center.y + radius),(center.z + radius)};
+    }
+    __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
 
 __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float& intersectionDistance,bool& frontFace, vec3& outwardNormal) {
@@ -301,6 +347,31 @@ __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, con
     intersectionDistance = t;
     return true;
 }
+
+__host__ __device__ inline unsigned int expandBits(const unsigned int point){
+    unsigned int expandedPoint = 0;
+    for(int i = 0; i < 10; i++){
+        unsigned int  bit = (point >> i ) & 1;
+        expandedPoint |= (bit << (3 * i));
+    }
+    return expandedPoint;
+}
+
+__host__ __device__ inline unsigned int quantize(float value, float minVal, float maxVal){
+    float normalized = (value - minVal) / (maxVal - minVal);   
+    return (unsigned int)(normalized * 1023.0f);                
+}
+
+__host__ __device__ inline unsigned int morton3D(const vec3& centroid, const AABB& sceneBounds){
+    unsigned int clampedX = quantize(centroid.x, sceneBounds.minInterval.x, sceneBounds.maxInterval.x);
+    unsigned int clampedY = quantize(centroid.y, sceneBounds.minInterval.y, sceneBounds.maxInterval.y);
+    unsigned int clampedZ = quantize(centroid.z, sceneBounds.minInterval.z, sceneBounds.maxInterval.z);
+    clampedX = expandBits(clampedX);
+    clampedY = expandBits(clampedY);
+    clampedZ = expandBits(clampedZ);
+    return clampedX | clampedY << 1| clampedZ << 2;
+}
+
 // ============================================================================
 
 
@@ -371,6 +442,416 @@ __device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
 }
     return nearestHit;
 }
+// ============================================================================
+
+
+
+// ============================================================================
+// === BVH ===
+// ============================================================================
+
+struct BVH_Node{
+    AABB bounds;
+    int  leftChild;  
+    int  rightChild;
+    bool leftIsLeaf;     
+    bool rightIsLeaf;
+    int  parent;       
+    int  primitiveIndex; 
+    bool isLeaf;
+};
+struct PrimitiveRef {
+    AABB bounds;
+    vec3 centroid;
+    int  primitiveType;   
+    int  primitiveIndex;  
+    unsigned int mortonCode;   
+};
+
+// == FORWARD DECLERATIONS =======================================================
+__global__ void buildLeavesKernel(BVH_Node* d_leafNode, const int* sortedPrimitiveIDs, const AABB* sortedBounds, int numObjects);
+__global__ void buildInternalNodesKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, const unsigned int* sortedMortonCodes, int numObjects);
+__global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, int* d_atomicCounters, int numObjects);
+__host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide);   
+__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide);          
+__host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance);
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
+// ===============================================================================
+class BVH{
+
+public:
+    BVH_Node* d_internalNodes = nullptr;
+    BVH_Node* d_leafNode = nullptr;
+    int* d_primitiveTypes = nullptr;
+    int primitiveCount;
+
+
+    __host__ void generateHierarchy(const unsigned int* d_sortedMortonCodes, const int* d_sortedPrimitiveIDs, const AABB* d_sortedBounds, const int* d_sortedPrimitiveTypes, int numObjects){
+        primitiveCount = numObjects;
+
+        CUDA_CHECK(cudaMalloc(&d_leafNode, numObjects * sizeof(BVH_Node)));
+        CUDA_CHECK(cudaMalloc(&d_internalNodes, (numObjects - 1) * sizeof(BVH_Node)));
+
+        CUDA_CHECK(cudaMalloc(&d_primitiveTypes, numObjects * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_primitiveTypes, d_sortedPrimitiveTypes, numObjects * sizeof(int), cudaMemcpyDeviceToDevice));
+
+        int* d_atomicCounters;
+        CUDA_CHECK(cudaMalloc(&d_atomicCounters, (numObjects - 1) * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_atomicCounters, 0, (numObjects - 1) * sizeof(int)));
+
+        int blockSize = 256;
+        buildLeavesKernel<<<(numObjects + blockSize - 1) / blockSize, blockSize>>>(d_leafNode, d_sortedPrimitiveIDs, d_sortedBounds, numObjects);
+        CUDA_CHECK_KERNEL();
+
+        buildInternalNodesKernel<<<(numObjects - 1 + blockSize - 1) / blockSize, blockSize>>>(d_internalNodes, d_leafNode, d_sortedMortonCodes, numObjects);
+        CUDA_CHECK_KERNEL();
+
+        int rootParent = -1;
+        CUDA_CHECK(cudaMemcpy(&d_internalNodes[0].parent, &rootParent, sizeof(int), cudaMemcpyHostToDevice));
+
+        refitBoundsKernel<<<(numObjects + blockSize - 1) / blockSize, blockSize>>>(d_internalNodes, d_leafNode, d_atomicCounters, numObjects);
+        CUDA_CHECK_KERNEL();
+
+        CUDA_CHECK(cudaFree(d_atomicCounters));
+    }
+
+    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles) const {
+        hitRecord nearestHit;
+
+        const int MAX_STACK = 64;
+        int stackIdx[MAX_STACK];
+        bool stackIsLeaf[MAX_STACK];
+        int stackPtr = 0;
+
+        int nodeIdx = 0;
+        bool nodeIsLeaf = false;
+
+        while (true) {
+            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+
+            int childLIdx = node.leftChild;
+            bool childLIsLeaf = node.leftIsLeaf;
+            int childRIdx = node.rightChild;
+            bool childRIsLeaf = node.rightIsLeaf;
+
+            AABB childLBounds = childLIsLeaf ? d_leafNode[childLIdx].bounds : d_internalNodes[childLIdx].bounds;
+            AABB childRBounds = childRIsLeaf ? d_leafNode[childRIdx].bounds : d_internalNodes[childRIdx].bounds;
+
+            float nearL = 0.0001f;
+            float farL = nearestHit.closestDistance;
+            bool overlapL = hit_aabb(childLBounds, rayOrigin, rayDirection, nearL, farL);
+
+            float nearR = 0.0001f;
+            float farR = nearestHit.closestDistance;
+            bool overlapR = hit_aabb(childRBounds, rayOrigin, rayDirection, nearR, farR);
+
+            if (overlapL && childLIsLeaf) {
+                int primitiveIdx = d_leafNode[childLIdx].primitiveIndex;
+                int primitiveType = d_primitiveTypes[childLIdx];
+                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection, spheres, triangles, nearestHit);
+            }
+            if (overlapR && childRIsLeaf) {
+                int primitiveIdx = d_leafNode[childRIdx].primitiveIndex;
+                int primitiveType = d_primitiveTypes[childRIdx];
+                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection, spheres, triangles, nearestHit);
+            }
+
+
+            bool traverseL = overlapL && !childLIsLeaf;
+            bool traverseR = overlapR && !childRIsLeaf;
+
+            if (!traverseL && !traverseR) {
+                if (stackPtr == 0) break;
+                stackPtr--;
+                nodeIdx = stackIdx[stackPtr];
+                nodeIsLeaf = stackIsLeaf[stackPtr];
+            } else {
+                if (traverseL && traverseR) {
+                    stackIdx[stackPtr] = childRIdx;
+                    stackIsLeaf[stackPtr] = childRIsLeaf;
+                    stackPtr++;
+                }
+                nodeIdx = traverseL ? childLIdx : childRIdx;
+                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
+            }
+        }
+
+        return nearestHit;
+    }
+
+    __device__ void traverseHierarchy(const PrimitiveRef* d_primitiveRefs, int queryObjectIdx, int* d_collisionCounts) const {
+        AABB queryBounds = d_primitiveRefs[queryObjectIdx].bounds;
+        int  querySelfIdx = d_primitiveRefs[queryObjectIdx].primitiveIndex;
+        const int MAX_STACK = 64;
+        int  stackIdx[MAX_STACK];
+        bool stackIsLeaf[MAX_STACK];
+        int  stackPtr = 0;
+
+        int  nodeIdx = 0;      // root = d_internalNodes[0]
+        bool nodeIsLeaf = false;
+
+        while (true) {
+            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+
+            int  childLIdx = node.leftChild;
+            bool childLIsLeaf = node.leftIsLeaf;
+            int  childRIdx = node.rightChild;
+            bool childRIsLeaf = node.rightIsLeaf;
+
+            AABB childLBounds = childLIsLeaf ? d_leafNode[childLIdx].bounds : d_internalNodes[childLIdx].bounds;
+            AABB childRBounds = childRIsLeaf ? d_leafNode[childRIdx].bounds : d_internalNodes[childRIdx].bounds;
+
+            bool overlapL = intersects(queryBounds, childLBounds);
+            bool overlapR = intersects(queryBounds, childRBounds);
+
+            if (overlapL && childLIsLeaf) {
+                int hitPrimitiveIdx = d_leafNode[childLIdx].primitiveIndex;
+                if (hitPrimitiveIdx != querySelfIdx) {
+                    atomicAdd(&d_collisionCounts[queryObjectIdx], 1);
+                }
+            }
+            if (overlapR && childRIsLeaf) {
+                int hitPrimitiveIdx = d_leafNode[childRIdx].primitiveIndex;
+                if (hitPrimitiveIdx != querySelfIdx) {
+                    atomicAdd(&d_collisionCounts[queryObjectIdx], 1);
+                }
+            }
+
+            bool traverseL = overlapL && !childLIsLeaf;
+            bool traverseR = overlapR && !childRIsLeaf;
+
+            if (!traverseL && !traverseR) {
+                if (stackPtr == 0) break;      
+                stackPtr--;
+                nodeIdx = stackIdx[stackPtr];
+                nodeIsLeaf = stackIsLeaf[stackPtr];
+            } else {
+                if (traverseL && traverseR) {
+                    stackIdx[stackPtr] = childRIdx;
+                    stackIsLeaf[stackPtr] = childRIsLeaf;
+                    stackPtr++;
+                }
+                nodeIdx = traverseL ? childLIdx : childRIdx;
+                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
+            }
+        }
+    }
+
+    __host__ void free(){
+        if (d_internalNodes) CUDA_CHECK(cudaFree(d_internalNodes));
+        if (d_leafNode) CUDA_CHECK(cudaFree(d_leafNode));
+        if (d_primitiveTypes) CUDA_CHECK(cudaFree(d_primitiveTypes));
+        d_internalNodes = nullptr;
+        d_leafNode = nullptr;
+        d_primitiveTypes = nullptr;
+    }
+
+
+};
+
+
+__device__ inline int delta(const unsigned int* sortedMortonCodes, int numObjects, int i, int j){
+    if (j < 0 || j >= numObjects) return -1;
+
+    unsigned int codeI = sortedMortonCodes[i];
+    unsigned int codeJ = sortedMortonCodes[j];
+
+    if (codeI == codeJ){
+        return 32 + __clz((unsigned int)(i ^ j));
+    }
+    return __clz(codeI ^ codeJ);
+}
+
+__device__ inline int2 determineRange(const unsigned int* sortedMortonCodes, int numObjects, int idx){
+    int d = (delta(sortedMortonCodes, numObjects, idx, idx+1) -
+             delta(sortedMortonCodes, numObjects, idx, idx-1)) >= 0 ? 1 : -1;
+
+    int deltaMin = delta(sortedMortonCodes, numObjects, idx, idx - d);
+
+    int lmax = 2;
+    while (delta(sortedMortonCodes, numObjects, idx, idx + lmax * d) > deltaMin){
+        lmax *= 2;
+    }
+
+    int l = 0;
+    for (int t = lmax / 2; t >= 1; t /= 2){
+        if (delta(sortedMortonCodes, numObjects, idx, idx + (l + t) * d) > deltaMin){
+            l += t;
+        }
+    }
+
+    int jdx = idx + l * d;
+    int first = min(idx, jdx);
+    int last  = max(idx, jdx);
+    return make_int2(first, last);
+}
+
+__device__ inline int findSplit(const unsigned int* sortedMortonCodes, int first, int last){
+    unsigned int firstCode = sortedMortonCodes[first];
+    unsigned int lastCode  = sortedMortonCodes[last];
+
+    if (firstCode == lastCode) return (first + last) >> 1;
+
+    int commonPrefix = __clz(firstCode ^ lastCode);
+
+    int split = first;
+    int step  = last - first;
+    do {
+        step = (step + 1) >> 1;
+        int newSplit = split + step;
+        if (newSplit < last){
+            unsigned int splitCode = sortedMortonCodes[newSplit];
+            int splitPrefix = __clz(firstCode ^ splitCode);
+            if (splitPrefix > commonPrefix) split = newSplit;
+        }
+    } while (step > 1);
+
+    return split;
+}
+// KERNEL FUNCTIONS FOR GENERATING THE HIERARCHY 
+__global__ void buildLeavesKernel(BVH_Node* d_leafNode, const int* sortedPrimitiveIDs, const AABB* sortedBounds, int numObjects){
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= numObjects) return;
+    d_leafNode[idx].primitiveIndex = sortedPrimitiveIDs[idx];
+    d_leafNode[idx].bounds = sortedBounds[idx];
+    d_leafNode[idx].isLeaf = true;
+    d_leafNode[idx].leftChild  = -1;
+    d_leafNode[idx].rightChild = -1;
+}
+
+__global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode, int* d_atomicCounters, int numObjects){
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= numObjects) return;
+
+    int currentParent = d_leafNode[idx].parent;
+
+    while (currentParent != -1) {
+        int old = atomicAdd(&d_atomicCounters[currentParent], 1);
+        if (old == 0) return;   
+
+        BVH_Node& node = d_internalNodes[currentParent];
+        AABB leftBounds  = node.leftIsLeaf  ? d_leafNode[node.leftChild].bounds  : d_internalNodes[node.leftChild].bounds;
+        AABB rightBounds = node.rightIsLeaf ? d_leafNode[node.rightChild].bounds : d_internalNodes[node.rightChild].bounds;
+        node.bounds = merge(leftBounds, rightBounds);
+
+        currentParent = node.parent;
+    }
+}
+
+__global__ void buildInternalNodesKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNode,const unsigned int* sortedMortonCodes, int numObjects){
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= numObjects - 1) return;
+
+    int2 range = determineRange(sortedMortonCodes, numObjects, idx);
+    int first = range.x;
+    int last  = range.y;
+    int split = findSplit(sortedMortonCodes, first, last);
+
+    d_internalNodes[idx].isLeaf = false;
+
+    if (split == first){
+        d_internalNodes[idx].leftChild = split;
+        d_internalNodes[idx].leftIsLeaf = true;
+        d_leafNode[split].parent = idx;
+    } else {
+        d_internalNodes[idx].leftChild = split;
+        d_internalNodes[idx].leftIsLeaf = false;
+        d_internalNodes[split].parent = idx;
+    }
+
+    if (split + 1 == last){
+        d_internalNodes[idx].rightChild = split + 1;
+        d_internalNodes[idx].rightIsLeaf = true;
+        d_leafNode[split + 1].parent = idx;
+    } else {
+        d_internalNodes[idx].rightChild = split + 1;
+        d_internalNodes[idx].rightIsLeaf = false;
+        d_internalNodes[split + 1].parent = idx;
+    }
+}
+
+__host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide){
+    if (leftHandSide.maxInterval.x < rightHandSide.minInterval.x || rightHandSide.maxInterval.x < leftHandSide.minInterval.x) { return false; }
+    if (leftHandSide.maxInterval.y < rightHandSide.minInterval.y || rightHandSide.maxInterval.y < leftHandSide.minInterval.y) { return false; }
+    if (leftHandSide.maxInterval.z < rightHandSide.minInterval.z || rightHandSide.maxInterval.z < leftHandSide.minInterval.z) { return false; }
+    return true;
+}
+
+__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide){
+    AABB mergedAABB;
+    mergedAABB.maxInterval.x = fmaxf(leftHandSide.maxInterval.x ,rightHandSide.maxInterval.x);
+    mergedAABB.maxInterval.y = fmaxf(leftHandSide.maxInterval.y ,rightHandSide.maxInterval.y);
+    mergedAABB.maxInterval.z = fmaxf(leftHandSide.maxInterval.z ,rightHandSide.maxInterval.z);
+    mergedAABB.minInterval.x = fminf(leftHandSide.minInterval.x ,rightHandSide.minInterval.x);
+    mergedAABB.minInterval.y = fminf(leftHandSide.minInterval.y ,rightHandSide.minInterval.y);
+    mergedAABB.minInterval.z = fminf(leftHandSide.minInterval.z ,rightHandSide.minInterval.z);
+    return mergedAABB;
+}
+
+__host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance){
+    for (int axisIndex = 0; axisIndex < 3; axisIndex++) {
+        float originOnAxis = (axisIndex == 0) ? rayOrigin.x : (axisIndex == 1) ? rayOrigin.y : rayOrigin.z;
+        float directionOnAxis = (axisIndex == 0) ? rayDirection.x : (axisIndex == 1) ? rayDirection.y : rayDirection.z;
+        float boxMinOnAxis = (axisIndex == 0) ? box.minInterval.x : (axisIndex == 1) ? box.minInterval.y : box.minInterval.z;
+        float boxMaxOnAxis = (axisIndex == 0) ? box.maxInterval.x : (axisIndex == 1) ? box.maxInterval.y : box.maxInterval.z;
+
+        float inverseDirection = 1.0f / directionOnAxis;
+        float entryDistance = (boxMinOnAxis - originOnAxis) * inverseDirection;
+        float exitDistance = (boxMaxOnAxis - originOnAxis) * inverseDirection;
+        if (inverseDirection < 0.0f) {
+            float swapTemp = entryDistance;
+            entryDistance = exitDistance;
+            exitDistance = swapTemp;
+        }
+
+        nearestEntryDistance = fmaxf(nearestEntryDistance, entryDistance);
+        farthestExitDistance = fminf(farthestExitDistance, exitDistance);
+        if (farthestExitDistance <= nearestEntryDistance) return false;
+    }
+    return true;
+}
+
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit){
+    if (primitiveType == 0) {
+        float intersectionDistance;
+        bool frontFace;
+        vec3 outwardNormal;
+        if (hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, intersectionDistance, frontFace, outwardNormal)) {
+            if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
+                nearestHit.didHit = true;
+                nearestHit.closestDistance = intersectionDistance;
+                nearestHit.hitPoint = rayOrigin + rayDirection * intersectionDistance;
+                nearestHit.mat = spheres[primitiveIdx].mat;
+                nearestHit.frontFace = frontFace;
+                nearestHit.hitNormal = frontFace ? outwardNormal : -outwardNormal;
+            }
+        }
+    } else {
+        float intersectionDistance;
+        if (hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) {
+            if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
+                nearestHit.didHit = true;
+                nearestHit.closestDistance = intersectionDistance;
+                nearestHit.hitPoint = rayOrigin + rayDirection * intersectionDistance;
+                nearestHit.mat = triangles[primitiveIdx].mat;
+
+                vec3 edge1 = triangles[primitiveIdx].v1 - triangles[primitiveIdx].v0;
+                vec3 edge2 = triangles[primitiveIdx].v2 - triangles[primitiveIdx].v0;
+                nearestHit.hitNormal = edge1.cross(edge2).normalize();
+            }
+        }
+    }
+}
+
+__global__ void findCollisions(const PrimitiveRef* d_primitiveRefs, BVH* d_bvh, int primitiveCount, int* d_collisionCounts){
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if(idx < primitiveCount){
+        d_bvh->traverseHierarchy(d_primitiveRefs, idx, d_collisionCounts);
+    }
+}
+
+
+
 // ============================================================================
 
 
@@ -451,6 +932,8 @@ public:
     }
 };
 
+
+
 // ============================================================================
 
 
@@ -462,33 +945,87 @@ public:
 struct hostScene {
     std::vector<sphere> spheres;
     std::vector<triangle> triangles;
+    std::vector<PrimitiveRef> primitiveRefs;
+    AABB bounds;
 };
 
 __host__ hostScene setup_scene() {
     hostScene scene;
 
     Material redDiffuse = make_lambertian(vec3(0.8f, 0.3f, 0.3f));
-    Material groundMat  = make_lambertian(vec3(0.5f, 1.0f, 0.5f));
-    Material mirrorMat  = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.3f);
-    Material glassMat   = make_dielectric(1.5f);
+    Material groundMat = make_lambertian(vec3(0.5f, 1.0f, 0.5f));
+    Material mirrorMat = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.3f);
+    Material glassMat = make_dielectric(1.5f);
+    Material lightMat = make_emissive(vec3(4.0f, 4.0f, 4.0f));
 
+    scene.spheres.push_back(sphere(vec3(0, 1.6f, -1), 0.3f, lightMat));
     scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f, redDiffuse));
     scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, mirrorMat));
     scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, glassMat));
     scene.spheres.push_back(sphere(vec3(0, -100.5f, -1), 100.0f, groundMat));
 
+    srand(42);
+    for (int a = -8; a < 8; a++) {
+        for (int b = -9; b < 1; b++) {
+            float chooseMat = rand() / (float)RAND_MAX;
+            vec3 center(a + 0.9f * (rand() / (float)RAND_MAX), -0.3f, -1.0f + b * 0.9f + (rand() / (float)RAND_MAX) * 0.5f);
 
+            if ((center - vec3(0, -0.3f, -1)).length() < 1.3f) continue;
+
+            Material randomMat;
+            if (chooseMat < 0.8f) {
+                vec3 albedo(rand() / (float)RAND_MAX, rand() / (float)RAND_MAX, rand() / (float)RAND_MAX);
+                randomMat = make_lambertian(albedo);
+            } else if (chooseMat < 0.95f) {
+                vec3 albedo(0.5f + 0.5f * (rand() / (float)RAND_MAX), 0.5f + 0.5f * (rand() / (float)RAND_MAX), 0.5f + 0.5f * (rand() / (float)RAND_MAX));
+                float fuzz = 0.5f * (rand() / (float)RAND_MAX);
+                randomMat = make_conductor(albedo, fuzz);
+            } else {
+                randomMat = make_dielectric(1.5f);
+            }
+
+            scene.spheres.push_back(sphere(center, 0.2f, randomMat));
+        }
+    }
+
+    for (size_t i = 0; i < scene.spheres.size(); i++) scene.spheres[i].calculate_bounding_box();
+    for (size_t i = 0; i < scene.triangles.size(); i++) scene.triangles[i].calculate_bounding_box();
+
+    AABB sceneBounds = scene.spheres[0].aabb;
+    for (size_t i = 1; i < scene.spheres.size(); i++)   sceneBounds = merge(sceneBounds, scene.spheres[i].aabb);
+    for (size_t i = 0; i < scene.triangles.size(); i++) sceneBounds = merge(sceneBounds, scene.triangles[i].aabb);
+    scene.bounds = sceneBounds;
+
+    for (size_t i = 0; i < scene.spheres.size(); i++) {
+        PrimitiveRef ref;
+        ref.bounds = scene.spheres[i].aabb;
+        ref.centroid = scene.spheres[i].center;
+        ref.primitiveType  = 0;
+        ref.primitiveIndex = i;
+        ref.mortonCode = morton3D(ref.centroid,scene.bounds);
+        scene.primitiveRefs.push_back(ref);
+        
+    }
+    for (size_t i = 0; i < scene.triangles.size(); i++) {
+        PrimitiveRef ref;
+        ref.bounds = scene.triangles[i].aabb;
+        ref.centroid = scene.triangles[i].calculateCentroid();
+        ref.primitiveType  = 1;
+        ref.primitiveIndex = i;
+        ref.mortonCode = morton3D(ref.centroid,scene.bounds);
+        scene.primitiveRefs.push_back(ref);
+        
+    }
     return scene;
 }
-
 // ============================================================================
 
 // ============================================================================
 // === RENDER ===
 // ============================================================================
 
-__global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* spheres,int sphereCount,triangle* triangles,int triangleCount,
-                                    int maximumX,int maximumY,unsigned long long seed,int sampleIndex){
+__global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, sphere* spheres, int sphereCount, triangle* triangles, int triangleCount,
+                                    int maximumX, int maximumY, unsigned long long seed, int sampleIndex){
 
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -503,16 +1040,23 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera,sphere* sph
     vec3 sampleColor(0.0f, 0.0f, 0.0f);
 
     for(int depth = 0 ; depth < camera.max_depth;depth++){
-        hitRecord hit = find_nearest_hit(r.origin, r.direction,spheres,sphereCount,triangles,triangleCount);
+        hitRecord hit = bvh.traverseRay(r.origin, r.direction, spheres, triangles);
         
         if(!hit.didHit){
             vec3 unitDir = r.direction.normalize();
             float t = 0.5f * (unitDir.y + 1.0f);
             vec3 skyColor = vec3(1.0f, 1.0f, 1.0f) * (1.0f - t) + vec3(0.5f, 0.7f, 1.0f) * t;
-            sampleColor = attenuation * skyColor;
+            sampleColor = sampleColor + attenuation * skyColor;
             break;
         }
+        sampleColor = sampleColor + attenuation * hit.mat.emittedColor;
+
+        if (hit.mat.type == MaterialType::Emissive) {
+            break;   
+        }
+
         attenuation =  attenuation * hit.mat.albedo;
+        
         if(depth > 3){
             float maxComponent = fmaxf(attenuation.x , fmaxf(attenuation.y,attenuation.z)); 
             float continueProbability =  fminf(maxComponent,0.95f);
@@ -556,6 +1100,7 @@ __global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int m
 
     outputBuffer[pixel_index] = accumBuffer[pixel_index] / float(samplesSoFar);
 }
+
 // ============================================================================
 
 // ============================================================================
@@ -588,10 +1133,9 @@ int main() {
     cam.image_width = numberOfPixels_X;
     cam.samples_per_pixel = 50;
     cam.max_depth = 20;
-    cam.vfov = 50.0f;
     cam.look_from = vec3(-1.9f, 0.6f, 1.2f);   
     cam.look_at = vec3(0, 0, -1);               
-    cam.vfov = 45.0f;
+    cam.vfov = 70.0f;
     cam.focus_distance = 2.73f;                 
     cam.aperture = 0.1f;
   
@@ -599,6 +1143,48 @@ int main() {
 
     // scene setup
     hostScene scene = setup_scene();
+
+    // === BVH: Morton koduna göre sort + cihaza kopyala ===
+    std::sort(scene.primitiveRefs.begin(), scene.primitiveRefs.end(),[](const PrimitiveRef& a, const PrimitiveRef& b) {
+            return a.mortonCode < b.mortonCode;
+        });
+
+    int numPrimitives = (int)scene.primitiveRefs.size();
+
+    std::vector<unsigned int> sortedMortonCodes(numPrimitives);
+    std::vector<int> sortedPrimitiveIDs(numPrimitives);
+    std::vector<AABB> sortedBounds(numPrimitives);
+    std::vector<int> sortedPrimitiveTypes(numPrimitives);       
+
+    for (int i = 0; i < numPrimitives; i++) {
+        sortedMortonCodes[i] = scene.primitiveRefs[i].mortonCode;
+        sortedPrimitiveIDs[i] = scene.primitiveRefs[i].primitiveIndex;
+        sortedBounds[i] = scene.primitiveRefs[i].bounds;
+        sortedPrimitiveTypes[i] = scene.primitiveRefs[i].primitiveType;   
+    }
+
+    unsigned int* d_sortedMortonCodes;
+    int* d_sortedPrimitiveIDs;
+    AABB* d_sortedBounds;
+    int* d_sortedPrimitiveTypes;                                    
+
+    CUDA_CHECK(cudaMalloc(&d_sortedMortonCodes, numPrimitives * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_sortedPrimitiveIDs, numPrimitives * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_sortedBounds, numPrimitives * sizeof(AABB)));
+    CUDA_CHECK(cudaMalloc(&d_sortedPrimitiveTypes, numPrimitives * sizeof(int)));  
+
+    CUDA_CHECK(cudaMemcpy(d_sortedMortonCodes, sortedMortonCodes.data(), numPrimitives * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sortedPrimitiveIDs, sortedPrimitiveIDs.data(), numPrimitives * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sortedBounds, sortedBounds.data(), numPrimitives * sizeof(AABB), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sortedPrimitiveTypes, sortedPrimitiveTypes.data(), numPrimitives * sizeof(int), cudaMemcpyHostToDevice));   
+
+    BVH bvh;
+    bvh.generateHierarchy(d_sortedMortonCodes, d_sortedPrimitiveIDs, d_sortedBounds, d_sortedPrimitiveTypes, numPrimitives);   
+
+    CUDA_CHECK(cudaFree(d_sortedMortonCodes));
+    CUDA_CHECK(cudaFree(d_sortedPrimitiveIDs));
+    CUDA_CHECK(cudaFree(d_sortedBounds));
+    CUDA_CHECK(cudaFree(d_sortedPrimitiveTypes));   
 
     // call the render_kernel
     sphere* d_spheres;
@@ -617,7 +1203,7 @@ int main() {
     
     auto renderStart = std::chrono::steady_clock::now();
     for (int s = 0; s < cam.samples_per_pixel; s++) {
-        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, d_spheres, sphereCount,d_triangles, triangleCount,numberOfPixels_X, numberOfPixels_Y,1234ULL, s);
+        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, 1234ULL, s);
         CUDA_CHECK_KERNEL();
 
         resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1);
@@ -663,7 +1249,9 @@ int main() {
     CUDA_CHECK(cudaFree(d_spheres));
     CUDA_CHECK(cudaFree(d_triangles));
     CUDA_CHECK(cudaFree(d_accumBuffer));   
+    bvh.free();
     delete[] host_frameBuffer;
+    
 
     return 0;
 }
