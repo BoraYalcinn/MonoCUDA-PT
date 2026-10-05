@@ -518,7 +518,7 @@ public:
     __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles) const {
         hitRecord nearestHit;
 
-        const int MAX_STACK = 64;
+        const int MAX_STACK = 32;
         int stackIdx[MAX_STACK];
         bool stackIsLeaf[MAX_STACK];
         int stackPtr = 0;

@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Defaults to the architecture of the GPU present on the build machine.
+# Override with -DCMAKE_CUDA_ARCHITECTURES=89 (Ada) / 120 (Blackwell) etc.
+# for cross-compiling or CI (no GPU present -> falls back to a safe list).
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 120-real)
+endif()
+
 project(MonoCUDA LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -7,12 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Defaults to the architecture of the GPU present on the build machine.
-# Override with -DCMAKE_CUDA_ARCHITECTURES=89 (Ada) / 120 (Blackwell) etc.
-# for cross-compiling or CI (no GPU present -> falls back to a safe list).
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120-real)
-endif()
+
 
 option(MONOCUDA_ENABLE_WARNINGS "Enable strict host+device warnings" ON)
 option(MONOCUDA_BENCH "Build the benchmark target" OFF)
