@@ -518,7 +518,7 @@ public:
     __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles) const {
         hitRecord nearestHit;
 
-        const int MAX_STACK = 32;
+        const int MAX_STACK = 64;
         int stackIdx[MAX_STACK];
         bool stackIsLeaf[MAX_STACK];
         int stackPtr = 0;
@@ -849,9 +849,6 @@ __global__ void findCollisions(const PrimitiveRef* d_primitiveRefs, BVH* d_bvh, 
         d_bvh->traverseHierarchy(d_primitiveRefs, idx, d_collisionCounts);
     }
 }
-
-
-
 // ============================================================================
 
 
@@ -1023,17 +1020,24 @@ __host__ hostScene setup_scene() {
 // ============================================================================
 // === RENDER ===
 // ============================================================================
+__global__ void init_rng_kernel(curandState* rngStates, int maximumX, int maximumY, unsigned long long seed){
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    if (i >= maximumX || j >= maximumY) return;
+    int pixel_index = maximumX * j + i;
+    curand_init(seed, pixel_index, 0, &rngStates[pixel_index]);
+}
+
 
 __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, sphere* spheres, int sphereCount, triangle* triangles, int triangleCount,
-                                    int maximumX, int maximumY, unsigned long long seed, int sampleIndex){
+                                    int maximumX, int maximumY, curandState* rngStates, int sampleIndex){
 
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if(i >= maximumX || j >= maximumY) return;
     int pixel_index = maximumX * j + i;
 
-    curandState rngState;
-    curand_init(seed,pixel_index,sampleIndex,&rngState);
+    curandState rngState = rngStates[pixel_index];
 
     Ray r = camera.getRay(i, j, &rngState);
     vec3 attenuation(1.0f, 1.0f, 1.0f);
@@ -1090,6 +1094,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         r = Ray(hit.hitPoint, newDirection);
     }
     accumBuffer[pixel_index] = accumBuffer[pixel_index] + sampleColor;
+    rngStates[pixel_index] = rngState;
 }
 
 __global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int maximumX, int maximumY, int samplesSoFar) {
@@ -1200,10 +1205,15 @@ int main() {
     vec3* d_accumBuffer;
     CUDA_CHECK(cudaMalloc(&d_accumBuffer, frameBufferSize));
     CUDA_CHECK(cudaMemset(d_accumBuffer, 0, frameBufferSize));
-    
+
+    curandState* d_rngStates;
+    CUDA_CHECK(cudaMalloc(&d_rngStates, totalNumberOfPixels * sizeof(curandState)));
+    init_rng_kernel<<<grid, block>>>(d_rngStates, numberOfPixels_X, numberOfPixels_Y, 1234ULL);
+    CUDA_CHECK_KERNEL();
+
     auto renderStart = std::chrono::steady_clock::now();
     for (int s = 0; s < cam.samples_per_pixel; s++) {
-        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, 1234ULL, s);
+        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, d_rngStates, s);
         CUDA_CHECK_KERNEL();
 
         resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1);
@@ -1212,7 +1222,7 @@ int main() {
         // PROGRESS BAR
         float percent = 100.0f * float(s + 1) / float(cam.samples_per_pixel);
         auto elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - renderStart).count();
-        printf("\rSample %d / %d (%.1f%%) — %.1fs elapsed", s + 1, cam.samples_per_pixel, percent, elapsed);
+        printf("\rSample %d / %d (%.1f%%) — %.3fs elapsed", s + 1, cam.samples_per_pixel, percent, elapsed);
         fflush(stdout);
     }
     printf("\n");
@@ -1249,6 +1259,7 @@ int main() {
     CUDA_CHECK(cudaFree(d_spheres));
     CUDA_CHECK(cudaFree(d_triangles));
     CUDA_CHECK(cudaFree(d_accumBuffer));   
+    CUDA_CHECK(cudaFree(d_rngStates));
     bvh.free();
     delete[] host_frameBuffer;
     
