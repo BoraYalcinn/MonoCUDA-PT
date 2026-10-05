@@ -40,6 +40,7 @@ endif()
 target_compile_options(monocuda PRIVATE
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-G;-g>
 )
+target_compile_options(monocuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
 # Release builds: aggressive optimization + fast math (path tracer doesn't
 # need strict IEEE compliance; revisit if correctness diffs demand it).
