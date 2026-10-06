@@ -266,8 +266,9 @@ struct triangle {
     }
 
     __host__ __device__ void calculate_bounding_box(){
-    aabb.minInterval = { fminf(v0.x, fminf(v1.x, v2.x)),  fminf(v0.y, fminf(v1.y, v2.y)),fminf(v0.z, fminf(v1.z, v2.z)) };
-    aabb.maxInterval = { fmaxf(v0.x, fmaxf(v1.x, v2.x)),fmaxf(v0.y, fmaxf(v1.y, v2.y)),fmaxf(v0.z, fmaxf(v1.z, v2.z)) };
+        const float eps = 1e-3f;
+        aabb.minInterval = { fminf(v0.x, fminf(v1.x, v2.x)) - eps, fminf(v0.y, fminf(v1.y, v2.y)) - eps, fminf(v0.z, fminf(v1.z, v2.z)) - eps };
+        aabb.maxInterval = { fmaxf(v0.x, fmaxf(v1.x, v2.x)) + eps, fmaxf(v0.y, fmaxf(v1.y, v2.y)) + eps, fmaxf(v0.z, fmaxf(v1.z, v2.z)) + eps };
     }
 
     __host__ __device__ AABB get_bounding_box(){return aabb;}
@@ -837,7 +838,11 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
 
                 vec3 edge1 = triangles[primitiveIdx].v1 - triangles[primitiveIdx].v0;
                 vec3 edge2 = triangles[primitiveIdx].v2 - triangles[primitiveIdx].v0;
-                nearestHit.hitNormal = edge1.cross(edge2).normalize();
+                vec3 n = edge1.cross(edge2).normalize();
+
+                bool front = rayDirection.dot(n) < 0.0f;     
+                nearestHit.frontFace = front;
+                nearestHit.hitNormal = front ? n : -n;
             }
         }
     }
@@ -876,6 +881,7 @@ public:
     vec3 pixel00_location;
     vec3 pixel_delta_u, pixel_delta_v;
     vec3 u, v, w;
+    vec3 backround_color;
 
     float aperture;
     float lens_radius;
@@ -928,9 +934,6 @@ public:
         return Ray(rayOriginOnLens,rayDirection);
     }
 };
-
-
-
 // ============================================================================
 
 
@@ -946,42 +949,69 @@ struct hostScene {
     AABB bounds;
 };
 
+static void add_quad(hostScene& s, vec3 a, vec3 b, vec3 c, vec3 d, Material m){
+    s.triangles.push_back(triangle(a, b, c, m));
+    s.triangles.push_back(triangle(a, c, d, m));
+}
+
+static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m){
+    float cs = cosf(rotY), sn = sinf(rotY);
+    vec3 p[8];
+    for (int i = 0; i < 8; i++) {
+        float x = (i & 1) ? half.x : -half.x;
+        float y = (i & 2) ? half.y : -half.y;
+        float z = (i & 4) ? half.z : -half.z;
+        p[i] = center + vec3(x*cs + z*sn, y, -x*sn + z*cs);
+    }
+    add_quad(s, p[0], p[1], p[3], p[2], m);  // -z
+    add_quad(s, p[4], p[5], p[7], p[6], m);  // +z
+    add_quad(s, p[0], p[2], p[6], p[4], m);  // -x
+    add_quad(s, p[1], p[3], p[7], p[5], m);  // +x
+    add_quad(s, p[0], p[1], p[5], p[4], m);  // -y
+    add_quad(s, p[2], p[3], p[7], p[6], m);  // +y
+}
+
 __host__ hostScene setup_scene() {
     hostScene scene;
 
-    Material redDiffuse = make_lambertian(vec3(0.8f, 0.3f, 0.3f));
-    Material groundMat = make_lambertian(vec3(0.5f, 1.0f, 0.5f));
-    Material mirrorMat = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.3f);
-    Material glassMat = make_dielectric(1.5f);
-    Material lightMat = make_emissive(vec3(4.0f, 4.0f, 4.0f));
+    
+    Material white  = make_lambertian(vec3(0.73f, 0.73f, 0.73f));
+    Material red = make_lambertian(vec3(0.65f, 0.05f, 0.05f));
+    Material green  = make_lambertian(vec3(0.12f, 0.45f, 0.15f));
+    Material mirror = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.02f);
+    Material light  = make_emissive(vec3(15.0f, 15.0f, 15.0f));
 
-    scene.spheres.push_back(sphere(vec3(0, 1.6f, -1), 0.3f, lightMat));
-    scene.spheres.push_back(sphere(vec3(0,0,-1), 0.5f, redDiffuse));
-    scene.spheres.push_back(sphere(vec3(1,0,-1), 0.3f, mirrorMat));
-    scene.spheres.push_back(sphere(vec3(-1,0,-1), 0.4f, glassMat));
-    scene.spheres.push_back(sphere(vec3(0, -100.5f, -1), 100.0f, groundMat));
+    const float L = -2.f, R = 2.f, B = 0.f, T = 4.f, F = -4.f, N = 0.f;
+    add_quad(scene, vec3(L,B,N), vec3(R,B,N), vec3(R,B,F), vec3(L,B,F), white);  // floor
+    add_quad(scene, vec3(L,T,N), vec3(R,T,N), vec3(R,T,F), vec3(L,T,F), white);  // ceiling
+    add_quad(scene, vec3(L,B,F), vec3(R,B,F), vec3(R,T,F), vec3(L,T,F), white);  // back
+    add_quad(scene, vec3(L,B,N), vec3(L,B,F), vec3(L,T,F), vec3(L,T,N), red);    // left
+    add_quad(scene, vec3(R,B,N), vec3(R,B,F), vec3(R,T,F), vec3(R,T,N), green);  // right
+    
+    add_quad(scene, vec3(-1.f,T-0.01f,-2.6f), vec3(1.f,T-0.01f,-2.6f),vec3(1.f,T-0.01f,-1.4f), vec3(-1.f,T-0.01f,-1.4f), light);
 
+    vec3 boxCenter(-0.8f, 1.1f, -2.8f);
+    add_box(scene, boxCenter, vec3(0.55f, 1.1f, 0.55f), 0.3f, white);
+    vec3 bigCenter(0.85f, 0.7f, -1.7f);
+    scene.spheres.push_back(sphere(bigCenter, 0.7f, mirror));
+
+    
     srand(42);
-    for (int a = -8; a < 8; a++) {
-        for (int b = -9; b < 1; b++) {
+    const float r = 0.1f;
+    for (int a = 0; a < 13; a++) {
+        for (int b = 0; b < 13; b++) {
+            float jx = (rand() / (float)RAND_MAX - 0.5f) * 0.08f;   
+            float jz = (rand() / (float)RAND_MAX - 0.5f) * 0.08f;
+            vec3 c(-1.8f + 0.3f * a + jx, r, -3.8f + 0.3f * b + jz);
+
+            if ((c - bigCenter).length() < 0.7f + r + 0.02f) continue;
+            if ((c - vec3(boxCenter.x, r, boxCenter.z)).length() < 0.9f) continue;  
             float chooseMat = rand() / (float)RAND_MAX;
-            vec3 center(a + 0.9f * (rand() / (float)RAND_MAX), -0.3f, -1.0f + b * 0.9f + (rand() / (float)RAND_MAX) * 0.5f);
-
-            if ((center - vec3(0, -0.3f, -1)).length() < 1.3f) continue;
-
-            Material randomMat;
-            if (chooseMat < 0.8f) {
-                vec3 albedo(rand() / (float)RAND_MAX, rand() / (float)RAND_MAX, rand() / (float)RAND_MAX);
-                randomMat = make_lambertian(albedo);
-            } else if (chooseMat < 0.95f) {
-                vec3 albedo(0.5f + 0.5f * (rand() / (float)RAND_MAX), 0.5f + 0.5f * (rand() / (float)RAND_MAX), 0.5f + 0.5f * (rand() / (float)RAND_MAX));
-                float fuzz = 0.5f * (rand() / (float)RAND_MAX);
-                randomMat = make_conductor(albedo, fuzz);
-            } else {
-                randomMat = make_dielectric(1.5f);
-            }
-
-            scene.spheres.push_back(sphere(center, 0.2f, randomMat));
+            Material m;
+            if (chooseMat < 0.8f)       m = make_lambertian(vec3(rand()/(float)RAND_MAX, rand()/(float)RAND_MAX, rand()/(float)RAND_MAX));
+            else if (chooseMat < 0.95f) m = make_conductor(vec3(0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX)), 0.3f*(rand()/(float)RAND_MAX));
+            else                        m = make_dielectric(1.5f);
+            scene.spheres.push_back(sphere(c, r, m));
         }
     }
 
@@ -1047,10 +1077,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         hitRecord hit = bvh.traverseRay(r.origin, r.direction, spheres, triangles);
         
         if(!hit.didHit){
-            vec3 unitDir = r.direction.normalize();
-            float t = 0.5f * (unitDir.y + 1.0f);
-            vec3 skyColor = vec3(1.0f, 1.0f, 1.0f) * (1.0f - t) + vec3(0.5f, 0.7f, 1.0f) * t;
-            sampleColor = sampleColor + attenuation * skyColor;
+            sampleColor = sampleColor + attenuation * camera.backround_color;
             break;
         }
         sampleColor = sampleColor + attenuation * hit.mat.emittedColor;
@@ -1117,8 +1144,8 @@ int main() {
     fetchDeviceInfo();
     
     // display size
-    int numberOfPixels_X = 800;
-    int numberOfPixels_Y = 400;
+    int numberOfPixels_X = 600;
+    int numberOfPixels_Y = 600;     
     int totalNumberOfPixels = numberOfPixels_X * numberOfPixels_Y;
 
     // determine the number of block and grid numbers to be used
@@ -1136,13 +1163,14 @@ int main() {
     Camera cam;
     cam.aspect_ratio = numberOfPixels_X / float(numberOfPixels_Y);
     cam.image_width = numberOfPixels_X;
-    cam.samples_per_pixel = 50;
     cam.max_depth = 20;
-    cam.look_from = vec3(-1.9f, 0.6f, 1.2f);   
-    cam.look_at = vec3(0, 0, -1);               
-    cam.vfov = 70.0f;
-    cam.focus_distance = 2.73f;                 
-    cam.aperture = 0.1f;
+    cam.look_from = vec3(0, 2, 5.5f);
+    cam.look_at = vec3(0, 2, -2);
+    cam.vfov = 40.0f;                    
+    cam.focus_distance = 7.5f;
+    cam.aperture = 0.0f;
+    cam.backround_color = vec3(0, 0, 0);
+    cam.samples_per_pixel = 500;
   
     cam.initialize();
 
