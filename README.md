@@ -1,15 +1,19 @@
 # MonoCUDA-PT
 MonoCUDA is an original CUDA path tracer written as a single source file. It was started after completing Peter Shirley's Ray Tracing in One Weekend series in C++, with the goal of understanding how physically based rendering, specifically Monte Carlo path integration, maps onto GPU hardware rather than a single CPU thread. It is not based on or derived from NVIDIA's official CUDA port of the same book.
 
-The renderer is deliberately kept in one file. The intent is for the source to read as a continuous explanation of a GPU path tracer's design, from ray generation through BVH traversal, material evaluation, and light transport, rather than as a general-purpose rendering engine split across many files. Kernels are written iteratively rather than recursively, since recursion on GPU forces register spilling and reduces occupancy; 
+The renderer is deliberately kept in one file. The intent is for the source to read as a continuous explanation of a GPU path tracer's design, from ray generation through BVH traversal, material evaluation, and light transport, rather than as a general-purpose rendering engine split across many files. Kernels are written iteratively rather than recursively, since recursion on GPU forces register spilling and reduces occupancy.
 
-The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive) with multiple importance sampling between light and BSDF sampling. Correctness is checked against a CPU reference implementation on shared test scenes, and performance is tracked with benchmark numbers will be recorded in bench/results.md.
+The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Multiple importance sampling between light and BSDF sampling and correctness checks against a CPU reference implementation are planned (see CHECKLIST.md). Performance is tracked with benchmark numbers that will be recorded in bench/results.md.
 
 Building requires the CUDA Toolkit (12.x or later), CMake 3.24 or later, and a CUDA-capable NVIDIA GPU. From the repository root:
 
+```
 cmake --preset release
 cmake --build --preset release
-./build/release/monocuda --out render.ppm
+./build/release/monocuda
+```
+
+The render is written to `render.ppm` in the current directory.
 
 The project's implementation status is tracked in CHECKLIST.md. It is licensed under the MIT License.
 
@@ -25,9 +29,9 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ x ] Progressive rendering loop (N samples/pixel, accumulate + save incrementally)
 
 ## 2. Scene Representation & Acceleration Structures
-- [ x ] Primitive types: sphere, and at least one more
+- [ x ] Primitive types: sphere, and at least one more (triangle)
 - [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access
-- [ x ] BVH construction (GPU-side LBVH build via Morton codes + Karras parallel radix-tree algorithm)
+- [ x ] BVH construction (LBVH build via Morton codes + Karras parallel radix-tree algorithm; Morton codes and sort on the CPU, tree construction and bounds refit on the GPU)
 - [ x ] BVH traversal (device-side, iterative, stack-based — no recursion)
 - [ x ] Bounding-box (AABB) intersection + slab test
 - [ ] **(stretch)** SAH (surface area heuristic) BVH build for better traversal quality
@@ -75,10 +79,10 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] **(stretch)** Proper motion-aware BVH instead of a single expanded box per moving primitive
 
 ## 8. GPU Architecture-Specific Design
-- [ ] Iterative (not recursive) kernels throughout — verify with register usage report (`nvcc --ptxas-options=-v`)
-- [ ] Persistent per-pixel RNG state, not reinitialized per sample
+- [ x ] Iterative (not recursive) kernels throughout — verified with the register/stack usage report (`cuobjdump --dump-resource-usage`, equivalent to `nvcc --ptxas-options=-v`)
+- [ x ] Persistent per-pixel RNG state, not reinitialized per sample
 - [ ] Memory access audit: confirm scene/material reads go through `__ldg`/`const __restrict__`
-- [ ] Occupancy measurement (Nsight Compute or `nvidia-smi`) at a baseline milestone
+- [ x ] Occupancy measurement (Nsight Compute or `nvidia-smi`) at a baseline milestone
 - [ ] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything")
 - [ ] **(stretch)** Material-sorted shading — sort active paths by material ID before shading to reduce warp divergence
 
@@ -92,6 +96,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [ ] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo
 - [ ] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag)
+- [ x ] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor)
 
 ## References
 
@@ -100,3 +105,18 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - Tero Karras, NVIDIA Developer Blog — "Thinking Parallel, Part II: Tree Traversal on the GPU" (https://developer.nvidia.com/blog/thinking-parallel-part-ii-tree-traversal-gpu/)
 - Tero Karras, NVIDIA Developer Blog — "Thinking Parallel, Part III: Tree Construction on the GPU" (https://developer.nvidia.com/blog/thinking-parallel-part-iii-tree-construction-gpu/)
 - ToruNiina/lbvh (https://github.com/ToruNiina/lbvh) — used as a reference while designing and debugging MonoCUDA-PT's own LBVH construction and traversal; not used as source code
+
+## Blog
+
+I write about the process of building this project (BVH construction, profiling with Nsight Compute, and more) on my portfolio website: [borayalcinn.github.io](https://borayalcinn.github.io/)
+
+## Reference Books
+
+<p>
+  <img src="assets/readme/fundamentals-of-computer-graphics.png" alt="Fundamentals of Computer Graphics, Fifth Edition" height="320">
+  &nbsp;&nbsp;
+  <img src="assets/readme/essential-mathematics-for-games.png" alt="Essential Mathematics for Games and Interactive Applications, Second Edition" height="320">
+</p>
+
+- Steve Marschner, Peter Shirley — *Fundamentals of Computer Graphics*, Fifth Edition, CRC Press / A K Peters
+- James M. Van Verth, Lars M. Bishop — *Essential Mathematics for Games and Interactive Applications: A Programmer's Guide*, Second Edition, CRC Press
