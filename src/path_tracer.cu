@@ -248,6 +248,7 @@ public:
 // ============================================================================
 // === MESH & PRIMITIVE TYPES ===
 // ============================================================================
+__host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide);
 __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
 }
@@ -305,6 +306,8 @@ __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3&
 
 struct sphere {
     vec3 center;
+    vec3 center1;  
+    bool isMoving = false;
     float radius;
     Material mat;
     AABB aabb;
@@ -312,23 +315,34 @@ struct sphere {
     __host__ __device__ sphere(){}
     __host__ __device__ sphere(vec3 center_,double radius_) : center(center_), radius(radius_){}
     __host__ __device__ sphere(vec3 center_,double radius_,Material mat_) : center(center_), radius(radius_), mat(mat_){} 
+    __host__ __device__ sphere(vec3 c0, vec3 c1, double radius_, Material mat_) : center(c0), center1(c1), isMoving(true), radius(radius_), mat(mat_){}
 
     __host__ __device__ vec3 calculateCentroid(){
-        return center;
+        return isMoving ? (center + center1) * 0.5f : center;
     }
     __host__ __device__ void calculate_bounding_box(){
-        aabb.minInterval = {(center.x - radius),(center.y - radius),(center.z - radius)};
-        aabb.maxInterval = {(center.x + radius),(center.y + radius),(center.z + radius)};
+        vec3 rv(radius, radius, radius);
+        AABB b0(center - rv, center + rv);
+        if (!isMoving) { 
+            aabb = b0; 
+            return;
+        }
+        AABB b1(center1 - rv, center1 + rv);
+        aabb = merge(b0, b1);                    
+    }
+    __host__ __device__ vec3 center_at(float t) const {
+        return isMoving ? center + (center1 - center) * t : center;
     }
     __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
 
-__device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float& intersectionDistance,bool& frontFace, vec3& outwardNormal) {
-    vec3 vectorFromRayOriginToSphereCenter = targetSphere.center - rayOrigin;
+__device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float time,float& intersectionDistance,bool& frontFace, vec3& outwardNormal) {
+    vec3 cur_center = targetSphere.center_at(time);
+    vec3 vectorFromRayOriginToSphereCenter = cur_center - rayOrigin;
     float distanceToClosestPointOnRay =  vectorFromRayOriginToSphereCenter.dot(rayDirection) / rayDirection.dot(rayDirection);
     vec3 closestPointOnRay = rayOrigin + rayDirection * distanceToClosestPointOnRay;
 
-    float distanceSquaredFromCenterToClosest = (targetSphere.center - closestPointOnRay).length_squared();
+    float distanceSquaredFromCenterToClosest = (cur_center - closestPointOnRay).length_squared();
     float discriminant = targetSphere.radius * targetSphere.radius - distanceSquaredFromCenterToClosest;
 
     if (discriminant < 0.0f) {
@@ -342,7 +356,7 @@ __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, con
     if (t < 0.0001f) return false;
 
     vec3 hitPoint = rayOrigin + rayDirection * t;
-    outwardNormal = (hitPoint - targetSphere.center).normalize();
+    outwardNormal = (hitPoint - cur_center).normalize();
     frontFace = rayDirection.dot(outwardNormal) < 0.0f;   // is ray coming from outside
 
     intersectionDistance = t;
@@ -380,15 +394,19 @@ __host__ __device__ inline unsigned int morton3D(const vec3& centroid, const AAB
 // === Ray & HitRecord ===
 // ============================================================================
 struct Ray{
+public:
     vec3 origin;
     vec3 direction;
+    float time;
 
     __device__ Ray(){}
-    __device__ Ray(vec3 origin_,vec3 direction_) : origin(origin_),direction(direction_) {}
+    __device__ Ray(vec3 origin_,vec3 direction_) : origin(origin_),direction(direction_),time(0.f) {}
+    __device__ Ray(vec3 origin_,vec3 direction_,float time_) : origin(origin_),direction(direction_),time(time_){}
 
-    __device__ vec3 isAt(double t) const {
+    __device__ vec3 isAt(float t) const {
         return origin + direction * t; 
     }
+
 };
 
 struct hitRecord{
@@ -400,49 +418,6 @@ struct hitRecord{
     bool frontFace = true;
 };
 
-__device__ hitRecord find_nearest_hit(const vec3& rayOrig,const vec3& rayDir,
-                                        const sphere* sphereArray,const int sphereCount,
-                                        const triangle* triangleArray,const int triangleCount){
-    hitRecord nearestHit;
-
-    bool frontFace;
-    vec3 outwardNormal;
-    for(int i = 0; i < sphereCount;i++ ){
-        float t;
-        if(hit_sphere(sphereArray[i],rayOrig,rayDir,t,frontFace,outwardNormal)){
-            if(t < nearestHit.closestDistance && t > 0.0001f){
-                nearestHit.didHit = true;
-                nearestHit.closestDistance = t;
-                nearestHit.hitPoint = rayOrig + rayDir * t;
-                nearestHit.hitNormal = (nearestHit.hitPoint - sphereArray[i].center).normalize();
-                nearestHit.mat = sphereArray[i].mat;
-                nearestHit.frontFace = frontFace;
-                if(frontFace){
-                    nearestHit.hitNormal = outwardNormal;
-                }else{
-                    nearestHit.hitNormal = -outwardNormal;
-                }
-            }
-        }
-    }
-
-    for (int i = 0; i < triangleCount; i++) {
-    float t;
-    if (hit_triangle(triangleArray[i], rayOrig, rayDir, t)) {
-        if (t < nearestHit.closestDistance && t > 0.0001f) {
-            nearestHit.didHit = true;
-            nearestHit.closestDistance = t;
-            nearestHit.hitPoint = rayOrig + rayDir * t;
-            nearestHit.mat = triangleArray[i].mat;
-
-            vec3 edge1 = triangleArray[i].v1 - triangleArray[i].v0;
-            vec3 edge2 = triangleArray[i].v2 - triangleArray[i].v0;
-            nearestHit.hitNormal = edge1.cross(edge2).normalize();
-        }
-    }
-}
-    return nearestHit;
-}
 // ============================================================================
 
 
@@ -476,7 +451,7 @@ __global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNod
 __host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide);   
 __host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide);          
 __host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance);
-__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
 // ===============================================================================
 class BVH{
 
@@ -516,7 +491,7 @@ public:
         CUDA_CHECK(cudaFree(d_atomicCounters));
     }
 
-    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles) const {
+    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles) const {
         hitRecord nearestHit;
 
         const int MAX_STACK = 64;
@@ -549,12 +524,12 @@ public:
             if (overlapL && childLIsLeaf) {
                 int primitiveIdx = d_leafNode[childLIdx].primitiveIndex;
                 int primitiveType = d_primitiveTypes[childLIdx];
-                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection, spheres, triangles, nearestHit);
+                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection,time, spheres, triangles, nearestHit);
             }
             if (overlapR && childRIsLeaf) {
                 int primitiveIdx = d_leafNode[childRIdx].primitiveIndex;
                 int primitiveType = d_primitiveTypes[childRIdx];
-                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection, spheres, triangles, nearestHit);
+                testPrimitiveHit(primitiveType, primitiveIdx, rayOrigin, rayDirection, time, spheres, triangles, nearestHit);
             }
 
 
@@ -812,12 +787,12 @@ __host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin,
     return true;
 }
 
-__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit){
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection,float time, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit){
     if (primitiveType == 0) {
         float intersectionDistance;
         bool frontFace;
         vec3 outwardNormal;
-        if (hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, intersectionDistance, frontFace, outwardNormal)) {
+        if (hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, time, intersectionDistance, frontFace, outwardNormal)) {
             if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
                 nearestHit.didHit = true;
                 nearestHit.closestDistance = intersectionDistance;
@@ -923,15 +898,20 @@ public:
         }
     }
 
+    __device__ double random_double(curandState* rngState,double low,double high) const{
+        return low + (high - low) * curand_uniform_double(rngState);
+    }
+
     __device__ Ray getRay(int pixelX,int pixelY,curandState* rngState) const{
         vec3 pixelCenter = pixel00_location + (pixel_delta_u * float(pixelX)) + (pixel_delta_v * float(pixelY));
         
         vec3 randomPointOnLens = random_in_unit_disk(rngState) * lens_radius;
         vec3 lensOffSetInWorldSpace = u * randomPointOnLens.x + v * randomPointOnLens.y;
         vec3 rayOriginOnLens = center + lensOffSetInWorldSpace;
+        float ray_time = curand_uniform(rngState);
 
         vec3 rayDirection = (pixelCenter - rayOriginOnLens).normalize();
-        return Ray(rayOriginOnLens,rayDirection);
+        return Ray(rayOriginOnLens, rayDirection, ray_time);
     }
 };
 // ============================================================================
@@ -1008,10 +988,16 @@ __host__ hostScene setup_scene() {
             if ((c - vec3(boxCenter.x, r, boxCenter.z)).length() < 0.9f) continue;  
             float chooseMat = rand() / (float)RAND_MAX;
             Material m;
-            if (chooseMat < 0.8f)       m = make_lambertian(vec3(rand()/(float)RAND_MAX, rand()/(float)RAND_MAX, rand()/(float)RAND_MAX));
+            if (chooseMat < 0.8f) m = make_lambertian(vec3(rand()/(float)RAND_MAX, rand()/(float)RAND_MAX, rand()/(float)RAND_MAX));
             else if (chooseMat < 0.95f) m = make_conductor(vec3(0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX)), 0.3f*(rand()/(float)RAND_MAX));
-            else                        m = make_dielectric(1.5f);
-            scene.spheres.push_back(sphere(c, r, m));
+            else m = make_dielectric(1.5f);
+
+            if (a == 6 && b == 10) {
+                Material blue = make_lambertian(vec3(0.1f, 0.2f, 0.9f));
+                scene.spheres.push_back(sphere(vec3(c.x, 0.25f, c.z), vec3(c.x, 1.25f, c.z), 0.25f, blue));
+            } else {
+                scene.spheres.push_back(sphere(c, r, m));
+            }
         }
     }
 
@@ -1026,7 +1012,7 @@ __host__ hostScene setup_scene() {
     for (size_t i = 0; i < scene.spheres.size(); i++) {
         PrimitiveRef ref;
         ref.bounds = scene.spheres[i].aabb;
-        ref.centroid = scene.spheres[i].center;
+        ref.centroid = scene.spheres[i].calculateCentroid();
         ref.primitiveType  = 0;
         ref.primitiveIndex = i;
         ref.mortonCode = morton3D(ref.centroid,scene.bounds);
@@ -1074,7 +1060,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
     vec3 sampleColor(0.0f, 0.0f, 0.0f);
 
     for(int depth = 0 ; depth < camera.max_depth;depth++){
-        hitRecord hit = bvh.traverseRay(r.origin, r.direction, spheres, triangles);
+        hitRecord hit = bvh.traverseRay(r.origin, r.direction,r.time, spheres, triangles);
         
         if(!hit.didHit){
             sampleColor = sampleColor + attenuation * camera.backround_color;
@@ -1118,7 +1104,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 newDirection = lambertian_scatter_direction(hit.hitNormal, &rngState);
                 break;
         }
-        r = Ray(hit.hitPoint, newDirection);
+        r = Ray(hit.hitPoint, newDirection, r.time);   
     }
     accumBuffer[pixel_index] = accumBuffer[pixel_index] + sampleColor;
     rngStates[pixel_index] = rngState;
