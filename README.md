@@ -73,9 +73,9 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] **(stretch)** Heterogeneous volumes (3D voxel grid for density — real smoke/cloud data)
 
 ## 7. Motion Blur
-- [ ] Per-sample time value on each ray (random within the shutter interval)
-- [ ] Time-interpolated primitive transforms (e.g. `center0`/`center1` lerp'ed by `time` for a moving sphere)
-- [ ] BVH handling for moving primitives — expanded bounding box covering the full motion range
+- [ x ] Per-sample time value on each ray (random within the shutter interval)
+- [ x ] Time-interpolated primitive transforms (e.g. `center0`/`center1` lerp'ed by `time` for a moving sphere)
+- [ x ] BVH handling for moving primitives — expanded bounding box covering the full motion range
 - [ ] **(stretch)** Proper motion-aware BVH instead of a single expanded box per moving primitive
 
 ## 8. GPU Architecture-Specific Design
