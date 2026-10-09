@@ -986,21 +986,22 @@ __host__ hostScene setup_scene() {
 
             if ((c - bigCenter).length() < 0.7f + r + 0.02f) continue;
             if ((c - vec3(boxCenter.x, r, boxCenter.z)).length() < 0.9f) continue;  
-            float chooseMat = rand() / (float)RAND_MAX;
-            Material m;
-            if (chooseMat < 0.8f) m = make_lambertian(vec3(rand()/(float)RAND_MAX, rand()/(float)RAND_MAX, rand()/(float)RAND_MAX));
-            else if (chooseMat < 0.95f) m = make_conductor(vec3(0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX)), 0.3f*(rand()/(float)RAND_MAX));
-            else m = make_dielectric(1.5f);
 
-            if (a == 6 && b == 10) {
-                Material blue = make_lambertian(vec3(0.1f, 0.2f, 0.9f));
-                scene.spheres.push_back(sphere(vec3(c.x, 0.25f, c.z), vec3(c.x, 1.25f, c.z), 0.25f, blue));
+            float chooseMat = rand() / (float)RAND_MAX;
+
+            if (chooseMat < 0.8f) {
+                Material m = make_lambertian(vec3(rand()/(float)RAND_MAX, rand()/(float)RAND_MAX, rand()/(float)RAND_MAX));
+                float h = 0.5f * (rand() / (float)RAND_MAX);
+                scene.spheres.push_back(sphere(c, c + vec3(0.f, h, 0.f), r, m));
             } else {
+                Material m;
+                if (chooseMat < 0.95f) m = make_conductor(vec3(0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX), 0.5f + 0.5f*(rand()/(float)RAND_MAX)), 0.3f*(rand()/(float)RAND_MAX));
+                else m = make_dielectric(1.5f);
                 scene.spheres.push_back(sphere(c, r, m));
             }
         }
     }
-
+    
     for (size_t i = 0; i < scene.spheres.size(); i++) scene.spheres[i].calculate_bounding_box();
     for (size_t i = 0; i < scene.triangles.size(); i++) scene.triangles[i].calculate_bounding_box();
 
