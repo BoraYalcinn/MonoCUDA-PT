@@ -304,6 +304,21 @@ __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3&
     return true;
 }
 
+// to pick a random point on triangles surface
+__device__ vec3 sample_triangle(const triangle& tri,curandState* rngState){
+    float randomValue_1 = curand_uniform(rngState);
+    float randomValue_2 = curand_uniform(rngState); 
+    // we are taking its squareRoot so that the random values spread out evenly inside the triangle
+    float sqrtRandom_1 = sqrtf(randomValue_1);
+
+    float weightOfVertex0 = 1.0f - sqrtRandom_1;
+    float weightOfVertex1 = randomValue_2 * sqrtRandom_1;
+    float weightOfVertex2 = 1.0f - weightOfVertex0 - weightOfVertex1;
+
+    return tri.v0 * weightOfVertex0 + tri.v1 * weightOfVertex1 + tri.v2 * weightOfVertex2; 
+
+}
+
 struct sphere {
     vec3 center;
     vec3 center1;  
@@ -389,6 +404,16 @@ __host__ __device__ inline unsigned int morton3D(const vec3& centroid, const AAB
 
 // ============================================================================
 
+// ============================================================================
+// === Lights ===
+// ============================================================================
+struct Light{
+    triangle sourceTriangle;
+    float surfaceArea;
+    vec3 surfaceNormal;
+};
+
+// ============================================================================
 
 // ============================================================================
 // === Ray & HitRecord ===
@@ -491,8 +516,9 @@ public:
         CUDA_CHECK(cudaFree(d_atomicCounters));
     }
 
-    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles) const {
+    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles,float maxDistance = 1e30f) const {
         hitRecord nearestHit;
+        nearestHit.closestDistance = maxDistance;
 
         const int MAX_STACK = 64;
         int stackIdx[MAX_STACK];
@@ -639,9 +665,7 @@ __device__ inline int delta(const unsigned int* sortedMortonCodes, int numObject
 }
 
 __device__ inline int2 determineRange(const unsigned int* sortedMortonCodes, int numObjects, int idx){
-    int d = (delta(sortedMortonCodes, numObjects, idx, idx+1) -
-             delta(sortedMortonCodes, numObjects, idx, idx-1)) >= 0 ? 1 : -1;
-
+    int d = (delta(sortedMortonCodes, numObjects, idx, idx+1) - delta(sortedMortonCodes, numObjects, idx, idx-1)) >= 0 ? 1 : -1;
     int deltaMin = delta(sortedMortonCodes, numObjects, idx, idx - d);
 
     int lmax = 2;
@@ -706,7 +730,7 @@ __global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNod
         if (old == 0) return;   
 
         BVH_Node& node = d_internalNodes[currentParent];
-        AABB leftBounds  = node.leftIsLeaf  ? d_leafNode[node.leftChild].bounds  : d_internalNodes[node.leftChild].bounds;
+        AABB leftBounds = node.leftIsLeaf  ? d_leafNode[node.leftChild].bounds  : d_internalNodes[node.leftChild].bounds;
         AABB rightBounds = node.rightIsLeaf ? d_leafNode[node.rightChild].bounds : d_internalNodes[node.rightChild].bounds;
         node.bounds = merge(leftBounds, rightBounds);
 
@@ -925,6 +949,7 @@ public:
 struct hostScene {
     std::vector<sphere> spheres;
     std::vector<triangle> triangles;
+    std::vector<Light> lights;
     std::vector<PrimitiveRef> primitiveRefs;
     AABB bounds;
 };
@@ -1028,8 +1053,21 @@ __host__ hostScene setup_scene() {
         ref.primitiveIndex = i;
         ref.mortonCode = morton3D(ref.centroid,scene.bounds);
         scene.primitiveRefs.push_back(ref);
-        
+        if(scene.triangles[i].mat.type == MaterialType::Emissive){
+            triangle& emissiveTriangle = scene.triangles[i];
+            vec3 edgeOne = emissiveTriangle.v1 - emissiveTriangle.v0;
+            vec3 edgeTwo = emissiveTriangle.v2 - emissiveTriangle.v0;
+            
+            vec3 areaVector = edgeOne.cross(edgeTwo);
+
+            Light light;
+            light.sourceTriangle = emissiveTriangle;
+            light.surfaceArea = 0.5f * areaVector.length();
+            light.surfaceNormal = areaVector.normalize();
+            scene.lights.push_back(light);
+        }
     }
+
     return scene;
 }
 // ============================================================================
@@ -1047,7 +1085,7 @@ __global__ void init_rng_kernel(curandState* rngStates, int maximumX, int maximu
 
 
 __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, sphere* spheres, int sphereCount, triangle* triangles, int triangleCount,
-                                    int maximumX, int maximumY, curandState* rngStates, int sampleIndex){
+                                    int maximumX, int maximumY, curandState* rngStates, int sampleIndex,Light* lights,int lightCount){
 
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -1059,6 +1097,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
     Ray r = camera.getRay(i, j, &rngState);
     vec3 attenuation(1.0f, 1.0f, 1.0f);
     vec3 sampleColor(0.0f, 0.0f, 0.0f);
+    bool previousBounceWasSpecular = true;   
 
     for(int depth = 0 ; depth < camera.max_depth;depth++){
         hitRecord hit = bvh.traverseRay(r.origin, r.direction,r.time, spheres, triangles);
@@ -1067,13 +1106,42 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             sampleColor = sampleColor + attenuation * camera.backround_color;
             break;
         }
-        sampleColor = sampleColor + attenuation * hit.mat.emittedColor;
+        if (depth == 0 || previousBounceWasSpecular) {
+            sampleColor = sampleColor + attenuation * hit.mat.emittedColor;
+        }
 
         if (hit.mat.type == MaterialType::Emissive) {
             break;   
         }
 
         attenuation =  attenuation * hit.mat.albedo;
+
+        // ---- NEXT EVENT ESTIMATION (direct light) ----
+        if (hit.mat.type == MaterialType::Lambertian && lightCount > 0) {
+            int selectedLightIndex = min((int)(curand_uniform(&rngState) * lightCount), lightCount - 1);
+            const Light& selectedLight = lights[selectedLightIndex];
+            float lightSelectionProbability = 1.0f / float(lightCount);
+
+            vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &rngState);
+            vec3 vectorToLight = sampledPointOnLight - hit.hitPoint;
+            float distanceToLight = vectorToLight.length();
+            vec3 directionToLight = vectorToLight / distanceToLight;
+
+            float cosineAtSurface = hit.hitNormal.dot(directionToLight);
+            float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
+
+            if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
+                hitRecord shadowHit = bvh.traverseRay(hit.hitPoint, directionToLight, r.time, spheres, triangles, distanceToLight * 0.999f);
+
+                if (!shadowHit.didHit) {
+                    float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
+                    vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
+                    sampleColor = sampleColor + attenuation * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf));
+                }
+            }
+        }
+        // ----------------------------------------------
+
         
         if(depth > 3){
             float maxComponent = fmaxf(attenuation.x , fmaxf(attenuation.y,attenuation.z)); 
@@ -1105,8 +1173,16 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 newDirection = lambertian_scatter_direction(hit.hitNormal, &rngState);
                 break;
         }
+        previousBounceWasSpecular = (hit.mat.type != MaterialType::Lambertian);
         r = Ray(hit.hitPoint, newDirection, r.time);   
     }
+    // to reduce firefly points
+    float brightestChannel = fmaxf(sampleColor.x,fmaxf(sampleColor.y,sampleColor.z));
+    const float maximumSampleBrightness = 10.0f;
+    if(brightestChannel > maximumSampleBrightness){
+        sampleColor = sampleColor * (maximumSampleBrightness / brightestChannel);
+    }
+
     accumBuffer[pixel_index] = accumBuffer[pixel_index] + sampleColor;
     rngStates[pixel_index] = rngState;
 }
@@ -1226,9 +1302,14 @@ int main() {
     init_rng_kernel<<<grid, block>>>(d_rngStates, numberOfPixels_X, numberOfPixels_Y, 1234ULL);
     CUDA_CHECK_KERNEL();
 
+    Light* d_lights;
+    int lightCount = (int)scene.lights.size();
+    CUDA_CHECK(cudaMalloc(&d_lights, lightCount * sizeof(Light)));
+    CUDA_CHECK(cudaMemcpy(d_lights, scene.lights.data(), lightCount * sizeof(Light), cudaMemcpyHostToDevice));
+
     auto renderStart = std::chrono::steady_clock::now();
     for (int s = 0; s < cam.samples_per_pixel; s++) {
-        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, d_rngStates, s);
+        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, d_rngStates, s,d_lights,lightCount);
         CUDA_CHECK_KERNEL();
 
         resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1);
@@ -1240,6 +1321,7 @@ int main() {
         printf("\rSample %d / %d (%.1f%%) — %.3fs elapsed", s + 1, cam.samples_per_pixel, percent, elapsed);
         fflush(stdout);
     }
+    printf("\nLight triangles in the scene: %zu\n", scene.lights.size());
     printf("\n");
 
     CUDA_CHECK(cudaMemcpy(host_frameBuffer,device_frameBuffer,frameBufferSize,cudaMemcpyDeviceToHost));
@@ -1275,6 +1357,7 @@ int main() {
     CUDA_CHECK(cudaFree(d_triangles));
     CUDA_CHECK(cudaFree(d_accumBuffer));   
     CUDA_CHECK(cudaFree(d_rngStates));
+    CUDA_CHECK(cudaFree(d_lights));
     bvh.free();
     delete[] host_frameBuffer;
     
