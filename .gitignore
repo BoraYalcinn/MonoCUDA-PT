@@ -7,9 +7,10 @@ build/
 compile_commands.json
 .vscode/
 .idea/
+*.ncu-rep*
 *.nsys-rep
-*.ncu-rep
-
+*.sqlite
+*.ppm
 //CUDA
 
 *.i
