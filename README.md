@@ -5,15 +5,18 @@ The renderer is deliberately kept in one file. The intent is for the source to r
 
 The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, and the renderer supports motion blur through time-sampled rays and moving spheres. Multiple importance sampling between light and BSDF sampling and correctness checks against a CPU reference implementation are planned (see below checklist). Performance is tracked with benchmark numbers that will be recorded in bench/results.md.
 
+Two execution models are implemented side by side and produce the same image: a single-kernel path tracer (the default), where one thread follows a whole path, and a wavefront path tracer (`--wavefront`), which splits every bounce into separate extend, shade and shadow-ray kernels connected by compacted path queues and a structure-of-arrays path state. The wavefront version raises the average number of active threads per warp from about 7 to about 27 on the first bounce, at the cost of extra memory traffic.
+
 Building requires the CUDA Toolkit (12.x or later), CMake 3.24 or later, and a CUDA-capable NVIDIA GPU. From the repository root:
 
 ```
 cmake --preset release
 cmake --build --preset release
-./build/release/monocuda
+./build/release/monocuda               # single-kernel path tracer
+./build/release/monocuda --wavefront   # wavefront path tracer
 ```
 
-The render is written to `render.ppm` in the current directory.
+The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model.
 
 The project's implementation status is tracked in CHECKLIST.md. It is licensed under the MIT License.
 
@@ -30,7 +33,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 
 ## 2. Scene Representation & Acceleration Structures
 - [x] Primitive types: sphere, and at least one more (triangle)
-- [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access
+- [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access *(path state and hit results are already SoA in the wavefront renderer; scene geometry is still array-of-structs)*
 - [x] BVH construction (LBVH build via Morton codes + Karras parallel radix-tree algorithm; Morton codes and sort on the CPU, tree construction and bounds refit on the GPU)
 - [x] BVH traversal (device-side, iterative, stack-based — no recursion)
 - [x] Bounding-box (AABB) intersection + slab test
@@ -84,8 +87,10 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [x] Persistent per-pixel RNG state, not reinitialized per sample
 - [ ] Memory access audit: confirm scene/material reads go through `__ldg`/`const __restrict__`
 - [x] Occupancy measurement (Nsight Compute or `nvidia-smi`) at a baseline milestone
-- [ ] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything")
+- [x] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything") *(implemented with atomic-counter path queues, a separate shadow-ray queue for NEE, and SoA path state; selectable with `--wavefront`)*
 - [ ] **(stretch)** Material-sorted shading — sort active paths by material ID before shading to reduce warp divergence
+- [ ] **(stretch)** Any-hit traversal for shadow rays (early exit on the first occluder, no hit record)
+- [ ] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces
 
 ## 9. Image Output & Post-Processing
 - [ ] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp)
