@@ -7,6 +7,7 @@
 // === INCLUDE AND MACROS ===
 // ==============================================================================
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <chrono>
@@ -441,6 +442,8 @@ struct hitRecord{
     vec3 hitNormal;
     Material mat;
     bool frontFace = true;
+    int primitiveType = -1;     // 0 = sphere, 1 = triangle
+    int primitiveIndex = -1;
 };
 
 // ============================================================================
@@ -819,6 +822,8 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
         if (hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, time, intersectionDistance, frontFace, outwardNormal)) {
             if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
                 nearestHit.didHit = true;
+                nearestHit.primitiveType = primitiveType;
+                nearestHit.primitiveIndex = primitiveIdx;   
                 nearestHit.closestDistance = intersectionDistance;
                 nearestHit.hitPoint = rayOrigin + rayDirection * intersectionDistance;
                 nearestHit.mat = spheres[primitiveIdx].mat;
@@ -831,6 +836,8 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
         if (hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) {
             if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
                 nearestHit.didHit = true;
+                nearestHit.primitiveType = primitiveType;
+                nearestHit.primitiveIndex = primitiveIdx;
                 nearestHit.closestDistance = intersectionDistance;
                 nearestHit.hitPoint = rayOrigin + rayDirection * intersectionDistance;
                 nearestHit.mat = triangles[primitiveIdx].mat;
@@ -1199,9 +1206,579 @@ __global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int m
 // ============================================================================
 
 // ============================================================================
+// === WAVEFRONT & PERSISTENT THREADS ===
+// ============================================================================
+struct PathStateBuffers {
+    float* rayOriginX = nullptr;      
+    float* rayOriginY = nullptr;       
+    float* rayOriginZ = nullptr;
+    
+    float* rayDirectionX = nullptr;
+    float* rayDirectionY = nullptr;    
+    float* rayDirectionZ = nullptr;
+    
+    float* rayTime = nullptr;
+
+    float* throughputRed = nullptr;    
+    float* throughputGreen = nullptr;  
+    float* throughputBlue = nullptr;
+    
+    float* currentSampleRed = nullptr; 
+    float* currentSampleGreen = nullptr; 
+    float* currentSampleBlue = nullptr;
+    
+    unsigned char* previousBounceWasSpecular = nullptr;
+};
+
+struct HitResultBuffers {
+    unsigned char* didHit = nullptr;
+    float* hitDistance = nullptr;
+    
+    float* hitPointX = nullptr;
+    float* hitPointY = nullptr;   
+    float* hitPointZ = nullptr;
+    
+    float* hitNormalX = nullptr; 
+    float* hitNormalY = nullptr;  
+    float* hitNormalZ = nullptr;
+    
+    unsigned char* hitWasFrontFace = nullptr;
+    int* hitPrimitiveType = nullptr;     // 0 = sphere, 1 = triangle 
+    int* hitPrimitiveIndex = nullptr;
+};
+
+struct PathQueue {
+    int* pathIndices = nullptr;   // capacity = pixelCount
+    int* itemCount = nullptr;     
+};
+
+struct ShadowRayQueue {
+    float* originX = nullptr;     
+    float* originY = nullptr;      
+    float* originZ = nullptr;
+    
+    float* directionX = nullptr;   
+    float* directionY = nullptr;   
+    float* directionZ = nullptr;
+    
+    float* maximumDistance = nullptr;
+    float* contributionRed = nullptr;
+    float* contributionGreen = nullptr; 
+    float* contributionBlue = nullptr;
+    
+    int* pathIndices = nullptr;
+    int* itemCount = nullptr;
+};
+
+struct WavefrontRenderContext {
+    Camera camera;
+    BVH bvh;
+    sphere* spheres;
+    int sphereCount;
+    
+    triangle* triangles;   
+    int triangleCount;
+    
+    Light* lights;         
+    int lightCount;
+    
+    vec3* accumBuffer;
+    vec3* frameBuffer;
+    curandState* randomNumberStates;
+    
+    int imageWidth;
+    int imageHeight;
+    dim3 gridDimensions;
+    dim3 blockDimensions;
+};
+
+template <typename ElementType>
+static void allocateDeviceArray(ElementType*& devicePointer, size_t elementCount){
+    CUDA_CHECK(cudaMalloc(&devicePointer, elementCount * sizeof(ElementType)));
+    CUDA_CHECK(cudaMemset(devicePointer, 0, elementCount * sizeof(ElementType)));
+}
+
+template <typename ElementType>
+static void freeDeviceArray(ElementType*& devicePointer) {
+    if (devicePointer) {
+        CUDA_CHECK(cudaFree(devicePointer));
+        devicePointer = nullptr;
+    }
+}
+// ----------------------------------------------------------------------------
+// Path queue
+// ----------------------------------------------------------------------------
+static void allocatePathQueue(PathQueue& queue, int pathCapacity) {
+    allocateDeviceArray(queue.pathIndices, pathCapacity);
+    allocateDeviceArray(queue.itemCount, 1);
+}
+
+static void freePathQueue(PathQueue& queue) {
+    freeDeviceArray(queue.pathIndices);
+    freeDeviceArray(queue.itemCount);
+}
+
+// ----------------------------------------------------------------------------
+// Path state (structure of arrays)
+// ----------------------------------------------------------------------------
+static void allocatePathStateBuffers(PathStateBuffers& buffers, int pathCapacity) {
+    allocateDeviceArray(buffers.rayOriginX, pathCapacity);
+    allocateDeviceArray(buffers.rayOriginY, pathCapacity);
+    allocateDeviceArray(buffers.rayOriginZ, pathCapacity);
+
+    allocateDeviceArray(buffers.rayDirectionX, pathCapacity);
+    allocateDeviceArray(buffers.rayDirectionY, pathCapacity);
+    allocateDeviceArray(buffers.rayDirectionZ, pathCapacity);
+
+    allocateDeviceArray(buffers.rayTime, pathCapacity);
+
+    allocateDeviceArray(buffers.throughputRed, pathCapacity);
+    allocateDeviceArray(buffers.throughputGreen, pathCapacity);
+    allocateDeviceArray(buffers.throughputBlue, pathCapacity);
+
+    allocateDeviceArray(buffers.currentSampleRed, pathCapacity);
+    allocateDeviceArray(buffers.currentSampleGreen, pathCapacity);
+    allocateDeviceArray(buffers.currentSampleBlue, pathCapacity);
+
+    allocateDeviceArray(buffers.previousBounceWasSpecular, pathCapacity);
+}
+
+static void freePathStateBuffers(PathStateBuffers& buffers) {
+    freeDeviceArray(buffers.rayOriginX);
+    freeDeviceArray(buffers.rayOriginY);
+    freeDeviceArray(buffers.rayOriginZ);
+
+    freeDeviceArray(buffers.rayDirectionX);
+    freeDeviceArray(buffers.rayDirectionY);
+    freeDeviceArray(buffers.rayDirectionZ);
+
+    freeDeviceArray(buffers.rayTime);
+
+    freeDeviceArray(buffers.throughputRed);
+    freeDeviceArray(buffers.throughputGreen);
+    freeDeviceArray(buffers.throughputBlue);
+
+    freeDeviceArray(buffers.currentSampleRed);
+    freeDeviceArray(buffers.currentSampleGreen);
+    freeDeviceArray(buffers.currentSampleBlue);
+
+    freeDeviceArray(buffers.previousBounceWasSpecular);
+}
+
+// ----------------------------------------------------------------------------
+// Hit results
+// ----------------------------------------------------------------------------
+static void allocateHitResultBuffers(HitResultBuffers& buffers, int pathCapacity) {
+    allocateDeviceArray(buffers.didHit, pathCapacity);
+    allocateDeviceArray(buffers.hitDistance, pathCapacity);
+
+    allocateDeviceArray(buffers.hitPointX, pathCapacity);
+    allocateDeviceArray(buffers.hitPointY, pathCapacity);
+    allocateDeviceArray(buffers.hitPointZ, pathCapacity);
+
+    allocateDeviceArray(buffers.hitNormalX, pathCapacity);
+    allocateDeviceArray(buffers.hitNormalY, pathCapacity);
+    allocateDeviceArray(buffers.hitNormalZ, pathCapacity);
+
+    allocateDeviceArray(buffers.hitWasFrontFace, pathCapacity);
+    allocateDeviceArray(buffers.hitPrimitiveType, pathCapacity);
+    allocateDeviceArray(buffers.hitPrimitiveIndex, pathCapacity);
+}
+
+static void freeHitResultBuffers(HitResultBuffers& buffers) {
+    freeDeviceArray(buffers.didHit);
+    freeDeviceArray(buffers.hitDistance);
+
+    freeDeviceArray(buffers.hitPointX);
+    freeDeviceArray(buffers.hitPointY);
+    freeDeviceArray(buffers.hitPointZ);
+
+    freeDeviceArray(buffers.hitNormalX);
+    freeDeviceArray(buffers.hitNormalY);
+    freeDeviceArray(buffers.hitNormalZ);
+
+    freeDeviceArray(buffers.hitWasFrontFace);
+    freeDeviceArray(buffers.hitPrimitiveType);
+    freeDeviceArray(buffers.hitPrimitiveIndex);
+}
+
+// ----------------------------------------------------------------------------
+// Shadow ray queue
+// ----------------------------------------------------------------------------
+static void allocateShadowRayQueue(ShadowRayQueue& queue, int pathCapacity) {
+    allocateDeviceArray(queue.originX, pathCapacity);
+    allocateDeviceArray(queue.originY, pathCapacity);
+    allocateDeviceArray(queue.originZ, pathCapacity);
+
+    allocateDeviceArray(queue.directionX, pathCapacity);
+    allocateDeviceArray(queue.directionY, pathCapacity);
+    allocateDeviceArray(queue.directionZ, pathCapacity);
+
+    allocateDeviceArray(queue.maximumDistance, pathCapacity);
+
+    allocateDeviceArray(queue.contributionRed, pathCapacity);
+    allocateDeviceArray(queue.contributionGreen, pathCapacity);
+    allocateDeviceArray(queue.contributionBlue, pathCapacity);
+
+    allocateDeviceArray(queue.pathIndices, pathCapacity);
+    allocateDeviceArray(queue.itemCount, 1);
+}
+
+static void freeShadowRayQueue(ShadowRayQueue& queue) {
+    freeDeviceArray(queue.originX);
+    freeDeviceArray(queue.originY);
+    freeDeviceArray(queue.originZ);
+
+    freeDeviceArray(queue.directionX);
+    freeDeviceArray(queue.directionY);
+    freeDeviceArray(queue.directionZ);
+
+    freeDeviceArray(queue.maximumDistance);
+
+    freeDeviceArray(queue.contributionRed);
+    freeDeviceArray(queue.contributionGreen);
+    freeDeviceArray(queue.contributionBlue);
+
+    freeDeviceArray(queue.pathIndices);
+    freeDeviceArray(queue.itemCount);
+}
+
+__global__ void generateCameraRaysKernel(Camera camera, int imageWidth, int imageHeight,curandState* randomNumberStates,PathStateBuffers pathState, PathQueue queue){
+    int pixelX = threadIdx.x + blockIdx.x * blockDim.x;
+    int pixelY = threadIdx.y + blockIdx.y * blockDim.y;
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+    int pathIndex = imageWidth * pixelY + pixelX;
+
+    curandState randomNumberState = randomNumberStates[pathIndex];
+    Ray cameraRay = camera.getRay(pixelX, pixelY, &randomNumberState);
+
+    pathState.rayOriginX[pathIndex] = cameraRay.origin.x;
+    pathState.rayOriginY[pathIndex] = cameraRay.origin.y;
+    pathState.rayOriginZ[pathIndex] = cameraRay.origin.z;
+
+    pathState.rayDirectionX[pathIndex] = cameraRay.direction.x;
+    pathState.rayDirectionY[pathIndex] = cameraRay.direction.y;
+    pathState.rayDirectionZ[pathIndex] = cameraRay.direction.z;
+    pathState.rayTime[pathIndex] = cameraRay.time;
+
+    pathState.throughputRed[pathIndex] = 1.0f;
+    pathState.throughputGreen[pathIndex] = 1.0f;
+    pathState.throughputBlue[pathIndex] = 1.0f;
+
+    pathState.currentSampleRed[pathIndex] = 0.0f;
+    pathState.currentSampleGreen[pathIndex] = 0.0f;
+    pathState.currentSampleBlue[pathIndex] = 0.0f;
+
+    pathState.previousBounceWasSpecular[pathIndex] = 1;
+
+    queue.pathIndices[pathIndex] = pathIndex;
+
+    randomNumberStates[pathIndex] = randomNumberState;
+}
+
+__global__ void extendKernel(BVH bvh, const sphere* spheres, const triangle* triangles, PathStateBuffers pathState, HitResultBuffers hitResults, PathQueue queue){
+    int queueSlot = threadIdx.x + blockIdx.x * blockDim.x;
+    if (queueSlot >= *queue.itemCount) return;
+    int pathIndex = queue.pathIndices[queueSlot];
+
+    vec3 rayOrigin(pathState.rayOriginX[pathIndex], pathState.rayOriginY[pathIndex], pathState.rayOriginZ[pathIndex]);
+    vec3 rayDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
+    float rayTime = pathState.rayTime[pathIndex];
+
+    hitRecord hit = bvh.traverseRay(rayOrigin, rayDirection, rayTime, spheres, triangles);
+
+    hitResults.didHit[pathIndex] = hit.didHit ? 1 : 0;
+    if (!hit.didHit) return;
+
+    hitResults.hitDistance[pathIndex] = hit.closestDistance;
+    hitResults.hitPointX[pathIndex] = hit.hitPoint.x;
+    hitResults.hitPointY[pathIndex] = hit.hitPoint.y;
+    hitResults.hitPointZ[pathIndex] = hit.hitPoint.z;
+    hitResults.hitNormalX[pathIndex] = hit.hitNormal.x;
+    hitResults.hitNormalY[pathIndex] = hit.hitNormal.y;
+    hitResults.hitNormalZ[pathIndex] = hit.hitNormal.z;
+    hitResults.hitWasFrontFace[pathIndex] = hit.frontFace ? 1 : 0;
+    hitResults.hitPrimitiveType[pathIndex] = hit.primitiveType;
+    hitResults.hitPrimitiveIndex[pathIndex] = hit.primitiveIndex;
+}
+
+__global__ void shadeKernel(int depth, vec3 backgroundColor,
+                            const sphere* spheres, const triangle* triangles,
+                            const Light* lights, int lightCount,
+                            curandState* randomNumberStates,
+                            PathStateBuffers pathState, HitResultBuffers hitResults,
+                            PathQueue currentQueue, PathQueue nextQueue,
+                            ShadowRayQueue shadowQueue)
+{
+    int queueSlot = threadIdx.x + blockIdx.x * blockDim.x;
+    if (queueSlot >= *currentQueue.itemCount) return;
+    int pathIndex = currentQueue.pathIndices[queueSlot];
+
+    vec3 throughput(pathState.throughputRed[pathIndex], pathState.throughputGreen[pathIndex], pathState.throughputBlue[pathIndex]);
+    vec3 currentSample(pathState.currentSampleRed[pathIndex], pathState.currentSampleGreen[pathIndex], pathState.currentSampleBlue[pathIndex]);
+
+    // missed
+    if (!hitResults.didHit[pathIndex]) {
+        currentSample = currentSample + throughput * backgroundColor;
+        pathState.currentSampleRed[pathIndex] = currentSample.x;
+        pathState.currentSampleGreen[pathIndex] = currentSample.y;
+        pathState.currentSampleBlue[pathIndex] = currentSample.z;
+        return;
+    }
+
+    // material
+    int primitiveIndex = hitResults.hitPrimitiveIndex[pathIndex];
+    Material material = (hitResults.hitPrimitiveType[pathIndex] == 0) ? spheres[primitiveIndex].mat : triangles[primitiveIndex].mat;
+
+    // emission
+    bool previousBounceWasSpecular = pathState.previousBounceWasSpecular[pathIndex] != 0;
+    if (depth == 0 || previousBounceWasSpecular) {
+        currentSample = currentSample + throughput * material.emittedColor;
+        pathState.currentSampleRed[pathIndex] = currentSample.x;
+        pathState.currentSampleGreen[pathIndex] = currentSample.y;
+        pathState.currentSampleBlue[pathIndex] = currentSample.z;
+    }
+    if (material.type == MaterialType::Emissive) return;
+
+    // throughput (with albedo)
+    throughput = throughput * material.albedo;
+
+    vec3 hitPoint(hitResults.hitPointX[pathIndex], hitResults.hitPointY[pathIndex], hitResults.hitPointZ[pathIndex]);
+    vec3 hitNormal(hitResults.hitNormalX[pathIndex], hitResults.hitNormalY[pathIndex], hitResults.hitNormalZ[pathIndex]);
+
+    curandState randomNumberState = randomNumberStates[pathIndex];
+
+    // NEE again same as before !
+    if (material.type == MaterialType::Lambertian && lightCount > 0) {
+        int selectedLightIndex = min((int)(curand_uniform(&randomNumberState) * lightCount), lightCount - 1);
+        const Light& selectedLight = lights[selectedLightIndex];
+        float lightSelectionProbability = 1.0f / float(lightCount);
+
+        vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &randomNumberState);
+        vec3 vectorToLight = sampledPointOnLight - hitPoint;
+        float distanceToLight = vectorToLight.length();
+        vec3 directionToLight = vectorToLight / distanceToLight;
+
+        float cosineAtSurface = hitNormal.dot(directionToLight);
+        float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
+
+        if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
+            float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
+            vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
+            vec3 contribution = throughput * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf));
+
+            int shadowSlot = atomicAdd(shadowQueue.itemCount, 1);
+            shadowQueue.originX[shadowSlot] = hitPoint.x;
+            shadowQueue.originY[shadowSlot] = hitPoint.y;
+            shadowQueue.originZ[shadowSlot] = hitPoint.z;
+            shadowQueue.directionX[shadowSlot] = directionToLight.x;
+            shadowQueue.directionY[shadowSlot] = directionToLight.y;
+            shadowQueue.directionZ[shadowSlot] = directionToLight.z;
+            shadowQueue.maximumDistance[shadowSlot] = distanceToLight * 0.999f;
+            shadowQueue.contributionRed[shadowSlot] = contribution.x;
+            shadowQueue.contributionGreen[shadowSlot] = contribution.y;
+            shadowQueue.contributionBlue[shadowSlot] = contribution.z;
+            shadowQueue.pathIndices[shadowSlot] = pathIndex;
+        }
+    }
+
+    // Russian roulette 
+    bool pathSurvives = true;
+    if (depth > 3) {
+        float maxComponent = fmaxf(throughput.x, fmaxf(throughput.y, throughput.z));
+        float continueProbability = fminf(maxComponent, 0.95f);
+        if (curand_uniform(&randomNumberState) > continueProbability) {
+            pathSurvives = false;
+        } else {
+            throughput = throughput / continueProbability;
+        }
+    }
+
+    if (pathSurvives) {
+        vec3 rayDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
+        bool frontFace = hitResults.hitWasFrontFace[pathIndex] != 0;
+
+        // same old scatter switch case
+        vec3 newDirection;
+        switch (material.type) {
+            case MaterialType::Conductor: {
+                vec3 reflected = specular_scatter_direction(rayDirection, hitNormal);
+                newDirection = (reflected + random_unit_vector(&randomNumberState) * material.fuzz).normalize();
+                break;
+            }
+            case MaterialType::Dielectric: {
+                float ratio = frontFace ? 1.0f / material.refractionIndex : material.refractionIndex;
+                newDirection = dielectric_scatter_direction(rayDirection, hitNormal, ratio, &randomNumberState);
+                break;
+            }
+            case MaterialType::Lambertian:
+            default:
+                newDirection = lambertian_scatter_direction(hitNormal, &randomNumberState);
+                break;
+        }
+
+        pathState.rayOriginX[pathIndex] = hitPoint.x;
+        pathState.rayOriginY[pathIndex] = hitPoint.y;
+        pathState.rayOriginZ[pathIndex] = hitPoint.z;
+        pathState.rayDirectionX[pathIndex] = newDirection.x;
+        pathState.rayDirectionY[pathIndex] = newDirection.y;
+        pathState.rayDirectionZ[pathIndex] = newDirection.z;
+        pathState.throughputRed[pathIndex] = throughput.x;
+        pathState.throughputGreen[pathIndex] = throughput.y;
+        pathState.throughputBlue[pathIndex] = throughput.z;
+        pathState.previousBounceWasSpecular[pathIndex] = (material.type != MaterialType::Lambertian) ? 1 : 0;
+
+        int nextQueueSlot = atomicAdd(nextQueue.itemCount, 1);
+        nextQueue.pathIndices[nextQueueSlot] = pathIndex;
+    }
+
+    randomNumberStates[pathIndex] = randomNumberState;
+}
+
+__global__ void shadowKernel(BVH bvh, const sphere* spheres, const triangle* triangles,
+                             PathStateBuffers pathState, ShadowRayQueue shadowQueue)
+{
+    int shadowSlot = threadIdx.x + blockIdx.x * blockDim.x;
+    if (shadowSlot >= *shadowQueue.itemCount) return;
+
+    int pathIndex = shadowQueue.pathIndices[shadowSlot];
+    vec3 shadowRayOrigin(shadowQueue.originX[shadowSlot], shadowQueue.originY[shadowSlot], shadowQueue.originZ[shadowSlot]);
+    vec3 shadowRayDirection(shadowQueue.directionX[shadowSlot], shadowQueue.directionY[shadowSlot], shadowQueue.directionZ[shadowSlot]);
+    float rayTime = pathState.rayTime[pathIndex];     // motion blur same as before
+
+    hitRecord shadowHit = bvh.traverseRay(shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
+
+    if (!shadowHit.didHit) {
+        
+        pathState.currentSampleRed[pathIndex] += shadowQueue.contributionRed[shadowSlot];
+        pathState.currentSampleGreen[pathIndex] += shadowQueue.contributionGreen[shadowSlot];
+        pathState.currentSampleBlue[pathIndex] += shadowQueue.contributionBlue[shadowSlot];
+    }
+}
+
+__global__ void debugShowRayDirectionKernel(vec3* frameBuffer, int imageWidth, int imageHeight, PathStateBuffers pathState){
+    int pixelX = threadIdx.x + blockIdx.x * blockDim.x;
+    int pixelY = threadIdx.y + blockIdx.y * blockDim.y;
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+    int pathIndex = imageWidth * pixelY + pixelX;
+
+    frameBuffer[pathIndex] = vec3(pathState.rayDirectionX[pathIndex] * 1.5f + 0.5f,pathState.rayDirectionY[pathIndex] * 1.5f + 0.5f,pathState.rayDirectionZ[pathIndex] * -1.0f);
+}
+
+__global__ void debugShowHitNormalKernel(vec3* frameBuffer, int imageWidth, int imageHeight, HitResultBuffers hitResults)
+{
+    int pixelX = threadIdx.x + blockIdx.x * blockDim.x;
+    int pixelY = threadIdx.y + blockIdx.y * blockDim.y;
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+    int pathIndex = imageWidth * pixelY + pixelX;
+
+    if (!hitResults.didHit[pathIndex]){ 
+        frameBuffer[pathIndex] = vec3(0, 0, 0); 
+        return; 
+    }
+    frameBuffer[pathIndex] = vec3(hitResults.hitNormalX[pathIndex] * 0.5f + 0.5f,
+                                  hitResults.hitNormalY[pathIndex] * 0.5f + 0.5f,
+                                  hitResults.hitNormalZ[pathIndex] * 0.5f + 0.5f);
+}
+
+__global__ void finalizeSampleKernel(vec3* accumBuffer, int imageWidth, int imageHeight, PathStateBuffers pathState)
+{
+    int pixelX = threadIdx.x + blockIdx.x * blockDim.x;
+    int pixelY = threadIdx.y + blockIdx.y * blockDim.y;
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+    int pathIndex = imageWidth * pixelY + pixelX;
+
+    vec3 sampleColor(pathState.currentSampleRed[pathIndex], pathState.currentSampleGreen[pathIndex], pathState.currentSampleBlue[pathIndex]);
+
+    
+    float brightestChannel = fmaxf(sampleColor.x, fmaxf(sampleColor.y, sampleColor.z));
+    const float maximumSampleBrightness = 10.0f;
+    if (brightestChannel > maximumSampleBrightness) {
+        sampleColor = sampleColor * (maximumSampleBrightness / brightestChannel);
+    }
+    accumBuffer[pathIndex] = accumBuffer[pathIndex] + sampleColor;
+}
+
+static void renderWithWavefront(const WavefrontRenderContext& context){
+    int pathCapacity = context.imageWidth * context.imageHeight;
+    PathStateBuffers pathState;
+    HitResultBuffers hitResults;
+    PathQueue currentQueue, nextQueue;
+    ShadowRayQueue shadowQueue;
+
+    
+    allocatePathStateBuffers(pathState, pathCapacity);
+    allocateHitResultBuffers(hitResults, pathCapacity);
+    allocatePathQueue(currentQueue, pathCapacity);
+    allocatePathQueue(nextQueue, pathCapacity);
+    allocateShadowRayQueue(shadowQueue, pathCapacity);
+
+    auto renderStart = std::chrono::steady_clock::now();
+
+    
+    for (int sampleIndex = 0; sampleIndex < context.camera.samples_per_pixel; ++sampleIndex) {
+
+        generateCameraRaysKernel<<<context.gridDimensions, context.blockDimensions>>>(context.camera, context.imageWidth, context.imageHeight,context.randomNumberStates, pathState, currentQueue);
+        CUDA_CHECK_KERNEL();
+
+        int activePathCount = pathCapacity;
+        CUDA_CHECK(cudaMemcpy(currentQueue.itemCount, &activePathCount, sizeof(int), cudaMemcpyHostToDevice));
+
+        
+        for (int depth = 0; depth < context.camera.max_depth; ++depth) {
+            if (activePathCount == 0) break;
+            CUDA_CHECK(cudaMemset(nextQueue.itemCount, 0, sizeof(int)));
+            CUDA_CHECK(cudaMemset(shadowQueue.itemCount, 0, sizeof(int)));
+
+            int blockSize = 256;
+            int blockCount = (activePathCount + blockSize - 1) / blockSize;
+
+            extendKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles,pathState, hitResults, currentQueue);
+            CUDA_CHECK_KERNEL();
+
+            shadeKernel<<<blockCount, blockSize>>>(depth, context.camera.backround_color,context.spheres, context.triangles, context.lights, context.lightCount,context.randomNumberStates, pathState, hitResults, currentQueue, nextQueue, shadowQueue);
+            CUDA_CHECK_KERNEL();
+
+            shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles,pathState, shadowQueue);
+            CUDA_CHECK_KERNEL();
+
+            CUDA_CHECK(cudaMemcpy(&activePathCount, nextQueue.itemCount, sizeof(int), cudaMemcpyDeviceToHost));
+            std::swap(currentQueue, nextQueue);
+        }
+
+        finalizeSampleKernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.imageWidth, context.imageHeight, pathState);
+        CUDA_CHECK_KERNEL();
+
+        resolve_kernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.frameBuffer, context.imageWidth, context.imageHeight, sampleIndex + 1);
+        CUDA_CHECK_KERNEL();
+
+        float percent = 100.0f * float(sampleIndex + 1) / float(context.camera.samples_per_pixel);
+        auto elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - renderStart).count();
+        printf("\rSample %d / %d (%.1f%%) — %.3fs elapsed", sampleIndex + 1, context.camera.samples_per_pixel, percent, elapsed);
+        fflush(stdout);
+    }
+    
+
+    freeShadowRayQueue(shadowQueue);
+    freePathQueue(nextQueue);
+    freePathQueue(currentQueue);
+    freeHitResultBuffers(hitResults);
+    freePathStateBuffers(pathState);
+}
+
+
+// ============================================================================
 // === MAIN ===
 // ============================================================================
-int main() {
+int main(int argc,char** argv) {
+
+    bool useWavefrontPathTracing = false;
+    for(int argumentIndex = 1; argumentIndex < argc; ++argumentIndex){
+        if(std::strcmp(argv[argumentIndex], "--wavefront") == 0){
+            useWavefrontPathTracing = true;
+        }
+    }
+
 
     // display device info
     fetchDeviceInfo();
@@ -1307,29 +1884,58 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_lights, lightCount * sizeof(Light)));
     CUDA_CHECK(cudaMemcpy(d_lights, scene.lights.data(), lightCount * sizeof(Light), cudaMemcpyHostToDevice));
 
+    CUDA_CHECK(cudaMemset(device_frameBuffer, 0, frameBufferSize));
+
+
+
+
     auto renderStart = std::chrono::steady_clock::now();
-    for (int s = 0; s < cam.samples_per_pixel; s++) {
-        trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, d_rngStates, s,d_lights,lightCount);
-        CUDA_CHECK_KERNEL();
+    if(useWavefrontPathTracing){
+        // Wavefront init
+        WavefrontRenderContext wavefrontContext;
+        wavefrontContext.camera = cam;
+        wavefrontContext.bvh = bvh;
+        wavefrontContext.spheres = d_spheres;      
+        wavefrontContext.sphereCount = sphereCount;
+        wavefrontContext.triangles = d_triangles;  
+        wavefrontContext.triangleCount = triangleCount;
+        wavefrontContext.lights = d_lights;        
+        wavefrontContext.lightCount = lightCount;
+        wavefrontContext.accumBuffer = d_accumBuffer;
+        wavefrontContext.frameBuffer = device_frameBuffer;
+        wavefrontContext.randomNumberStates = d_rngStates;
+        wavefrontContext.imageWidth = numberOfPixels_X;
+        wavefrontContext.imageHeight = numberOfPixels_Y;
+        wavefrontContext.gridDimensions = grid;
+        wavefrontContext.blockDimensions = block;
+        renderWithWavefront(wavefrontContext);
+    }else{
+        for (int s = 0; s < cam.samples_per_pixel; s++) {
+            trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, d_rngStates, s,d_lights,lightCount);
+            CUDA_CHECK_KERNEL();
 
-        resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1);
-        CUDA_CHECK_KERNEL();
+            resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1);
+            CUDA_CHECK_KERNEL();
 
-        // PROGRESS BAR
-        float percent = 100.0f * float(s + 1) / float(cam.samples_per_pixel);
-        auto elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - renderStart).count();
-        printf("\rSample %d / %d (%.1f%%) — %.3fs elapsed", s + 1, cam.samples_per_pixel, percent, elapsed);
-        fflush(stdout);
+            // PROGRESS BAR
+            float percent = 100.0f * float(s + 1) / float(cam.samples_per_pixel);
+            auto elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - renderStart).count();
+            printf("\rSample %d / %d (%.1f%%) — %.3fs elapsed", s + 1, cam.samples_per_pixel, percent, elapsed);
+            fflush(stdout);
+        }
     }
+
+
     printf("\nLight triangles in the scene: %zu\n", scene.lights.size());
     printf("\n");
 
     CUDA_CHECK(cudaMemcpy(host_frameBuffer,device_frameBuffer,frameBufferSize,cudaMemcpyDeviceToHost));
 
     // draw the ppm
-    FILE* out = fopen("render.ppm", "w");
+    const char* outputFileName = useWavefrontPathTracing ? "render_wavefront.ppm" : "render_megakernel.ppm";
+    FILE* out = fopen(outputFileName, "w");
     if (!out) {
-        std::fprintf(stderr, "failed to open render.ppm for writing\n");
+        std::fprintf(stderr, "failed to open %s for writing\n",outputFileName);
         return EXIT_FAILURE;
     }
     fprintf(out, "P3\n%d %d\n255\n", numberOfPixels_X, numberOfPixels_Y);
