@@ -480,6 +480,7 @@ __host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB&
 __host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide);          
 __host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance);
 __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
+__device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, float maximumDistance);
 // ===============================================================================
 class BVH{
 
@@ -582,6 +583,68 @@ public:
         }
 
         return nearestHit;
+    }
+
+    __device__ bool traverseAnyHit(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles,float maxDistance = 1e30f) const {
+        
+        const int MAX_STACK = 64;
+        int stackIdx[MAX_STACK];
+        bool stackIsLeaf[MAX_STACK];
+        int stackPtr = 0;
+
+        int nodeIdx = 0;
+        bool nodeIsLeaf = false;
+
+        while (true) {
+            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+
+            int childLIdx = node.leftChild;
+            bool childLIsLeaf = node.leftIsLeaf;
+            int childRIdx = node.rightChild;
+            bool childRIsLeaf = node.rightIsLeaf;
+
+            AABB childLBounds = childLIsLeaf ? d_leafNode[childLIdx].bounds : d_internalNodes[childLIdx].bounds;
+            AABB childRBounds = childRIsLeaf ? d_leafNode[childRIdx].bounds : d_internalNodes[childRIdx].bounds;
+
+            float nearL = 0.0001f;
+            float farL = maxDistance;
+            bool overlapL = hit_aabb(childLBounds, rayOrigin, rayDirection, nearL, farL);
+
+            float nearR = 0.0001f;
+            float farR = maxDistance;
+            bool overlapR = hit_aabb(childRBounds, rayOrigin, rayDirection, nearR, farR);
+
+            if (overlapL && childLIsLeaf) {
+                int primitiveIdx = d_leafNode[childLIdx].primitiveIndex;
+                int primitiveType = d_primitiveTypes[childLIdx];
+                if(doesPrimitiveBlockRay(primitiveType, primitiveIdx, rayOrigin, rayDirection, time, spheres, triangles, maxDistance))return true;
+            }
+            if (overlapR && childRIsLeaf) {
+                int primitiveIdx = d_leafNode[childRIdx].primitiveIndex;
+                int primitiveType = d_primitiveTypes[childRIdx];
+                if(doesPrimitiveBlockRay(primitiveType,primitiveIdx,rayOrigin,rayDirection,time,spheres,triangles,maxDistance))return true;
+            }
+
+
+            bool traverseL = overlapL && !childLIsLeaf;
+            bool traverseR = overlapR && !childRIsLeaf;
+
+            if (!traverseL && !traverseR) {
+                if (stackPtr == 0) break;
+                stackPtr--;
+                nodeIdx = stackIdx[stackPtr];
+                nodeIsLeaf = stackIsLeaf[stackPtr];
+            } else {
+                if (traverseL && traverseR) {
+                    stackIdx[stackPtr] = childRIdx;
+                    stackIsLeaf[stackPtr] = childRIsLeaf;
+                    stackPtr++;
+                }
+                nodeIdx = traverseL ? childLIdx : childRIdx;
+                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
+            }
+        }
+        return false;
     }
 
     __device__ void traverseHierarchy(const PrimitiveRef* d_primitiveRefs, int queryObjectIdx, int* d_collisionCounts) const {
@@ -852,6 +915,18 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
             }
         }
     }
+}
+
+__device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, float maximumDistance){
+    float intersectionDistance;
+    if (primitiveType == 0) {
+        bool frontFace;
+        vec3 outwardNormal;
+        if (!hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, time, intersectionDistance, frontFace, outwardNormal)) return false;
+    } else {
+        if (!hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) return false;
+    }
+    return (intersectionDistance > 0.0001f) && (intersectionDistance < maximumDistance);
 }
 
 __global__ void findCollisions(const PrimitiveRef* d_primitiveRefs, BVH* d_bvh, int primitiveCount, int* d_collisionCounts){
@@ -1646,9 +1721,9 @@ __global__ void shadowKernel(BVH bvh, const sphere* spheres, const triangle* tri
     vec3 shadowRayDirection(shadowQueue.directionX[shadowSlot], shadowQueue.directionY[shadowSlot], shadowQueue.directionZ[shadowSlot]);
     float rayTime = pathState.rayTime[pathIndex];     // motion blur same as before
 
-    hitRecord shadowHit = bvh.traverseRay(shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
+    bool isOccluded = bvh.traverseAnyHit(shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
 
-    if (!shadowHit.didHit) {
+    if (!isOccluded) {
         
         pathState.currentSampleRed[pathIndex] += shadowQueue.contributionRed[shadowSlot];
         pathState.currentSampleGreen[pathIndex] += shadowQueue.contributionGreen[shadowSlot];
