@@ -474,7 +474,24 @@ __device__ vec3 sample_triangle(const triangle& tri,curandState* rngState){
     float weightOfVertex2 = 1.0f - weightOfVertex0 - weightOfVertex1;
 
     return tri.v0 * weightOfVertex0 + tri.v1 * weightOfVertex1 + tri.v2 * weightOfVertex2; 
+}
 
+__device__ float powerHeuristic(float primaryPdf, float otherPdf) {
+    float primarySquared = primaryPdf * primaryPdf;
+    float otherSquared = otherPdf * otherPdf;
+    return primarySquared / (primarySquared + otherSquared);
+}
+
+__device__ float lambertianCosinePdf(float cosineAtSurface) {
+    return cosineAtSurface / MONOCUDA_PI;
+}
+
+__device__ float triangleSurfaceArea(const triangle& tri) {
+    return 0.5f * (tri.v1 - tri.v0).cross(tri.v2 - tri.v0).length();
+}
+
+__device__ float lightSolidAnglePdf(float lightSelectionProbability, float distanceToLight, float cosineAtLight, float lightArea) {
+    return lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * lightArea);
 }
 
 struct sphere {
@@ -1384,6 +1401,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
     vec3 attenuation(1.0f, 1.0f, 1.0f);
     vec3 sampleColor(0.0f, 0.0f, 0.0f);
     bool previousBounceWasSpecular = true;   
+    float previousBsdfPdf = 1.0f;
 
     for(int depth = 0 ; depth < camera.max_depth;depth++){
         hitRecord hit = bvh.traverseRay(r.origin, r.direction,r.time, spheres, triangles);
@@ -1392,9 +1410,15 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             sampleColor = sampleColor + attenuation * camera.backround_color;
             break;
         }
-        if (depth == 0 || previousBounceWasSpecular) {
-            sampleColor = sampleColor + attenuation * hit.mat.emittedColor;
+        float emissionWeight = 1.0f;
+        bool emissionComesFromBsdfSampling = !(depth == 0 || previousBounceWasSpecular);
+        if (emissionComesFromBsdfSampling && hit.mat.type == MaterialType::Emissive && hit.primitiveType == 1) {
+            float cosineAtLight = fmaxf(fabsf(r.direction.dot(hit.hitNormal)), 1e-4f);
+            float lightArea = triangleSurfaceArea(triangles[hit.primitiveIndex]);
+            float lightPdf = lightSolidAnglePdf(1.0f / float(lightCount), hit.closestDistance, cosineAtLight, lightArea);
+            emissionWeight = powerHeuristic(previousBsdfPdf, lightPdf);
         }
+        sampleColor = sampleColor + attenuation * hit.mat.emittedColor * emissionWeight;
 
         if (hit.mat.type == MaterialType::Emissive) {
             break;   
@@ -1422,7 +1446,8 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 if (!shadowHit.didHit) {
                     float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
                     vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
-                    sampleColor = sampleColor + attenuation * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf));
+                    float neeWeight = powerHeuristic(solidAnglePdf, lambertianCosinePdf(cosineAtSurface));
+                    sampleColor = sampleColor + attenuation * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf)) * neeWeight;
                 }
             }
         }
@@ -1460,6 +1485,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 break;
         }
         previousBounceWasSpecular = (hit.mat.type != MaterialType::Lambertian);
+        previousBsdfPdf = lambertianCosinePdf(fmaxf(newDirection.dot(hit.hitNormal), 0.0f));
         r = Ray(hit.hitPoint, newDirection, r.time);   
     }
     // to reduce firefly points
@@ -1507,6 +1533,7 @@ struct PathStateBuffers {
     float* currentSampleBlue = nullptr;
     
     unsigned char* previousBounceWasSpecular = nullptr;
+    float* previousBsdfPdf = nullptr;
 };
 
 struct HitResultBuffers {
@@ -1622,6 +1649,7 @@ static void allocatePathStateBuffers(PathStateBuffers& buffers, int pathCapacity
     allocateDeviceArray(buffers.currentSampleBlue, pathCapacity);
 
     allocateDeviceArray(buffers.previousBounceWasSpecular, pathCapacity);
+    allocateDeviceArray(buffers.previousBsdfPdf, pathCapacity);
 }
 
 static void freePathStateBuffers(PathStateBuffers& buffers) {
@@ -1644,6 +1672,7 @@ static void freePathStateBuffers(PathStateBuffers& buffers) {
     freeDeviceArray(buffers.currentSampleBlue);
 
     freeDeviceArray(buffers.previousBounceWasSpecular);
+    freeDeviceArray(buffers.previousBsdfPdf);
 }
 
 // ----------------------------------------------------------------------------
@@ -1760,6 +1789,7 @@ __global__ void generateCameraRaysKernel(Camera camera, int imageWidth, int imag
     pathState.currentSampleBlue[pathIndex] = 0.0f;
 
     pathState.previousBounceWasSpecular[pathIndex] = 1;
+    pathState.previousBsdfPdf[pathIndex] = 1.0f;
 
     queue.pathIndices[pathIndex] = pathIndex;
 
@@ -1820,25 +1850,35 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
 
     // material
     int primitiveIndex = hitResults.hitPrimitiveIndex[pathIndex];
-    Material material = (hitResults.hitPrimitiveType[pathIndex] == 0) ? spheres[primitiveIndex].mat : triangles[primitiveIndex].mat;
+    int primitiveType = hitResults.hitPrimitiveType[pathIndex];
+    Material material = (primitiveType == 0) ? spheres[primitiveIndex].mat : triangles[primitiveIndex].mat;
 
-    // emission
-    bool previousBounceWasSpecular = pathState.previousBounceWasSpecular[pathIndex] != 0;
-    if (depth == 0 || previousBounceWasSpecular) {
-        currentSample = currentSample + throughput * material.emittedColor;
+    vec3 hitPoint(hitResults.hitPointX[pathIndex], hitResults.hitPointY[pathIndex], hitResults.hitPointZ[pathIndex]);
+    vec3 hitNormal(hitResults.hitNormalX[pathIndex], hitResults.hitNormalY[pathIndex], hitResults.hitNormalZ[pathIndex]);
+    vec3 incomingRayDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
+
+    // emission (MIS weighted when it comes from BSDF sampling)
+    if (material.type == MaterialType::Emissive) {
+        bool previousBounceWasSpecular = pathState.previousBounceWasSpecular[pathIndex] != 0;
+        float emissionWeight = 1.0f;
+        bool emissionComesFromBsdfSampling = !(depth == 0 || previousBounceWasSpecular);
+        if (emissionComesFromBsdfSampling && primitiveType == 1) {
+            float cosineAtLight = fmaxf(fabsf(incomingRayDirection.dot(hitNormal)), 1e-4f);
+            float lightArea = triangleSurfaceArea(triangles[primitiveIndex]);
+            float lightPdf = lightSolidAnglePdf(1.0f / float(lightCount), hitResults.hitDistance[pathIndex], cosineAtLight, lightArea);
+            emissionWeight = powerHeuristic(pathState.previousBsdfPdf[pathIndex], lightPdf);
+        }
+        currentSample = currentSample + throughput * material.emittedColor * emissionWeight;
         pathState.currentSampleRed[pathIndex] = currentSample.x;
         pathState.currentSampleGreen[pathIndex] = currentSample.y;
         pathState.currentSampleBlue[pathIndex] = currentSample.z;
+        return;
     }
-    if (material.type == MaterialType::Emissive) return;
 
     // throughput (with albedo)
     float hitU = hitResults.hitU[pathIndex];
     float hitV = hitResults.hitV[pathIndex];
     throughput = throughput * sampleTexture(material.albedoTexture, hitU, hitV);
-
-    vec3 hitPoint(hitResults.hitPointX[pathIndex], hitResults.hitPointY[pathIndex], hitResults.hitPointZ[pathIndex]);
-    vec3 hitNormal(hitResults.hitNormalX[pathIndex], hitResults.hitNormalY[pathIndex], hitResults.hitNormalZ[pathIndex]);
 
     curandState randomNumberState = randomNumberStates[pathIndex];
 
@@ -1859,7 +1899,8 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
             float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
             vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
-            vec3 contribution = throughput * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf));
+            float neeWeight = powerHeuristic(solidAnglePdf, lambertianCosinePdf(cosineAtSurface));
+            vec3 contribution = throughput * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf)) * neeWeight;
 
             int shadowSlot = atomicAdd(shadowQueue.itemCount, 1);
             shadowQueue.originX[shadowSlot] = hitPoint.x;
@@ -1910,7 +1951,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
                 newDirection = lambertian_scatter_direction(hitNormal, &randomNumberState);
                 break;
         }
-
+        
         pathState.rayOriginX[pathIndex] = hitPoint.x;
         pathState.rayOriginY[pathIndex] = hitPoint.y;
         pathState.rayOriginZ[pathIndex] = hitPoint.z;
@@ -1921,6 +1962,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         pathState.throughputGreen[pathIndex] = throughput.y;
         pathState.throughputBlue[pathIndex] = throughput.z;
         pathState.previousBounceWasSpecular[pathIndex] = (material.type != MaterialType::Lambertian) ? 1 : 0;
+            pathState.previousBsdfPdf[pathIndex] = lambertianCosinePdf(fmaxf(newDirection.dot(hitNormal), 0.0f));
 
         int nextQueueSlot = atomicAdd(nextQueue.itemCount, 1);
         nextQueue.pathIndices[nextQueueSlot] = pathIndex;
