@@ -2,7 +2,7 @@
 // This project is fully written by Bora Yalçın (Undergraduate CSE Student at Yeditepe University)
 // Checkout out my website for related blogs : https://borayalcinn.github.io/
 // Checkout the related repository           : https://github.com/BoraYalcinn/MonoCUDA-PT 
-// I have shared the sources such as papers, websites and learning courses etc. under the README.md
+// I have shared the sources such as papers, websites and learning courses etc. under the README.mdHitResultBuffers
 // ==============================================================================
 // === INCLUDE AND MACROS ===
 // ==============================================================================
@@ -143,7 +143,65 @@ class vec3{
         }
 };
 
+class vec2{
+    public:
+        float x,y;
+
+        __host__ __device__ vec2() : x(0),y(0){}
+        __host__ __device__ vec2(float x_, float y_ ) : x(x_),y(y_){}
+
+        __host__ __device__ vec2 operator+(const vec2 &other)const{return vec2{x+other.x,y+other.y};}
+        __host__ __device__ vec2 operator-(const vec2 &other)const{return vec2{x-other.x,y-other.y};}
+        __host__ __device__ vec2 operator*(const vec2 &other)const{return vec2{x*other.x,y*other.y};}
+        __host__ __device__ vec2 operator-()const{return vec2{-x,-y};}
+        __host__ __device__ vec2 operator/(float n)const{return vec2{x/n,y/n};}
+        __host__ __device__ vec2 operator*(float n)const{return vec2{x*n,y*n};}
+};
+
 // ============================================================================
+
+// ============================================================================
+// === TEXTURES ===
+// ============================================================================
+
+enum class TextureType { Solid, Checker, Image };
+
+struct Texture {
+    TextureType type;
+    vec3 colorA;        // Solid color only 1 color
+    vec3 colorB;        // second color for the checker texture
+    float scale;        // square density in the checker texture
+    cudaTextureObject_t imageHandle;   // for Image textures
+};
+
+__host__ __device__ Texture make_solid_texture(vec3 color) {
+    return Texture{TextureType::Solid, color, vec3(0,0,0), 1.f, 0};
+}
+
+__host__ __device__ Texture make_checker_texture(vec3 colorA, vec3 colorB, float checkerScale) {
+    return Texture{TextureType::Checker, colorA, colorB, checkerScale, 0};
+}
+
+__device__ vec3 sampleTexture(const Texture& texture, float u, float v) {
+    switch (texture.type) {
+        case TextureType::Solid:
+            return texture.colorA;
+
+        case TextureType::Checker: {
+            int cellIndexU = (int)floorf(u * texture.scale);
+            int cellIndexV = (int)floorf(v * texture.scale);
+            bool isEvenCell = ((cellIndexU + cellIndexV) & 1) == 0;
+            return isEvenCell ? texture.colorA : texture.colorB;
+        }
+
+        case TextureType::Image:
+        default:
+            return vec3(1.f, 0.f, 1.f);   // şimdilik magenta: "image henüz yok"
+    }
+}
+
+// ============================================================================
+
 
 // ============================================================================
 // === MATERIALS ===
@@ -158,12 +216,14 @@ enum class MaterialType {Lambertian, Dielectric, Conductor,Emissive};
 
 struct Material{
     MaterialType type;
-    vec3 albedo;
+    Texture albedoTexture;
     vec3 emittedColor;
     float fuzz;
     float refractionIndex;
 
 };
+
+
 __device__ vec3 random_unit_vector(curandState* rngState){
     
     while (true){
@@ -212,19 +272,23 @@ __device__ vec3 dielectric_scatter_direction(const vec3& incomingLightDirection,
 
 // Constructors for material types
 __host__ __device__ Material make_lambertian(vec3 albedo) {
-    return Material{MaterialType::Lambertian, albedo, vec3(0,0,0), 0.f, 0.f};
+    return Material{MaterialType::Lambertian, make_solid_texture(albedo), vec3(0,0,0), 0.f, 0.f};
+}
+
+__host__ __device__ Material make_lambertian(Texture albedoTexture) {
+    return Material{MaterialType::Lambertian, albedoTexture, vec3(0,0,0), 0.f, 0.f};
 }
 
 __host__ __device__ Material make_conductor(vec3 albedo, float fuzz) {
-    return Material{MaterialType::Conductor, albedo, vec3(0,0,0), fuzz < 1 ? fuzz : 1.f, 0.f};
+    return Material{MaterialType::Conductor, make_solid_texture(albedo), vec3(0,0,0), fuzz < 1 ? fuzz : 1.f, 0.f};
 }
 
 __host__ __device__ Material make_dielectric(float refractionIndex) {
-    return Material{MaterialType::Dielectric, vec3(1,1,1), vec3(0,0,0), 0.f, refractionIndex};
+    return Material{MaterialType::Dielectric, make_solid_texture(vec3(1,1,1)), vec3(0,0,0), 0.f, refractionIndex};
 }
 
 __host__ __device__ Material make_emissive(vec3 emittedColor) {
-    return Material{MaterialType::Emissive, vec3(0,0,0), emittedColor, 0.f, 0.f};
+    return Material{MaterialType::Emissive, make_solid_texture(vec3(0,0,0)), emittedColor, 0.f, 0.f};
 }
 
 // ============================================================================
@@ -256,6 +320,7 @@ __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
 
 struct triangle {
     vec3 v0, v1, v2;
+    vec2 uv0, uv1, uv2;
     Material mat;
     AABB aabb;
 
@@ -276,6 +341,15 @@ struct triangle {
     __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
 
+__device__ vec2 computeTriangleUvFromHitPoint(const triangle& hitTriangle, const vec3& hitPoint){
+    float wholeTriangleAreaTimesTwo = (hitTriangle.v1 - hitTriangle.v0).cross(hitTriangle.v2 - hitTriangle.v0).length();
+    
+    float weightOfVertex0 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex1 = (hitTriangle.v0 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex2 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+
+    return hitTriangle.uv0 * weightOfVertex0 + hitTriangle.uv1 * weightOfVertex1+ hitTriangle.uv2 * weightOfVertex2;
+}
 
 __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
     vec3 edge1 = tri.v1 - tri.v0;
@@ -352,6 +426,15 @@ struct sphere {
     __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
 
+__device__ vec2 computeSphereUvFromOutwardNormal(const vec3& outwardUnitNormal){
+    float clampedNegativeY = fminf(1.0f, fmaxf(-1.0f, -outwardUnitNormal.y));
+    float polarAngleTheta = acosf(clampedNegativeY);
+    float azimuthAnglePhi = atan2f(-outwardUnitNormal.z, outwardUnitNormal.x) + MONOCUDA_PI;
+
+    float u = azimuthAnglePhi / (2.0f * MONOCUDA_PI);
+    float v = polarAngleTheta / MONOCUDA_PI;
+    return vec2(u, v);
+}
 __device__ bool hit_sphere(const sphere& targetSphere,const vec3& rayOrigin, const vec3& rayDirection,float time,float& intersectionDistance,bool& frontFace, vec3& outwardNormal) {
     vec3 cur_center = targetSphere.center_at(time);
     vec3 vectorFromRayOriginToSphereCenter = cur_center - rayOrigin;
@@ -444,6 +527,9 @@ struct hitRecord{
     bool frontFace = true;
     int primitiveType = -1;     // 0 = sphere, 1 = triangle
     int primitiveIndex = -1;
+
+    float u = 0.f;
+    float v = 0.f;
 };
 
 // ============================================================================
@@ -892,6 +978,9 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
                 nearestHit.mat = spheres[primitiveIdx].mat;
                 nearestHit.frontFace = frontFace;
                 nearestHit.hitNormal = frontFace ? outwardNormal : -outwardNormal;
+                vec2 sphereUv = computeSphereUvFromOutwardNormal(outwardNormal);
+                nearestHit.u = sphereUv.x;
+                nearestHit.v = sphereUv.y;
             }
         }
     } else {
@@ -912,6 +1001,9 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
                 bool front = rayDirection.dot(n) < 0.0f;     
                 nearestHit.frontFace = front;
                 nearestHit.hitNormal = front ? n : -n;
+                vec2 triangleUv = computeTriangleUvFromHitPoint(triangles[primitiveIdx], nearestHit.hitPoint);
+                nearestHit.u = triangleUv.x;
+                nearestHit.v = triangleUv.y;
             }
         }
     }
@@ -1039,6 +1131,17 @@ struct hostScene {
 static void add_quad(hostScene& s, vec3 a, vec3 b, vec3 c, vec3 d, Material m){
     s.triangles.push_back(triangle(a, b, c, m));
     s.triangles.push_back(triangle(a, c, d, m));
+
+    triangle& firstTriangle = s.triangles[s.triangles.size() - 2];
+    triangle& secondTriangle = s.triangles[s.triangles.size() - 1];
+
+    firstTriangle.uv0 = vec2(0.f, 0.f);
+    firstTriangle.uv1 = vec2(1.f, 0.f);
+    firstTriangle.uv2 = vec2(1.f, 1.f);
+
+    secondTriangle.uv0 = vec2(0.f, 0.f);
+    secondTriangle.uv1 = vec2(1.f, 1.f);
+    secondTriangle.uv2 = vec2(0.f, 1.f);
 }
 
 static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m){
@@ -1061,7 +1164,7 @@ static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m
 __host__ hostScene setup_scene() {
     hostScene scene;
 
-    
+    Material floor = make_lambertian(make_checker_texture(vec3(0.9f,0.9f,0.9f), vec3(0.1f,0.1f,0.1f), 8.f));
     Material white  = make_lambertian(vec3(0.73f, 0.73f, 0.73f));
     Material red = make_lambertian(vec3(0.65f, 0.05f, 0.05f));
     Material green  = make_lambertian(vec3(0.12f, 0.45f, 0.15f));
@@ -1069,7 +1172,7 @@ __host__ hostScene setup_scene() {
     Material light  = make_emissive(vec3(15.0f, 15.0f, 15.0f));
 
     const float L = -2.f, R = 2.f, B = 0.f, T = 4.f, F = -4.f, N = 0.f;
-    add_quad(scene, vec3(L,B,N), vec3(R,B,N), vec3(R,B,F), vec3(L,B,F), white);  // floor
+    add_quad(scene, vec3(L,B,N), vec3(R,B,N), vec3(R,B,F), vec3(L,B,F), floor);  // floor
     add_quad(scene, vec3(L,T,N), vec3(R,T,N), vec3(R,T,F), vec3(L,T,F), white);  // ceiling
     add_quad(scene, vec3(L,B,F), vec3(R,B,F), vec3(R,T,F), vec3(L,T,F), white);  // back
     add_quad(scene, vec3(L,B,N), vec3(L,B,F), vec3(L,T,F), vec3(L,T,N), red);    // left
@@ -1183,7 +1286,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
 
     for(int depth = 0 ; depth < camera.max_depth;depth++){
         hitRecord hit = bvh.traverseRay(r.origin, r.direction,r.time, spheres, triangles);
-        
+
         if(!hit.didHit){
             sampleColor = sampleColor + attenuation * camera.backround_color;
             break;
@@ -1196,7 +1299,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             break;   
         }
 
-        attenuation =  attenuation * hit.mat.albedo;
+        attenuation = attenuation * sampleTexture(hit.mat.albedoTexture, hit.u, hit.v);
 
         // ---- NEXT EVENT ESTIMATION (direct light) ----
         if (hit.mat.type == MaterialType::Lambertian && lightCount > 0) {
@@ -1320,6 +1423,8 @@ struct HitResultBuffers {
     unsigned char* hitWasFrontFace = nullptr;
     int* hitPrimitiveType = nullptr;     // 0 = sphere, 1 = triangle 
     int* hitPrimitiveIndex = nullptr;
+    float* hitU = nullptr;
+    float* hitV = nullptr;
 };
 
 struct PathQueue {
@@ -1458,6 +1563,11 @@ static void allocateHitResultBuffers(HitResultBuffers& buffers, int pathCapacity
     allocateDeviceArray(buffers.hitWasFrontFace, pathCapacity);
     allocateDeviceArray(buffers.hitPrimitiveType, pathCapacity);
     allocateDeviceArray(buffers.hitPrimitiveIndex, pathCapacity);
+
+    // for textures uv
+    allocateDeviceArray(buffers.hitU, pathCapacity);
+    allocateDeviceArray(buffers.hitV, pathCapacity);
+
 }
 
 static void freeHitResultBuffers(HitResultBuffers& buffers) {
@@ -1475,6 +1585,10 @@ static void freeHitResultBuffers(HitResultBuffers& buffers) {
     freeDeviceArray(buffers.hitWasFrontFace);
     freeDeviceArray(buffers.hitPrimitiveType);
     freeDeviceArray(buffers.hitPrimitiveIndex);
+
+    // for textures uv
+    freeDeviceArray(buffers.hitU);
+    freeDeviceArray(buffers.hitV);
 }
 
 // ----------------------------------------------------------------------------
@@ -1575,6 +1689,8 @@ __global__ void extendKernel(BVH bvh, const sphere* spheres, const triangle* tri
     hitResults.hitWasFrontFace[pathIndex] = hit.frontFace ? 1 : 0;
     hitResults.hitPrimitiveType[pathIndex] = hit.primitiveType;
     hitResults.hitPrimitiveIndex[pathIndex] = hit.primitiveIndex;
+    hitResults.hitU[pathIndex] = hit.u;
+    hitResults.hitV[pathIndex] = hit.v;
 }
 
 __global__ void shadeKernel(int depth, vec3 backgroundColor,
@@ -1616,7 +1732,9 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     if (material.type == MaterialType::Emissive) return;
 
     // throughput (with albedo)
-    throughput = throughput * material.albedo;
+    float hitU = hitResults.hitU[pathIndex];
+    float hitV = hitResults.hitV[pathIndex];
+    throughput = throughput * sampleTexture(material.albedoTexture, hitU, hitV);
 
     vec3 hitPoint(hitResults.hitPointX[pathIndex], hitResults.hitPointY[pathIndex], hitResults.hitPointZ[pathIndex]);
     vec3 hitNormal(hitResults.hitNormalX[pathIndex], hitResults.hitNormalY[pathIndex], hitResults.hitNormalZ[pathIndex]);
@@ -1892,7 +2010,7 @@ int main(int argc,char** argv) {
     // scene setup
     hostScene scene = setup_scene();
 
-    // === BVH: Morton koduna göre sort + cihaza kopyala ===
+    // === BVH MORTON CODE SORT AND DEVICE COPY ===
     std::sort(scene.primitiveRefs.begin(), scene.primitiveRefs.end(),[](const PrimitiveRef& a, const PrimitiveRef& b) {
             return a.mortonCode < b.mortonCode;
         });
