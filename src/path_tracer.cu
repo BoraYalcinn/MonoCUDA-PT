@@ -8,6 +8,7 @@
 // ==============================================================================
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <chrono>
@@ -193,11 +194,93 @@ __device__ vec3 sampleTexture(const Texture& texture, float u, float v) {
             bool isEvenCell = ((cellIndexU + cellIndexV) & 1) == 0;
             return isEvenCell ? texture.colorA : texture.colorB;
         }
-
-        case TextureType::Image:
+        case TextureType::Image: {
+            float4 texel = tex2D<float4>(texture.imageHandle, u, 1.0f - v);
+            return vec3(texel.x, texel.y, texel.z);
+        }
         default:
-            return vec3(1.f, 0.f, 1.f);   // şimdilik magenta: "image henüz yok"
+            return vec3(1.f, 0.f, 1.f);
     }
+}
+
+static bool readNextPpmInteger(FILE* file, int& value) {
+    int character = fgetc(file);
+    while (character != EOF) {
+        if (character == '#') {                       // comment line
+            while (character != '\n' && character != EOF){
+                 character = fgetc(file);
+            }
+        } else if (isspace(character)) {
+            character = fgetc(file);
+        } else break;
+    }
+    if (character == EOF || !isdigit(character)) {
+        return false;
+    }
+    value = 0;
+    while (character != EOF && isdigit(character)) {
+        value = value * 10 + (character - '0');
+        character = fgetc(file);                      // the separator after the number is consumed here
+    }
+    return true;
+}
+
+// reads a binary PPM (P6) and returns RGBA8 ( !! CUDA textures cannot be 3-channel)
+static bool loadPpmAsRgba8(const char* filePath, int& imageWidth, int& imageHeight, std::vector<unsigned char>& rgbaPixels) {
+    FILE* file = fopen(filePath, "rb");
+    if (!file) return false;
+
+    if (fgetc(file) != 'P' || fgetc(file) != '6'){
+        fclose(file); 
+        return false;
+    }
+    int maximumValue = 0;
+    if (!readNextPpmInteger(file, imageWidth) || !readNextPpmInteger(file, imageHeight) ||!readNextPpmInteger(file, maximumValue) || maximumValue != 255){
+        fclose(file);
+        return false;
+    }
+
+    std::vector<unsigned char> rgbPixels((size_t)imageWidth * imageHeight * 3);
+    size_t readCount = fread(rgbPixels.data(), 1, rgbPixels.size(), file);
+    fclose(file);
+    if (readCount != rgbPixels.size()){
+        return false;
+    }
+
+    rgbaPixels.resize((size_t)imageWidth * imageHeight * 4);
+    for (size_t pixelIndex = 0; pixelIndex < (size_t)imageWidth * imageHeight; pixelIndex++) {
+        rgbaPixels[pixelIndex * 4 + 0] = rgbPixels[pixelIndex * 3 + 0];
+        rgbaPixels[pixelIndex * 4 + 1] = rgbPixels[pixelIndex * 3 + 1];
+        rgbaPixels[pixelIndex * 4 + 2] = rgbPixels[pixelIndex * 3 + 2];
+        rgbaPixels[pixelIndex * 4 + 3] = 255;
+    }
+    return true;
+}
+
+static cudaTextureObject_t createImageTextureObject(const std::vector<unsigned char>& rgbaPixels, int imageWidth, int imageHeight, cudaArray_t& imageArray) {
+    cudaChannelFormatDesc channelDescription = cudaCreateChannelDesc<uchar4>();
+    CUDA_CHECK(cudaMallocArray(&imageArray, &channelDescription, imageWidth, imageHeight));
+    CUDA_CHECK(cudaMemcpy2DToArray(imageArray, 0, 0, rgbaPixels.data(), imageWidth * 4, imageWidth * 4, imageHeight, cudaMemcpyHostToDevice));
+
+    cudaResourceDesc resourceDescription = {};
+    resourceDescription.resType = cudaResourceTypeArray;
+    resourceDescription.res.array.array = imageArray;
+
+    cudaTextureDesc textureDescription = {};
+    textureDescription.addressMode[0] = cudaAddressModeWrap;
+    textureDescription.addressMode[1] = cudaAddressModeWrap;
+    textureDescription.filterMode = cudaFilterModeLinear;
+    textureDescription.readMode = cudaReadModeNormalizedFloat;
+    textureDescription.normalizedCoords = 1;
+    textureDescription.sRGB = 0;      // 1 once we output gamma-corrected images
+
+    cudaTextureObject_t textureHandle = 0;
+    CUDA_CHECK(cudaCreateTextureObject(&textureHandle, &resourceDescription, &textureDescription, nullptr));
+    return textureHandle;
+}
+
+__host__ __device__ Texture make_image_texture(cudaTextureObject_t imageHandle) {
+    return Texture{TextureType::Image, vec3(1,1,1), vec3(0,0,0), 1.f, imageHandle};
 }
 
 // ============================================================================
@@ -1125,6 +1208,8 @@ struct hostScene {
     std::vector<triangle> triangles;
     std::vector<Light> lights;
     std::vector<PrimitiveRef> primitiveRefs;
+    std::vector<cudaArray_t> imageArrays;
+    std::vector<cudaTextureObject_t> imageTextureHandles;
     AABB bounds;
 };
 
@@ -1184,7 +1269,23 @@ __host__ hostScene setup_scene() {
     add_box(scene, boxCenter, vec3(0.55f, 1.1f, 0.55f), 0.3f, white);
     vec3 bigCenter(0.85f, 0.7f, -1.7f);
     scene.spheres.push_back(sphere(bigCenter, 0.7f, mirror));
+    // earth
+    vec3 earthCenter(1.3f, 2.8f, -3.0f);
+    float earthRadius = 0.5f;
+    
+    int earthImageWidth = 0, earthImageHeight = 0;
+    std::vector<unsigned char> earthImagePixels;
+    if (!loadPpmAsRgba8("earth.ppm", earthImageWidth, earthImageHeight, earthImagePixels)) {
+        std::fprintf(stderr, "could not load earth.ppm\n");
+        std::exit(EXIT_FAILURE);
+    }
+    cudaArray_t earthImageArray = nullptr;
+    cudaTextureObject_t earthTextureHandle = createImageTextureObject(earthImagePixels, earthImageWidth, earthImageHeight, earthImageArray);
+    scene.imageArrays.push_back(earthImageArray);
+    scene.imageTextureHandles.push_back(earthTextureHandle);
 
+    Material earthMaterial = make_lambertian(make_image_texture(earthTextureHandle));
+    scene.spheres.push_back(sphere(earthCenter, earthRadius, earthMaterial));
     
     srand(42);
     const float r = 0.1f;
@@ -1195,7 +1296,7 @@ __host__ hostScene setup_scene() {
             vec3 c(-1.8f + 0.3f * a + jx, r, -3.8f + 0.3f * b + jz);
 
             if ((c - bigCenter).length() < 0.7f + r + 0.02f) continue;
-            if ((c - vec3(boxCenter.x, r, boxCenter.z)).length() < 0.9f) continue;  
+            if ((c - vec3(boxCenter.x, r, boxCenter.z)).length() < 0.9f) continue; 
 
             float chooseMat = rand() / (float)RAND_MAX;
 
@@ -2157,6 +2258,12 @@ int main(int argc,char** argv) {
     CUDA_CHECK(cudaFree(d_accumBuffer));   
     CUDA_CHECK(cudaFree(d_rngStates));
     CUDA_CHECK(cudaFree(d_lights));
+    for(size_t i = 0; i < scene.imageTextureHandles.size(); i++){
+        CUDA_CHECK(cudaDestroyTextureObject(scene.imageTextureHandles[i]));
+    }
+    for(size_t i = 0; i < scene.imageArrays.size(); i++){
+        CUDA_CHECK(cudaFreeArray(scene.imageArrays[i]));
+    }
     bvh.free();
     delete[] host_frameBuffer;
     
