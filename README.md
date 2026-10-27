@@ -3,7 +3,7 @@ MonoCUDA is an original CUDA path tracer written as a single source file. It was
 
 The renderer is deliberately kept in one file. The intent is for the source to read as a continuous explanation of a GPU path tracer's design, from ray generation through BVH traversal, material evaluation, and light transport, rather than as a general-purpose rendering engine split across many files. Kernels are written iteratively rather than recursively, since recursion on GPU forces register spilling and reduces occupancy.
 
-The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, and the renderer supports motion blur through time-sampled rays and moving spheres. Multiple importance sampling between light and BSDF sampling and correctness checks against a CPU reference implementation are planned (see below checklist). Performance is tracked with benchmark numbers that will be recorded in bench/results.md.
+The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, combined with BSDF sampling through multiple importance sampling (power heuristic). The renderer supports motion blur through time-sampled rays and moving spheres, and textured surfaces: solid colors, a procedural checker and image textures, with UV mapping on spheres and triangles and hardware-filtered image sampling through `cudaTextureObject_t`. Correctness checks against a CPU reference implementation are planned (see below checklist). Performance is tracked with benchmark numbers that will be recorded in bench/results.md.
 
 Two execution models are implemented side by side and produce the same image: a single-kernel path tracer (the default), where one thread follows a whole path, and a wavefront path tracer (`--wavefront`), which splits every bounce into separate extend, shade and shadow-ray kernels connected by compacted path queues and a structure-of-arrays path state. The wavefront version raises the average number of active threads per warp from about 7 to about 27 on the first bounce, at the cost of extra memory traffic.
 
@@ -16,7 +16,7 @@ cmake --build --preset release
 ./build/release/monocuda --wavefront   # wavefront path tracer
 ```
 
-The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model.
+The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model. The demo scene loads an `earth.ppm` image texture (binary PPM, P6) from the current directory.
 
 The project's implementation status is tracked in CHECKLIST.md. It is licensed under the MIT License.
 
@@ -50,10 +50,10 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] **(stretch)** Energy-conserving material blending (e.g. dielectric-coated diffuse)
 
 ## 4. Textures & Surface Detail
-- [ ] UV coordinates on primitives (spherical mapping for sphere, barycentric for triangle)
-- [ ] Image loading (e.g. `stb_image`) — PNG/JPG/HDR into host memory
-- [ ] Hardware-accelerated sampling via `cudaTextureObject_t` (bilinear filtering on the GPU, not a manual lerp)
-- [ ] Albedo/diffuse texture map, wired into existing materials
+- [x] UV coordinates on primitives (spherical mapping for sphere, barycentric for triangle)
+- [x] Procedural checker texture and a `Texture` struct (solid / checker / image) wired into the materials' albedo
+- [x] Image loading — dependency-free binary PPM (P6) reader into RGBA8 host memory (PNG/JPG/HDR are converted offline, no `stb_image`, to keep the project single-file)
+- [x] Hardware-accelerated sampling via `cudaTextureObject_t` (bilinear filtering on the GPU, wrap addressing) *(sampled without the sRGB conversion for now, since the output has no gamma step yet; see Image Output)*
 - [ ] **(stretch)** Normal mapping (tangent-space perturbation of the shading normal)
 - [ ] **(stretch)** Roughness/metallic texture maps for the conductor BSDF
 
@@ -65,7 +65,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] Light sampling for sphere lights (solid-angle / cone sampling)
 - [x] Light selection strategy for multiple lights (uniform; power-weighted is a possible upgrade)
 - [x] Next event estimation (NEE) — explicitly sample lights each bounce instead of relying on BSDF sampling alone to find them
-- [ ] Multiple importance sampling (MIS) between light sampling and BSDF sampling
+- [x] Multiple importance sampling (MIS) between light sampling and BSDF sampling — power heuristic, implemented in both the single-kernel and the wavefront path tracer *(on the current mostly diffuse scene with one small area light it does not reduce noise measurably, since NEE alone is already near-optimal there; its benefit shows up with large lights and glossy surfaces)*
 - [x] Cosine-weighted / importance-sampled BSDF sampling (not uniform hemisphere)
 - [ ] **(stretch)** Environment map (HDRI) lighting with importance sampling
 - [ ] **(stretch)** Stratified or low-discrepancy sampling (e.g. Sobol/blue-noise) instead of pure `curand` uniform — measurably reduces noise at equal sample count
@@ -89,7 +89,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [x] Occupancy measurement (Nsight Compute or `nvidia-smi`) at a baseline milestone
 - [x] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything") *(implemented with atomic-counter path queues, a separate shadow-ray queue for NEE, and SoA path state; selectable with `--wavefront`)*
 - [ ] **(stretch)** Material-sorted shading — sort active paths by material ID before shading to reduce warp divergence
-- [ ] **(stretch)** Any-hit traversal for shadow rays (early exit on the first occluder, no hit record)
+- [x] **(stretch)** Any-hit traversal for shadow rays (early exit on the first occluder, no hit record) *(used by the wavefront shadow kernel; the single-kernel path tracer still uses closest-hit traversal with a max distance)*
 - [ ] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces
 
 ## 9. Image Output & Post-Processing
@@ -102,7 +102,7 @@ The project's implementation status is tracked in CHECKLIST.md. It is licensed u
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [ ] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo
 - [ ] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag)
-- [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor)
+- [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor, a checker floor and a textured Earth sphere)
 
 ## References
 
