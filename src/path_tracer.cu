@@ -8,6 +8,9 @@
 // ==============================================================================
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
@@ -283,7 +286,10 @@ __host__ __device__ Texture make_image_texture(cudaTextureObject_t imageHandle) 
     return Texture{TextureType::Image, vec3(1,1,1), vec3(0,0,0), 1.f, imageHandle};
 }
 
+
 // ============================================================================
+
+
 
 
 // ============================================================================
@@ -938,13 +944,8 @@ __device__ inline int2 determineRange(const unsigned int* sortedMortonCodes, int
     return make_int2(first, last);
 }
 
-__device__ inline int findSplit(const unsigned int* sortedMortonCodes, int first, int last){
-    unsigned int firstCode = sortedMortonCodes[first];
-    unsigned int lastCode  = sortedMortonCodes[last];
-
-    if (firstCode == lastCode) return (first + last) >> 1;
-
-    int commonPrefix = __clz(firstCode ^ lastCode);
+__device__ inline int findSplit(const unsigned int* sortedMortonCodes, int numObjects, int first, int last){
+    int commonPrefix = delta(sortedMortonCodes, numObjects, first, last);
 
     int split = first;
     int step  = last - first;
@@ -952,8 +953,7 @@ __device__ inline int findSplit(const unsigned int* sortedMortonCodes, int first
         step = (step + 1) >> 1;
         int newSplit = split + step;
         if (newSplit < last){
-            unsigned int splitCode = sortedMortonCodes[newSplit];
-            int splitPrefix = __clz(firstCode ^ splitCode);
+            int splitPrefix = delta(sortedMortonCodes, numObjects, first, newSplit);
             if (splitPrefix > commonPrefix) split = newSplit;
         }
     } while (step > 1);
@@ -985,7 +985,7 @@ __global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNod
         AABB leftBounds = node.leftIsLeaf  ? d_leafNode[node.leftChild].bounds  : d_internalNodes[node.leftChild].bounds;
         AABB rightBounds = node.rightIsLeaf ? d_leafNode[node.rightChild].bounds : d_internalNodes[node.rightChild].bounds;
         node.bounds = merge(leftBounds, rightBounds);
-
+        __threadfence();
         currentParent = node.parent;
     }
 }
@@ -997,7 +997,7 @@ __global__ void buildInternalNodesKernel(BVH_Node* d_internalNodes, BVH_Node* d_
     int2 range = determineRange(sortedMortonCodes, numObjects, idx);
     int first = range.x;
     int last  = range.y;
-    int split = findSplit(sortedMortonCodes, first, last);
+    int split = findSplit(sortedMortonCodes, numObjects, first, last);
 
     d_internalNodes[idx].isLeaf = false;
 
@@ -1215,7 +1215,6 @@ public:
 // ============================================================================
 
 
-
 // ============================================================================
 // === SCENE SETUP ===
 // ============================================================================
@@ -1263,8 +1262,13 @@ static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m
     add_quad(s, p[2], p[3], p[7], p[6], m);  // +y
 }
 
-__host__ hostScene setup_scene() {
-    hostScene scene;
+enum class SceneChoice {Cornell, Sponza};
+
+// == FORWARD DECLERATIONS =======================================================
+static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians);
+// ===============================================================================
+
+__host__ void buildCornellScene(hostScene& scene) {
 
     Material floor = make_lambertian(make_checker_texture(vec3(0.9f,0.9f,0.9f), vec3(0.1f,0.1f,0.1f), 8.f));
     Material white  = make_lambertian(vec3(0.73f, 0.73f, 0.73f));
@@ -1330,37 +1334,71 @@ __host__ hostScene setup_scene() {
         }
     }
     
-    for (size_t i = 0; i < scene.spheres.size(); i++) scene.spheres[i].calculate_bounding_box();
-    for (size_t i = 0; i < scene.triangles.size(); i++) scene.triangles[i].calculate_bounding_box();
+}
 
-    AABB sceneBounds = scene.spheres[0].aabb;
-    for (size_t i = 1; i < scene.spheres.size(); i++)   sceneBounds = merge(sceneBounds, scene.spheres[i].aabb);
-    for (size_t i = 0; i < scene.triangles.size(); i++) sceneBounds = merge(sceneBounds, scene.triangles[i].aabb);
+__host__ void buildSponzaScene(hostScene& scene){
+    Material wallMaterial = make_lambertian(vec3(0.75f, 0.72f, 0.68f));
+    if (!loadObject(scene, "models/sponza.obj", wallMaterial, vec3(0.f, 0.f, 0.f), 37.f, 0.f)){
+        std::fprintf(stderr, "could not load models/sponza.obj\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    // sponza has no light of its own, a quad that fills the open roof acts as the sky.
+    // after the scale above the opening sits at x [-9, 8.5] and z [-1.8, 1.9], anything
+    // wider than that ends up buried in the roof and only wastes shadow rays
+    Material skylight = make_emissive(vec3(6.f, 6.f, 6.f));
+    const float skylightHeight = 14.6f;
+    add_quad(scene, vec3(-8.8f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, 1.7f), vec3(-8.8f, skylightHeight, 1.7f), skylight);
+}
+
+// bounding boxes, primitive references for the BVH and the light list (shared by every scene)
+__host__ void finalizeScene(hostScene& scene){
+    for (size_t i = 0; i < scene.spheres.size(); i++){
+        scene.spheres[i].calculate_bounding_box();
+    }
+    for (size_t i = 0; i < scene.triangles.size(); i++){
+        scene.triangles[i].calculate_bounding_box();
+    }
+
+    AABB sceneBounds;
+    bool hasBounds = false;
+    for (size_t i = 0; i < scene.spheres.size(); i++){
+        sceneBounds = hasBounds ? merge(sceneBounds, scene.spheres[i].aabb) : scene.spheres[i].aabb;
+        hasBounds = true;
+    }
+    for (size_t i = 0; i < scene.triangles.size(); i++){
+        sceneBounds = hasBounds ? merge(sceneBounds, scene.triangles[i].aabb) : scene.triangles[i].aabb;
+        hasBounds = true;
+    }
     scene.bounds = sceneBounds;
+
+        printf("scene bounds: min(%.2f %.2f %.2f) max(%.2f %.2f %.2f), %d triangles\n",
+           sceneBounds.minInterval.x, sceneBounds.minInterval.y, sceneBounds.minInterval.z,
+           sceneBounds.maxInterval.x, sceneBounds.maxInterval.y, sceneBounds.maxInterval.z,
+           (int)scene.triangles.size());
 
     for (size_t i = 0; i < scene.spheres.size(); i++) {
         PrimitiveRef ref;
         ref.bounds = scene.spheres[i].aabb;
         ref.centroid = scene.spheres[i].calculateCentroid();
-        ref.primitiveType  = 0;
+        ref.primitiveType = 0;
         ref.primitiveIndex = i;
-        ref.mortonCode = morton3D(ref.centroid,scene.bounds);
+        ref.mortonCode = morton3D(ref.centroid, scene.bounds);
         scene.primitiveRefs.push_back(ref);
-        
     }
     for (size_t i = 0; i < scene.triangles.size(); i++) {
         PrimitiveRef ref;
         ref.bounds = scene.triangles[i].aabb;
         ref.centroid = scene.triangles[i].calculateCentroid();
-        ref.primitiveType  = 1;
+        ref.primitiveType = 1;
         ref.primitiveIndex = i;
-        ref.mortonCode = morton3D(ref.centroid,scene.bounds);
+        ref.mortonCode = morton3D(ref.centroid, scene.bounds);
         scene.primitiveRefs.push_back(ref);
-        if(scene.triangles[i].mat.type == MaterialType::Emissive){
+
+        if (scene.triangles[i].mat.type == MaterialType::Emissive){
             triangle& emissiveTriangle = scene.triangles[i];
             vec3 edgeOne = emissiveTriangle.v1 - emissiveTriangle.v0;
             vec3 edgeTwo = emissiveTriangle.v2 - emissiveTriangle.v0;
-            
             vec3 areaVector = edgeOne.cross(edgeTwo);
 
             Light light;
@@ -1370,8 +1408,163 @@ __host__ hostScene setup_scene() {
             scene.lights.push_back(light);
         }
     }
+}
 
+__host__ hostScene setup_scene(SceneChoice sceneChoice){
+    hostScene scene;
+    if (sceneChoice == SceneChoice::Sponza){
+        buildSponzaScene(scene);
+    }else{
+        buildCornellScene(scene);
+    }
+    finalizeScene(scene);
     return scene;
+}
+// ============================================================================
+
+// ============================================================================
+// === OBJECT LOADING ===
+// ============================================================================
+struct ObjVertexReference {
+    int positionIndex;   // -1 = missing
+    int uvIndex;         // -1 = missing
+};
+
+struct ObjTriangleCorners {
+    ObjVertexReference corner[3];
+};
+
+// obj indices start from 1 and negative ones count from the end of the list
+static int resolveObjIndex(int rawIndex,int listSize){
+    if (rawIndex > 0) return rawIndex - 1;
+    if (rawIndex < 0) return listSize + rawIndex;
+    return -1;
+}
+
+// token examples: "7", "7/3", "7/3/5", "7//5"
+static ObjVertexReference parseObjFaceToken(const std::string& token,int positionCount,int uvCount){
+    int rawIndices[3] = {0, 0, 0};
+    size_t startOfPiece = 0;
+    for (int partIndex = 0; partIndex < 3; partIndex++){
+        size_t slashPosition = token.find('/', startOfPiece);
+        size_t pieceLength = (slashPosition == std::string::npos) ? std::string::npos : slashPosition - startOfPiece;
+        std::string piece = token.substr(startOfPiece, pieceLength);
+        if (!piece.empty()){
+            rawIndices[partIndex] = std::atoi(piece.c_str());
+        }
+        if (slashPosition == std::string::npos) break;
+        startOfPiece = slashPosition + 1;
+    }
+
+    ObjVertexReference reference;
+    reference.positionIndex = resolveObjIndex(rawIndices[0], positionCount);
+    reference.uvIndex = resolveObjIndex(rawIndices[1], uvCount);
+    return reference;
+}
+
+// model is centered on x/z, its lowest point sits at y = 0 and its largest side becomes 1
+// then uniformScale, rotation around Y and translation (where the bottom center ends up) are applied
+static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians){
+    std::ifstream file(filePath);
+    if (!file.is_open()) return false;
+
+    std::vector<vec3> positions;
+    std::vector<vec2> uvs;
+    std::vector<ObjTriangleCorners> faces;
+
+    std::string line;
+    while (std::getline(file, line)){
+        std::istringstream lineStream(line);
+        std::string keyword;
+        lineStream >> keyword;
+
+        if (keyword == "v"){
+            float x, y, z;
+            lineStream >> x >> y >> z;
+            positions.push_back(vec3(x, y, z));
+        } else if (keyword == "vt"){
+            float u, v;
+            lineStream >> u >> v;
+            uvs.push_back(vec2(u, v));
+        } else if (keyword == "f"){
+            std::vector<ObjVertexReference> corners;
+            std::string token;
+            while (lineStream >> token){
+                corners.push_back(parseObjFaceToken(token, (int)positions.size(), (int)uvs.size()));
+            }
+            // fan triangulation (0, fanIndex, fanIndex + 1)
+            for (size_t fanIndex = 1; fanIndex + 1 < corners.size(); fanIndex++){
+                ObjTriangleCorners face;
+                face.corner[0] = corners[0];
+                face.corner[1] = corners[fanIndex];
+                face.corner[2] = corners[fanIndex + 1];
+                faces.push_back(face);
+            }
+        }
+    }
+    if (positions.empty() || faces.empty()) return false;
+
+    // bounding box of the raw model
+    vec3 boxMin = positions[0];
+    vec3 boxMax = positions[0];
+    for (size_t positionIndex = 1; positionIndex < positions.size(); positionIndex++){
+        boxMin = vec3(fminf(boxMin.x, positions[positionIndex].x), fminf(boxMin.y, positions[positionIndex].y), fminf(boxMin.z, positions[positionIndex].z));
+        boxMax = vec3(fmaxf(boxMax.x, positions[positionIndex].x), fmaxf(boxMax.y, positions[positionIndex].y), fmaxf(boxMax.z, positions[positionIndex].z));
+    }
+    vec3 modelSize = boxMax - boxMin;
+    float largestSide = fmaxf(modelSize.x, fmaxf(modelSize.y, modelSize.z));
+    vec3 bottomCenter((boxMin.x + boxMax.x) * 0.5f, boxMin.y, (boxMin.z + boxMax.z) * 0.5f);
+
+    float cosine = cosf(rotationAroundYRadians);
+    float sine = sinf(rotationAroundYRadians);
+
+    // transform every position only once
+    std::vector<vec3> transformedPositions(positions.size());
+    for (size_t positionIndex = 0; positionIndex < positions.size(); positionIndex++){
+        vec3 normalizedPosition = (positions[positionIndex] - bottomCenter) * (uniformScale / largestSide);
+        vec3 rotatedPosition(normalizedPosition.x * cosine + normalizedPosition.z * sine, normalizedPosition.y, -normalizedPosition.x * sine + normalizedPosition.z * cosine);
+        transformedPositions[positionIndex] = rotatedPosition + translation;
+    }
+
+    int addedTriangleCount = 0;
+    int skippedFaceCount = 0;
+    for (size_t faceIndex = 0; faceIndex < faces.size(); faceIndex++){
+        const ObjTriangleCorners& face = faces[faceIndex];
+
+        bool isFaceValid = true;
+        for (int cornerIndex = 0; cornerIndex < 3; cornerIndex++){
+            int positionIndex = face.corner[cornerIndex].positionIndex;
+            if (positionIndex < 0 || positionIndex >= (int)positions.size()) isFaceValid = false;
+        }
+        if (!isFaceValid){
+            skippedFaceCount++;
+            continue;
+        }
+
+        vec3 vertex0 = transformedPositions[face.corner[0].positionIndex];
+        vec3 vertex1 = transformedPositions[face.corner[1].positionIndex];
+        vec3 vertex2 = transformedPositions[face.corner[2].positionIndex];
+
+        // degenerate (zero area) triangles would give NaN normals
+        if ((vertex1 - vertex0).cross(vertex2 - vertex0).length() < 1e-9f){
+            skippedFaceCount++;
+            continue;
+        }
+
+        triangle objectTriangle(vertex0, vertex1, vertex2, mat);
+        vec2* uvTargets[3] = {&objectTriangle.uv0, &objectTriangle.uv1, &objectTriangle.uv2};
+        for (int cornerIndex = 0; cornerIndex < 3; cornerIndex++){
+            int uvIndex = face.corner[cornerIndex].uvIndex;
+            if (uvIndex >= 0 && uvIndex < (int)uvs.size()){
+                *uvTargets[cornerIndex] = uvs[uvIndex];
+            }
+        }
+        scene.triangles.push_back(objectTriangle);
+        addedTriangleCount++;
+    }
+
+    printf("OBJ '%s': %d triangles added, %d faces skipped\n", filePath, addedTriangleCount, skippedFaceCount);
+    return addedTriangleCount > 0;
 }
 // ============================================================================
 
@@ -2109,9 +2302,17 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
 int main(int argc,char** argv) {
 
     bool useWavefrontPathTracing = false;
+    SceneChoice sceneChoice = SceneChoice::Cornell;
+    int samplesPerPixelOverride = 0;
     for(int argumentIndex = 1; argumentIndex < argc; ++argumentIndex){
         if(std::strcmp(argv[argumentIndex], "--wavefront") == 0){
             useWavefrontPathTracing = true;
+        }else if(std::strcmp(argv[argumentIndex], "--scene") == 0 && argumentIndex + 1 < argc){
+            ++argumentIndex;
+            if(std::strcmp(argv[argumentIndex], "sponza") == 0) sceneChoice = SceneChoice::Sponza;
+        }else if(std::strcmp(argv[argumentIndex], "--spp") == 0 && argumentIndex + 1 < argc){
+            ++argumentIndex;
+            samplesPerPixelOverride = std::atoi(argv[argumentIndex]);
         }
     }
 
@@ -2147,11 +2348,22 @@ int main(int argc,char** argv) {
     cam.aperture = 0.0f;
     cam.backround_color = vec3(0, 0, 0);
     cam.samples_per_pixel = 500;
+
+    if (samplesPerPixelOverride > 0) cam.samples_per_pixel = samplesPerPixelOverride;
+
+    if (sceneChoice == SceneChoice::Sponza){
+        // the lowest geometry of the model is the outer ground plate, so the atrium
+        // floor lands at y ~ 1.23 and the camera has to sit above that, inside the atrium
+        cam.look_from = vec3(-8.f, 3.f, 0.f);
+        cam.look_at = vec3(8.f, 3.5f, 0.f);
+        cam.vfov = 60.f;
+        cam.focus_distance = 10.f;
+    }
   
     cam.initialize();
 
     // scene setup
-    hostScene scene = setup_scene();
+    hostScene scene = setup_scene(sceneChoice);
 
     // === BVH MORTON CODE SORT AND DEVICE COPY ===
     std::sort(scene.primitiveRefs.begin(), scene.primitiveRefs.end(),[](const PrimitiveRef& a, const PrimitiveRef& b) {

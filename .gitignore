@@ -19,3 +19,4 @@ compile_commands.json
 *.ptx
 *.cubin
 *.fatbin
+models/
