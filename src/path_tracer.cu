@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <cctype>
+#include <map>
 #include <cstdlib>
 #include <iostream>
 #include <chrono>
@@ -1432,6 +1433,12 @@ struct ObjVertexReference {
 
 struct ObjTriangleCorners {
     ObjVertexReference corner[3];
+    int materialIndex = -1;    // index into the material library, -1 = use the default material
+};
+
+struct ObjMaterialLibrary {
+    std::vector<Material> materials;
+    std::map<std::string,int> indexByName;
 };
 
 // obj indices start from 1 and negative ones count from the end of the list
@@ -1462,15 +1469,116 @@ static ObjVertexReference parseObjFaceToken(const std::string& token,int positio
     return reference;
 }
 
+static std::string getDirectoryOfFile(const std::string& filePath){
+    size_t lastSlashPosition = filePath.find_last_of("/\\");
+    if (lastSlashPosition == std::string::npos) return ".";
+    return filePath.substr(0, lastSlashPosition);
+}
+
+// textures are converted to ppm offline, "textures\wall.png" becomes "textures/wall.ppm"
+static std::string convertTexturePathToPpm(std::string texturePath){
+    for (size_t characterIndex = 0; characterIndex < texturePath.size(); characterIndex++){
+        if (texturePath[characterIndex] == '\\') texturePath[characterIndex] = '/';
+    }
+    size_t lastDotPosition = texturePath.find_last_of('.');
+    size_t lastSlashPosition = texturePath.find_last_of('/');
+    bool dotBelongsToFileName = (lastDotPosition != std::string::npos) && (lastSlashPosition == std::string::npos || lastDotPosition > lastSlashPosition);
+    if (dotBelongsToFileName){
+        texturePath = texturePath.substr(0, lastDotPosition);
+    }
+    return texturePath + ".ppm";
+}
+
+// every ppm is uploaded to the gpu only once even if many materials use it, returns 0 if it could not be loaded
+static cudaTextureObject_t getOrLoadObjTexture(hostScene& scene,const std::string& ppmPath,std::map<std::string,cudaTextureObject_t>& textureCache){
+    std::map<std::string,cudaTextureObject_t>::iterator cachedEntry = textureCache.find(ppmPath);
+    if (cachedEntry != textureCache.end()) return cachedEntry->second;
+
+    cudaTextureObject_t textureHandle = 0;
+    int imageWidth = 0, imageHeight = 0;
+    std::vector<unsigned char> imagePixels;
+    if (loadPpmAsRgba8(ppmPath.c_str(), imageWidth, imageHeight, imagePixels)){
+        cudaArray_t imageArray = nullptr;
+        textureHandle = createImageTextureObject(imagePixels, imageWidth, imageHeight, imageArray);
+        scene.imageArrays.push_back(imageArray);
+        scene.imageTextureHandles.push_back(textureHandle);
+    } else {
+        printf("could not load texture '%s' (convert the png to a binary ppm first)\n", ppmPath.c_str());
+    }
+    textureCache[ppmPath] = textureHandle;
+    return textureHandle;
+}
+
+// reads newmtl / Kd / map_Kd, every material becomes a lambertian (flat color or image texture)
+// Ka, Ks, bump maps and alpha masks are ignored, so are map_Kd options like "-s 2 2 2"
+static bool loadMtlFile(hostScene& scene,const std::string& mtlPath,const std::string& objectDirectory,ObjMaterialLibrary& library,std::map<std::string,cudaTextureObject_t>& textureCache,int& missingTextureCount){
+    std::ifstream file(mtlPath);
+    if (!file.is_open()) return false;
+
+    std::string currentName;
+    vec3 currentColor(0.8f, 0.8f, 0.8f);
+    std::string currentTexturePath;
+    bool hasCurrentMaterial = false;
+
+    // pushes the material that was being read, called when the next one starts and at the end of the file
+    auto finishCurrentMaterial = [&](){
+        if (!hasCurrentMaterial) return;
+        Material finishedMaterial = make_lambertian(currentColor);
+        if (!currentTexturePath.empty()){
+            std::string ppmPath = objectDirectory + "/" + convertTexturePathToPpm(currentTexturePath);
+            cudaTextureObject_t textureHandle = getOrLoadObjTexture(scene, ppmPath, textureCache);
+            if (textureHandle != 0){
+                finishedMaterial = make_lambertian(make_image_texture(textureHandle));
+            } else {
+                missingTextureCount++;
+            }
+        }
+        library.indexByName[currentName] = (int)library.materials.size();
+        library.materials.push_back(finishedMaterial);
+        hasCurrentMaterial = false;
+    };
+
+    std::string line;
+    while (std::getline(file, line)){
+        std::istringstream lineStream(line);
+        std::string keyword;
+        lineStream >> keyword;
+
+        if (keyword == "newmtl"){
+            finishCurrentMaterial();
+            lineStream >> currentName;
+            currentColor = vec3(0.8f, 0.8f, 0.8f);
+            currentTexturePath.clear();
+            hasCurrentMaterial = true;
+        } else if (keyword == "Kd" && hasCurrentMaterial){
+            float red, green, blue;
+            lineStream >> red >> green >> blue;
+            currentColor = vec3(red, green, blue);
+        } else if (keyword == "map_Kd" && hasCurrentMaterial){
+            lineStream >> currentTexturePath;
+        }
+    }
+    finishCurrentMaterial();
+    return true;
+}
+
 // model is centered on x/z, its lowest point sits at y = 0 and its largest side becomes 1
 // then uniformScale, rotation around Y and translation (where the bottom center ends up) are applied
+// mat is only used for faces that have no material from the .mtl file
 static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians){
     std::ifstream file(filePath);
     if (!file.is_open()) return false;
 
+    std::string objectDirectory = getDirectoryOfFile(filePath);
+
     std::vector<vec3> positions;
     std::vector<vec2> uvs;
     std::vector<ObjTriangleCorners> faces;
+
+    ObjMaterialLibrary materialLibrary;
+    std::map<std::string,cudaTextureObject_t> textureCache;
+    int missingTextureCount = 0;
+    int currentMaterialIndex = -1;
 
     std::string line;
     while (std::getline(file, line)){
@@ -1486,6 +1594,18 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
             float u, v;
             lineStream >> u >> v;
             uvs.push_back(vec2(u, v));
+        } else if (keyword == "mtllib"){
+            std::string mtlFileName;
+            while (lineStream >> mtlFileName){
+                if (!loadMtlFile(scene, objectDirectory + "/" + mtlFileName, objectDirectory, materialLibrary, textureCache, missingTextureCount)){
+                    printf("OBJ '%s': could not open material library '%s'\n", filePath, mtlFileName.c_str());
+                }
+            }
+        } else if (keyword == "usemtl"){
+            std::string materialName;
+            lineStream >> materialName;
+            std::map<std::string,int>::iterator foundMaterial = materialLibrary.indexByName.find(materialName);
+            currentMaterialIndex = (foundMaterial != materialLibrary.indexByName.end()) ? foundMaterial->second : -1;
         } else if (keyword == "f"){
             std::vector<ObjVertexReference> corners;
             std::string token;
@@ -1498,6 +1618,7 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
                 face.corner[0] = corners[0];
                 face.corner[1] = corners[fanIndex];
                 face.corner[2] = corners[fanIndex + 1];
+                face.materialIndex = currentMaterialIndex;
                 faces.push_back(face);
             }
         }
@@ -1551,7 +1672,12 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
             continue;
         }
 
-        triangle objectTriangle(vertex0, vertex1, vertex2, mat);
+        Material triangleMaterial = mat;
+        if (face.materialIndex >= 0 && face.materialIndex < (int)materialLibrary.materials.size()){
+            triangleMaterial = materialLibrary.materials[face.materialIndex];
+        }
+
+        triangle objectTriangle(vertex0, vertex1, vertex2, triangleMaterial);
         vec2* uvTargets[3] = {&objectTriangle.uv0, &objectTriangle.uv1, &objectTriangle.uv2};
         for (int cornerIndex = 0; cornerIndex < 3; cornerIndex++){
             int uvIndex = face.corner[cornerIndex].uvIndex;
@@ -1563,7 +1689,12 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
         addedTriangleCount++;
     }
 
-    printf("OBJ '%s': %d triangles added, %d faces skipped\n", filePath, addedTriangleCount, skippedFaceCount);
+    int loadedTextureCount = 0;
+    for (std::map<std::string,cudaTextureObject_t>::iterator cachedEntry = textureCache.begin(); cachedEntry != textureCache.end(); ++cachedEntry){
+        if (cachedEntry->second != 0) loadedTextureCount++;
+    }
+    printf("OBJ '%s': %d triangles added, %d faces skipped, %d materials, %d textures loaded, %d materials with a missing texture\n",
+           filePath, addedTriangleCount, skippedFaceCount, (int)materialLibrary.materials.size(), loadedTextureCount, missingTextureCount);
     return addedTriangleCount > 0;
 }
 // ============================================================================
