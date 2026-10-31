@@ -679,6 +679,27 @@ __host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin,
 __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
 __device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, float maximumDistance);
 // ===============================================================================
+// One ray's traversal progress. Lives in a lane for as long as the ray is being traversed,
+// so a lane can be handed a new ray the moment its old one is finished. 
+// applying persistent threads to increase the number of threads per instruction to prevent thread divergence 
+static constexpr int TRAVERSAL_STACK_CAPACITY = 64;
+
+struct TraversalState{
+    vec3 rayOrigin;
+    vec3 rayDirection;
+    float rayTime;
+
+    hitRecord nearestHit;
+
+    int stackIdx[TRAVERSAL_STACK_CAPACITY];
+    bool stackIsLeaf[TRAVERSAL_STACK_CAPACITY];
+    int stackPointer;
+
+    int nodeIdx;
+    bool nodeIsLeaf;
+};
+
+
 class BVH{
 
 public:
@@ -902,6 +923,70 @@ public:
         }
     }
 
+    __device__ void beginTraversal(TraversalState& traversal, const vec3& rayOrigin, const vec3& rayDirection, float rayTime, float maxDistance = 1e30f) const {
+        traversal.rayOrigin = rayOrigin;
+        traversal.rayDirection = rayDirection;
+        traversal.rayTime = rayTime;
+
+        traversal.nearestHit = hitRecord();
+        traversal.nearestHit.closestDistance = maxDistance;
+
+        traversal.stackPointer = 0;
+        traversal.nodeIdx = 0;
+        traversal.nodeIsLeaf = false;
+    }
+
+    // Executes exactly one iteration of the traverseRay loop. Returns true when the traversal is finished.
+    __device__ bool stepTraversal(TraversalState& traversal, const sphere* spheres, const triangle* triangles) const {
+        const BVH_Node& node = traversal.nodeIsLeaf ? d_leafNode[traversal.nodeIdx] : d_internalNodes[traversal.nodeIdx];
+
+        int childLIdx = node.leftChild;
+        bool childLIsLeaf = node.leftIsLeaf;
+        int childRIdx = node.rightChild;
+        bool childRIsLeaf = node.rightIsLeaf;
+
+        AABB childLBounds = childLIsLeaf ? d_leafNode[childLIdx].bounds : d_internalNodes[childLIdx].bounds;
+        AABB childRBounds = childRIsLeaf ? d_leafNode[childRIdx].bounds : d_internalNodes[childRIdx].bounds;
+
+        float nearL = 0.0001f;
+        float farL = traversal.nearestHit.closestDistance;
+        bool overlapL = hit_aabb(childLBounds, traversal.rayOrigin, traversal.rayDirection, nearL, farL);
+
+        float nearR = 0.0001f;
+        float farR = traversal.nearestHit.closestDistance;
+        bool overlapR = hit_aabb(childRBounds, traversal.rayOrigin, traversal.rayDirection, nearR, farR);
+
+        if (overlapL && childLIsLeaf) {
+            int primitiveIdx = d_leafNode[childLIdx].primitiveIndex;
+            int primitiveType = d_primitiveTypes[childLIdx];
+            testPrimitiveHit(primitiveType, primitiveIdx, traversal.rayOrigin, traversal.rayDirection, traversal.rayTime, spheres, triangles, traversal.nearestHit);
+        }
+        if (overlapR && childRIsLeaf) {
+            int primitiveIdx = d_leafNode[childRIdx].primitiveIndex;
+            int primitiveType = d_primitiveTypes[childRIdx];
+            testPrimitiveHit(primitiveType, primitiveIdx, traversal.rayOrigin, traversal.rayDirection, traversal.rayTime, spheres, triangles, traversal.nearestHit);
+        }
+
+        bool traverseL = overlapL && !childLIsLeaf;
+        bool traverseR = overlapR && !childRIsLeaf;
+
+        if (!traverseL && !traverseR) {
+            if (traversal.stackPointer == 0) return true;
+            traversal.stackPointer--;
+            traversal.nodeIdx = traversal.stackIdx[traversal.stackPointer];
+            traversal.nodeIsLeaf = traversal.stackIsLeaf[traversal.stackPointer];
+        } else {
+            if (traverseL && traverseR) {
+                traversal.stackIdx[traversal.stackPointer] = childRIdx;
+                traversal.stackIsLeaf[traversal.stackPointer] = childRIsLeaf;
+                traversal.stackPointer++;
+            }
+            traversal.nodeIdx = traverseL ? childLIdx : childRIdx;
+            traversal.nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
+        }
+        return false;
+    }
+
     __host__ void free(){
         if (d_internalNodes) CUDA_CHECK(cudaFree(d_internalNodes));
         if (d_leafNode) CUDA_CHECK(cudaFree(d_leafNode));
@@ -910,6 +995,7 @@ public:
         d_leafNode = nullptr;
         d_primitiveTypes = nullptr;
     }
+
 
 
 };
@@ -1926,6 +2012,8 @@ struct WavefrontRenderContext {
     int imageHeight;
     dim3 gridDimensions;
     dim3 blockDimensions;
+
+    bool usePersistentThreads = false;
 };
 
 template <typename ElementType>
@@ -2150,6 +2238,82 @@ __global__ void extendKernel(BVH bvh, const sphere* spheres, const triangle* tri
     hitResults.hitPrimitiveIndex[pathIndex] = hit.primitiveIndex;
     hitResults.hitU[pathIndex] = hit.u;
     hitResults.hitV[pathIndex] = hit.v;
+}
+
+// A lane that finishes its ray asks for a new one while the other lanes keep traversing.
+// A warp refills only when at least this many of its lanes are idle (tunable: 1, 8, 16).
+static constexpr int minimumIdleLanesBeforeRefill = 8;
+
+__device__ inline void writeHitResult(HitResultBuffers& hitResults, int pathIndex, const hitRecord& hit){
+    hitResults.didHit[pathIndex] = hit.didHit ? 1 : 0;
+    if (!hit.didHit) return;
+
+    hitResults.hitDistance[pathIndex] = hit.closestDistance;
+    hitResults.hitPointX[pathIndex] = hit.hitPoint.x;
+    hitResults.hitPointY[pathIndex] = hit.hitPoint.y;
+    hitResults.hitPointZ[pathIndex] = hit.hitPoint.z;
+    hitResults.hitNormalX[pathIndex] = hit.hitNormal.x;
+    hitResults.hitNormalY[pathIndex] = hit.hitNormal.y;
+    hitResults.hitNormalZ[pathIndex] = hit.hitNormal.z;
+    hitResults.hitWasFrontFace[pathIndex] = hit.frontFace ? 1 : 0;
+    hitResults.hitPrimitiveType[pathIndex] = hit.primitiveType;
+    hitResults.hitPrimitiveIndex[pathIndex] = hit.primitiveIndex;
+    hitResults.hitU[pathIndex] = hit.u;
+    hitResults.hitV[pathIndex] = hit.v;
+}
+
+__global__ void extendKernelPersistent(BVH bvh, const sphere* spheres, const triangle* triangles, PathStateBuffers pathState, HitResultBuffers hitResults, PathQueue queue, int* workCounter){
+    const unsigned int fullWarpMask = 0xffffffffu;
+    const int laneIndex = threadIdx.x & 31;
+    const int totalPathCount = *queue.itemCount;
+
+    TraversalState traversal;
+    bool laneHasRay = false;
+    int currentPathIndex = -1;
+    bool workQueueExhausted = false;     // identical for all 32 lanes of the warp
+
+    while (true) {
+        // --- refill idle lanes: one atomicAdd per warp, ranks distributed with a prefix popcount ---
+        if (!workQueueExhausted) {
+            unsigned int idleLaneMask = __ballot_sync(fullWarpMask, !laneHasRay);
+            int idleLaneCount = __popc(idleLaneMask);
+
+            if (idleLaneCount >= minimumIdleLanesBeforeRefill) {
+                int firstIdleLane = __ffs(idleLaneMask) - 1;
+                int firstQueueSlot = 0;
+                if (laneIndex == firstIdleLane) firstQueueSlot = atomicAdd(workCounter, idleLaneCount);
+                firstQueueSlot = __shfl_sync(fullWarpMask, firstQueueSlot, firstIdleLane);
+
+                if (!laneHasRay) {
+                    int idleRank = __popc(idleLaneMask & ((1u << laneIndex) - 1u));
+                    int queueSlot = firstQueueSlot + idleRank;
+                    if (queueSlot < totalPathCount) {
+                        int pathIndex = queue.pathIndices[queueSlot];
+                        vec3 rayOrigin(pathState.rayOriginX[pathIndex], pathState.rayOriginY[pathIndex], pathState.rayOriginZ[pathIndex]);
+                        vec3 rayDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
+                        float rayTime = pathState.rayTime[pathIndex];
+
+                        bvh.beginTraversal(traversal, rayOrigin, rayDirection, rayTime);
+                        currentPathIndex = pathIndex;
+                        laneHasRay = true;
+                    }
+                }
+                if (firstQueueSlot + idleLaneCount >= totalPathCount) workQueueExhausted = true;
+            }
+        }
+
+        // --- the warp is done when the queue is empty and no lane holds a ray ---
+        if (workQueueExhausted && __ballot_sync(fullWarpMask, laneHasRay) == 0u) break;
+
+        // --- one traversal step for every lane that has a ray ---
+        if (laneHasRay) {
+            bool traversalFinished = bvh.stepTraversal(traversal, spheres, triangles);
+            if (traversalFinished) {
+                writeHitResult(hitResults, currentPathIndex, traversal.nearestHit);
+                laneHasRay = false;
+            }
+        }
+    }
 }
 
 __global__ void shadeKernel(int depth, vec3 backgroundColor,
@@ -2379,6 +2543,16 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
 
     auto renderStart = std::chrono::steady_clock::now();
 
+    int* persistentWorkCounter = nullptr;
+    int persistentBlockCount = 0;
+    if (context.usePersistentThreads) {
+        CUDA_CHECK(cudaMalloc(&persistentWorkCounter, sizeof(int)));
+        int deviceIndex = 0, multiprocessorCount = 0, residentBlocksPerMultiprocessor = 0;
+        CUDA_CHECK(cudaGetDevice(&deviceIndex));
+        CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessorCount, cudaDevAttrMultiProcessorCount, deviceIndex));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&residentBlocksPerMultiprocessor, extendKernelPersistent, 256, 0));
+        persistentBlockCount = multiprocessorCount * residentBlocksPerMultiprocessor;
+    }
     
     for (int sampleIndex = 0; sampleIndex < context.camera.samples_per_pixel; ++sampleIndex) {
 
@@ -2397,7 +2571,13 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
             int blockSize = 256;
             int blockCount = (activePathCount + blockSize - 1) / blockSize;
 
-            extendKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles,pathState, hitResults, currentQueue);
+            if (context.usePersistentThreads) {
+                CUDA_CHECK(cudaMemset(persistentWorkCounter, 0, sizeof(int)));
+                int persistentLaunchBlockCount = std::min(blockCount, persistentBlockCount);
+                extendKernelPersistent<<<persistentLaunchBlockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, hitResults, currentQueue, persistentWorkCounter);
+            } else {
+                extendKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, hitResults, currentQueue);
+            }
             CUDA_CHECK_KERNEL();
 
             shadeKernel<<<blockCount, blockSize>>>(depth, context.camera.backround_color,context.spheres, context.triangles, context.lights, context.lightCount,context.randomNumberStates, pathState, hitResults, currentQueue, nextQueue, shadowQueue);
@@ -2423,7 +2603,9 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
     }
     
 
-    freeShadowRayQueue(shadowQueue);
+    freeShadowRayQueue(shadowQueue);  
+    CUDA_CHECK(cudaFree(persistentWorkCounter));
+    
     freePathQueue(nextQueue);
     freePathQueue(currentQueue);
     freeHitResultBuffers(hitResults);
@@ -2436,12 +2618,15 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
 // ============================================================================
 int main(int argc,char** argv) {
 
+    bool usePersistentThreads = false;
     bool useWavefrontPathTracing = false;
     SceneChoice sceneChoice = SceneChoice::Cornell;
     int samplesPerPixelOverride = 0;
     for(int argumentIndex = 1; argumentIndex < argc; ++argumentIndex){
         if(std::strcmp(argv[argumentIndex], "--wavefront") == 0){
             useWavefrontPathTracing = true;
+        }else if(std::strcmp(argv[argumentIndex], "--persistent") == 0){
+            usePersistentThreads = true;
         }else if(std::strcmp(argv[argumentIndex], "--scene") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
             if(std::strcmp(argv[argumentIndex], "sponza") == 0) sceneChoice = SceneChoice::Sponza;
@@ -2450,7 +2635,9 @@ int main(int argc,char** argv) {
             samplesPerPixelOverride = std::atoi(argv[argumentIndex]);
         }
     }
-
+    if(usePersistentThreads && !useWavefrontPathTracing){
+        printf("--persistent only applies to the wavefront path tracer, ignoring it (add --wavefront)\n");
+    }
 
     // display device info
     fetchDeviceInfo();
@@ -2591,6 +2778,7 @@ int main(int argc,char** argv) {
         wavefrontContext.imageHeight = numberOfPixels_Y;
         wavefrontContext.gridDimensions = grid;
         wavefrontContext.blockDimensions = block;
+        wavefrontContext.usePersistentThreads = usePersistentThreads;
         renderWithWavefront(wavefrontContext);
     }else{
         for (int s = 0; s < cam.samples_per_pixel; s++) {

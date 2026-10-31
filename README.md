@@ -5,7 +5,7 @@ The renderer is deliberately kept in one file. The intent is for the source to r
 
 The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, combined with BSDF sampling through multiple importance sampling (power heuristic). The renderer supports motion blur through time-sampled rays and moving spheres, and textured surfaces: solid colors, a procedural checker and image textures, with UV mapping on spheres and triangles and hardware-filtered image sampling through `cudaTextureObject_t`. Triangle meshes can be loaded from Wavefront OBJ files (`v`, `vt` and `f`, flat shaded) together with their MTL materials (`Kd` and `map_Kd`), and the renderer ships with two selectable test scenes: a Cornell box and the Sponza atrium. Correctness checks against a CPU reference implementation are planned (see below checklist). Measured single-kernel versus wavefront timings are listed in the Benchmarks section.
 
-Two execution models are implemented side by side and produce the same image: a single-kernel path tracer (the default), where one thread follows a whole path, and a wavefront path tracer (`--wavefront`), which splits every bounce into separate extend, shade and shadow-ray kernels connected by compacted path queues and a structure-of-arrays path state. The wavefront version raises the average number of active threads per warp from about 7 to about 27 on the first bounce, at the cost of extra memory traffic.
+Two execution models are implemented side by side and produce the same image: a single-kernel path tracer (the default), where one thread follows a whole path, and a wavefront path tracer (`--wavefront`), which splits every bounce into separate extend, shade and shadow-ray kernels connected by compacted path queues and a structure-of-arrays path state. The wavefront version raises the average number of active threads per warp from about 7 to about 27 on the first bounce, at the cost of extra memory traffic. With `--persistent` the wavefront extend kernel additionally keeps each ray's traversal state in its lane and hands a finished lane a new ray from a global work counter, so warps stay busy on the incoherent later bounces; the image stays bit-identical.
 
 Building requires the CUDA Toolkit (12.x or later), CMake 3.24 or later, and a CUDA-capable NVIDIA GPU. From the repository root:
 
@@ -14,10 +14,11 @@ cmake --preset release
 cmake --build --preset release
 ./build/release/monocuda                                  # single-kernel path tracer, Cornell box
 ./build/release/monocuda --wavefront                     # wavefront path tracer
+./build/release/monocuda --wavefront --persistent        # wavefront with persistent threads in the extend kernel
 ./build/release/monocuda --scene sponza --spp 1000       # choose the scene and the sample count
 ```
 
-The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model. The Cornell box scene loads an `earth.ppm` image texture (binary PPM, P6) from the current directory. `--scene` selects `cornell` (default) or `sponza`, and `--spp N` overrides the number of samples per pixel. The Sponza model is not part of the repository. Download the OBJ version from the McGuire Computer Graphics Archive (https://casual-effects.com/data/), respect the `copyright.txt` that comes with it, and extract it so that `models/sponza.obj` exists. The loader also reads `models/sponza.mtl` (`newmtl`, `Kd`, `map_Kd`; other keywords are ignored). Image textures have to be binary PPM (P6, 8 bit) next to the original file with the extension replaced by `.ppm`, since the loader has no image decoders. Convert them once with ImageMagick:
+The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model. The Cornell box scene loads an `earth.ppm` image texture (binary PPM, P6) from the current directory. `--scene` selects `cornell` (default) or `sponza`, and `--spp N` overrides the number of samples per pixel, and `--persistent` (only together with `--wavefront`) selects the persistent-threads extend kernel. The Sponza model is not part of the repository. Download the OBJ version from the McGuire Computer Graphics Archive (https://casual-effects.com/data/), respect the `copyright.txt` that comes with it, and extract it so that `models/sponza.obj` exists. The loader also reads `models/sponza.mtl` (`newmtl`, `Kd`, `map_Kd`; other keywords are ignored). Image textures have to be binary PPM (P6, 8 bit) next to the original file with the extension replaced by `.ppm`, since the loader has no image decoders. Convert them once with ImageMagick:
 
 ```
 grep -h "map_Kd" models/sponza.mtl | tr -d '\r' | awk '{print $NF}' | tr '\\' '/' | sort -u | while read f; do magick "models/$f" -depth 8 "ppm:models/${f%.*}.ppm"; done
@@ -48,6 +49,17 @@ Profiling the wavefront `extendKernel` on Sponza with Nsight Compute showed that
 | After (32-byte aligned `AABB`, MTL textures loaded) | 88.01 s | 4.09 | 1.20x |
 
 Nsight Compute's estimated remaining speedup for `extendKernel` dropped from about 63% to 46.6%, and the kernel is now limited more by computation (57% of peak) than by memory throughput (30% of peak). The two runs differ in more than the `AABB` layout: the second one renders the textured Sponza, which adds shading work, so the gain from the layout change alone is probably slightly larger than 1.20x. The single-kernel path tracer has not been re-measured since this change.
+
+## Effect of persistent threads in the extend kernel
+
+With `--wavefront --persistent` the extend kernel launches a fixed grid that exactly fills the GPU (SM count times the resident blocks per SM). A lane that finishes its ray asks for a new one while the other lanes of its warp keep traversing: when at least 8 lanes of a warp are idle, one lane performs a single `atomicAdd` on a global work counter for the whole warp and the new queue slots are distributed to the idle lanes with a prefix popcount. The traversal loop of `traverseRay` was split into `beginTraversal` and `stepTraversal` so that a lane can carry its ray state across iterations. Every ray still performs exactly the same operations in the same order, and the rendered image is byte-identical to the normal wavefront renderer (checked with `cmp`).
+
+| Sponza, wavefront, 1000 spp | Time | Mpaths/s | Speedup |
+|---|---|---|---|
+| Normal extend kernel | 88.11 s | 4.09 | 1.00x |
+| Persistent threads (`--persistent`) | 78.23 s | 4.60 | 1.13x |
+
+Both rows were measured back to back in the same session. Nsight Compute on the extend kernel at bounce depth 3 showed the average number of active threads per warp rising from 6.35 to 15.33, the kernel time dropping from 18.2 ms to 10.2 ms, and registers per thread dropping from 71 to 56. The gain on the whole frame is smaller because the extend kernel is only part of it: an `nsys` run showed the persistent extend kernel at 66% of the GPU time, the shadow-ray kernel at 28% and the shade kernel at 3%. The shadow-ray kernel still uses one thread per ray. The extend kernel is now limited by memory (about 80% of peak memory throughput), mostly local memory traffic from the traversal stack and scattered stores of the hit results.
 
 # Implementation Checklist
 
@@ -121,7 +133,7 @@ Nsight Compute's estimated remaining speedup for `extendKernel` dropped from abo
 - [x] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything") *(implemented with atomic-counter path queues, a separate shadow-ray queue for NEE, and SoA path state; selectable with `--wavefront`)*
 - [ ] **(stretch)** Material-sorted shading — sort active paths by material ID before shading to reduce warp divergence
 - [x] **(stretch)** Any-hit traversal for shadow rays (early exit on the first occluder, no hit record) *(used by the wavefront shadow kernel; the single-kernel path tracer still uses closest-hit traversal with a max distance)*
-- [ ] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces
+- [x] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces *(wavefront extend kernel only, `--wavefront --persistent`: fixed grid, one warp-aggregated `atomicAdd` on a global work counter, refill when at least 8 lanes of a warp are idle; 1.13x on Sponza at 1000 spp, bit-identical image; the shadow-ray kernel does not use it yet)*
 
 ## 9. Image Output & Post-Processing
 - [ ] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp)
