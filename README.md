@@ -3,7 +3,7 @@ MonoCUDA is an original CUDA path tracer written as a single source file. It was
 
 The renderer is deliberately kept in one file. The intent is for the source to read as a continuous explanation of a GPU path tracer's design, from ray generation through BVH traversal, material evaluation, and light transport, rather than as a general-purpose rendering engine split across many files. Kernels are written iteratively rather than recursively, since recursion on GPU forces register spilling and reduces occupancy.
 
-The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, combined with BSDF sampling through multiple importance sampling (power heuristic). The renderer supports motion blur through time-sampled rays and moving spheres, and textured surfaces: solid colors, a procedural checker and image textures, with UV mapping on spheres and triangles and hardware-filtered image sampling through `cudaTextureObject_t`. Triangle meshes can be loaded from Wavefront OBJ files (`v`, `vt` and `f`, flat shaded), and the renderer ships with two selectable test scenes: a Cornell box and the Sponza atrium. Correctness checks against a CPU reference implementation are planned (see below checklist). Measured single-kernel versus wavefront timings are listed in the Benchmarks section.
+The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, combined with BSDF sampling through multiple importance sampling (power heuristic). The renderer supports motion blur through time-sampled rays and moving spheres, and textured surfaces: solid colors, a procedural checker and image textures, with UV mapping on spheres and triangles and hardware-filtered image sampling through `cudaTextureObject_t`. Triangle meshes can be loaded from Wavefront OBJ files (`v`, `vt` and `f`, flat shaded) together with their MTL materials (`Kd` and `map_Kd`), and the renderer ships with two selectable test scenes: a Cornell box and the Sponza atrium. Correctness checks against a CPU reference implementation are planned (see below checklist). Measured single-kernel versus wavefront timings are listed in the Benchmarks section.
 
 Two execution models are implemented side by side and produce the same image: a single-kernel path tracer (the default), where one thread follows a whole path, and a wavefront path tracer (`--wavefront`), which splits every bounce into separate extend, shade and shadow-ray kernels connected by compacted path queues and a structure-of-arrays path state. The wavefront version raises the average number of active threads per warp from about 7 to about 27 on the first bounce, at the cost of extra memory traffic.
 
@@ -17,7 +17,13 @@ cmake --build --preset release
 ./build/release/monocuda --scene sponza --spp 1000       # choose the scene and the sample count
 ```
 
-The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model. The Cornell box scene loads an `earth.ppm` image texture (binary PPM, P6) from the current directory. `--scene` selects `cornell` (default) or `sponza`, and `--spp N` overrides the number of samples per pixel. The Sponza model is not part of the repository. Download the OBJ version from the McGuire Computer Graphics Archive (https://casual-effects.com/data/), respect the `copyright.txt` that comes with it, and extract it so that `models/sponza.obj` exists. Sponza currently renders with a single placeholder material; `.mtl` files and their textures are not read yet.
+The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model. The Cornell box scene loads an `earth.ppm` image texture (binary PPM, P6) from the current directory. `--scene` selects `cornell` (default) or `sponza`, and `--spp N` overrides the number of samples per pixel. The Sponza model is not part of the repository. Download the OBJ version from the McGuire Computer Graphics Archive (https://casual-effects.com/data/), respect the `copyright.txt` that comes with it, and extract it so that `models/sponza.obj` exists. The loader also reads `models/sponza.mtl` (`newmtl`, `Kd`, `map_Kd`; other keywords are ignored). Image textures have to be binary PPM (P6, 8 bit) next to the original file with the extension replaced by `.ppm`, since the loader has no image decoders. Convert them once with ImageMagick:
+
+```
+grep -h "map_Kd" models/sponza.mtl | tr -d '\r' | awk '{print $NF}' | tr '\\' '/' | sort -u | while read f; do magick "models/$f" -depth 8 "ppm:models/${f%.*}.ppm"; done
+```
+
+The console reports `N materials, M textures loaded, K materials with a missing texture` when the model is loaded. A material whose texture is missing falls back to its `Kd` color. Alpha-masked parts of Sponza (leaves, chains, plants) are not supported yet and render as solid quads. The output has no gamma or tone mapping step yet, so colors look darker and flatter than in other renderers.
 
 The project's implementation status is tracked in CHECKLIST.md. It is licensed under the MIT License.
 
@@ -30,7 +36,18 @@ Single-kernel versus wavefront path tracing, measured with the release build on 
 | Cornell box | 24 triangles + spheres | 13.99 s | 13.81 s | 1.01x |
 | Sponza atrium | 262,268 triangles | 191.44 s | 105.36 s | 1.82x |
 
-On the small Cornell scene both execution models take about the same time. A plausible reason, not yet verified with a profiler, is that the extra memory traffic of the wavefront path state cancels what it gains on such a small scene. On Sponza the wavefront version is clearly faster, most likely because rays traverse a large hierarchy incoherently, threads of a warp diverge more inside the single kernel, and compacting the active paths between bounces reduces that. These are single measurements and the Sponza scene uses one placeholder material, so treat the numbers as a first data point rather than a full benchmark.
+On the small Cornell scene both execution models take about the same time. A plausible reason, not yet verified with a profiler, is that the extra memory traffic of the wavefront path state cancels what it gains on such a small scene. On Sponza the wavefront version is clearly faster, most likely because rays traverse a large hierarchy incoherently, threads of a warp diverge more inside the single kernel, and compacting the active paths between bounces reduces that. These are single measurements and the Sponza scene used one placeholder material at that time, so treat the numbers as a first data point rather than a full benchmark.
+
+## Effect of a 16-byte aligned AABB
+
+Profiling the wavefront `extendKernel` on Sponza with Nsight Compute showed that about 76% of its global load requests came from reading the child bounding boxes during traversal. `AABB` was 36 bytes and unaligned (it carried an unused `centroid`), so the compiler emitted 12 separate 4-byte loads per box. Removing the unused field and padding the box to 32 bytes with 16-byte alignment (`alignas(16)`) lets it be read with vector loads (4 load instructions per box instead of 12 in the source view); `BVH_Node` grows to exactly 64 bytes as a side effect.
+
+| Sponza, wavefront, 1000 spp | Time | Mpaths/s | Speedup |
+|---|---|---|---|
+| Before (36-byte `AABB`, placeholder material) | 105.36 s | 3.42 | 1.00x |
+| After (32-byte aligned `AABB`, MTL textures loaded) | 88.01 s | 4.09 | 1.20x |
+
+Nsight Compute's estimated remaining speedup for `extendKernel` dropped from about 63% to 46.6%, and the kernel is now limited more by computation (57% of peak) than by memory throughput (30% of peak). The two runs differ in more than the `AABB` layout: the second one renders the textured Sponza, which adds shading work, so the gain from the layout change alone is probably slightly larger than 1.20x. The single-kernel path tracer has not been re-measured since this change.
 
 # Implementation Checklist
 
@@ -45,13 +62,13 @@ On the small Cornell scene both execution models take about the same time. A pla
 
 ## 2. Scene Representation & Acceleration Structures
 - [x] Primitive types: sphere, and at least one more (triangle)
-- [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access *(path state and hit results are already SoA in the wavefront renderer; scene geometry is still array-of-structs)*
+- [ ] Structure-of-arrays scene layout (not array-of-structs) for coalesced access *(path state and hit results are already SoA in the wavefront renderer; scene geometry is still array-of-structs. For BVH nodes a compact, aligned array-of-structs is the better layout, since a traversal step reads whole nodes; the open item is a hot/cold split of the triangle data)*
 - [x] BVH construction (LBVH build via Morton codes + Karras parallel radix-tree algorithm; Morton codes and sort on the CPU, tree construction and bounds refit on the GPU; primitives with identical Morton codes are separated by their index, and `findSplit` uses the same `delta` function as `determineRange` so that such runs build a consistent tree)
 - [x] BVH traversal (device-side, iterative, stack-based — no recursion)
 - [x] Bounding-box (AABB) intersection + slab test
 - [ ] **(stretch)** SAH (surface area heuristic) BVH build for better traversal quality
 - [x] **(stretch)** Basic OBJ mesh loading so you can render more than primitives *(dependency-free parser for `v`, `vt` and `f` with negative indices and polygon fan triangulation; the model is centered, scaled, rotated around Y and translated into the scene; flat shading only)*
-- [ ] **(stretch)** MTL parsing so loaded models keep their original per-material colors and textures (`Kd`, `map_Kd`)
+- [x] **(stretch)** MTL parsing so loaded models keep their original per-material colors and textures (`Kd`, `map_Kd`) *(`newmtl`, `Kd` and `map_Kd` only; textures are binary PPM converted offline, cached by path; alpha masks, `Ks`, bump maps and texture options are ignored)*
 - [ ] **(stretch)** Smooth shading from OBJ vertex normals (`vn`) or averaged vertex normals
 
 ## 3. Materials / BSDFs
@@ -99,7 +116,7 @@ On the small Cornell scene both execution models take about the same time. A pla
 ## 8. GPU Architecture-Specific Design
 - [x] Iterative (not recursive) kernels throughout — verified with the register/stack usage report (`cuobjdump --dump-resource-usage`, equivalent to `nvcc --ptxas-options=-v`)
 - [x] Persistent per-pixel RNG state, not reinitialized per sample
-- [ ] Memory access audit: confirm scene/material reads go through `__ldg`/`const __restrict__`
+- [ ] Memory access audit: confirm scene/material reads go through `__ldg`/`const __restrict__` *(profiling showed plain `LDG.E` loads in `extendKernel`; the 16-byte aligned `AABB` is done, `const __restrict__` kernel parameters and the child bounds stored inside the parent node are still open)*
 - [x] Occupancy measurement (Nsight Compute or `nvidia-smi`) at a baseline milestone
 - [x] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything") *(implemented with atomic-counter path queues, a separate shadow-ray queue for NEE, and SoA path state; selectable with `--wavefront`)*
 - [ ] **(stretch)** Material-sorted shading — sort active paths by material ID before shading to reduce warp divergence
@@ -117,7 +134,7 @@ On the small Cornell scene both execution models take about the same time. A pla
 - [x] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo *(single-kernel versus wavefront on Cornell and Sponza, see Benchmarks)*
 - [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene cornell|sponza`, plus `--spp N` for the sample count)*
 - [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor, a checker floor and a textured Earth sphere)
-- [x] Sponza atrium test scene (262k triangles loaded from the McGuire OBJ, one placeholder material, a skylight quad above the open roof as the only light)
+- [x] Sponza atrium test scene (262k triangles loaded from the McGuire OBJ with its MTL materials and 24 textures, a skylight quad above the open roof as the only light)
 
 ## References
 
