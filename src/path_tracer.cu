@@ -388,17 +388,21 @@ __host__ __device__ Material make_emissive(vec3 emittedColor) {
 // === AABB ===
 // ============================================================================
 
-class AABB{
+class alignas(16) AABB{
 public:
     vec3 minInterval;
+    float paddingToMakeMinIntervalSixteenBytes; 
+
     vec3 maxInterval;
-    vec3 centroid;
+    float paddingToMakeMaxIntervalSixteenBytes;
+
 
     __host__ __device__ AABB(){}
     __host__ __device__ AABB(const vec3& minInterval_,const vec3& maxInterval_) : minInterval(minInterval_) , maxInterval(maxInterval_){}
-
-
 };
+static_assert(sizeof(AABB) == 32,  "AABB must be exactly 32 bytes so one box is two 16-byte vector loads");
+static_assert(alignof(AABB) == 16, "AABB must be 16-byte aligned for LDG.128");
+// ============================================================================
 
 // ============================================================================
 // === MESH & PRIMITIVE TYPES ===
