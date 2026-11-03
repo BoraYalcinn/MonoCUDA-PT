@@ -643,6 +643,20 @@ struct hitRecord{
     float v = 0.f;
 };
 
+// for deferred shading
+struct ClosestHitCandidate{
+    float closestDistance;
+    int primitiveType;
+    int primitiveIndex;
+};
+
+struct alignas(16) PackedHit{
+    float hitDistance;
+    int primitiveType;
+    int primitiveIndex;
+    int didHit;
+};
+
 // ============================================================================
 
 
@@ -678,6 +692,7 @@ __host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& righ
 __host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance);
 __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
 __device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, float maximumDistance);
+__device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, ClosestHitCandidate& nearestHit);
 // ===============================================================================
 // One ray's traversal progress. Lives in a lane for as long as the ray is being traversed,
 // so a lane can be handed a new ray the moment its old one is finished. 
@@ -689,7 +704,7 @@ struct TraversalState{
     vec3 rayDirection;
     float rayTime;
 
-    hitRecord nearestHit;
+    ClosestHitCandidate nearestHit;
 
     int stackIdx[TRAVERSAL_STACK_CAPACITY];
     bool stackIsLeaf[TRAVERSAL_STACK_CAPACITY];
@@ -928,8 +943,9 @@ public:
         traversal.rayDirection = rayDirection;
         traversal.rayTime = rayTime;
 
-        traversal.nearestHit = hitRecord();
         traversal.nearestHit.closestDistance = maxDistance;
+        traversal.nearestHit.primitiveIndex = -1;
+        traversal.nearestHit.primitiveType = -1;
 
         traversal.stackPointer = 0;
         traversal.nodeIdx = 0;
@@ -959,12 +975,12 @@ public:
         if (overlapL && childLIsLeaf) {
             int primitiveIdx = d_leafNode[childLIdx].primitiveIndex;
             int primitiveType = d_primitiveTypes[childLIdx];
-            testPrimitiveHit(primitiveType, primitiveIdx, traversal.rayOrigin, traversal.rayDirection, traversal.rayTime, spheres, triangles, traversal.nearestHit);
+            testPrimitiveClosest(primitiveType, primitiveIdx, traversal.rayOrigin, traversal.rayDirection, traversal.rayTime, spheres, triangles, traversal.nearestHit);
         }
         if (overlapR && childRIsLeaf) {
             int primitiveIdx = d_leafNode[childRIdx].primitiveIndex;
             int primitiveType = d_primitiveTypes[childRIdx];
-            testPrimitiveHit(primitiveType, primitiveIdx, traversal.rayOrigin, traversal.rayDirection, traversal.rayTime, spheres, triangles, traversal.nearestHit);
+            testPrimitiveClosest(primitiveType, primitiveIdx, traversal.rayOrigin, traversal.rayDirection, traversal.rayTime, spheres, triangles, traversal.nearestHit);
         }
 
         bool traverseL = overlapL && !childLIsLeaf;
@@ -1197,6 +1213,22 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
                 nearestHit.v = triangleUv.y;
             }
         }
+    }
+}
+
+__device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, ClosestHitCandidate& nearestHit){
+    float intersectionDistance;
+    if (primitiveType == 0) {
+        bool frontFace;
+        vec3 outwardNormal;
+        if (!hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, time, intersectionDistance, frontFace, outwardNormal)) return;
+    } else {
+        if (!hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) return;
+    }
+    if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
+        nearestHit.closestDistance = intersectionDistance;
+        nearestHit.primitiveType = primitiveType;
+        nearestHit.primitiveIndex = primitiveIdx;
     }
 }
 
@@ -1951,22 +1983,7 @@ struct PathStateBuffers {
 };
 
 struct HitResultBuffers {
-    unsigned char* didHit = nullptr;
-    float* hitDistance = nullptr;
-    
-    float* hitPointX = nullptr;
-    float* hitPointY = nullptr;   
-    float* hitPointZ = nullptr;
-    
-    float* hitNormalX = nullptr; 
-    float* hitNormalY = nullptr;  
-    float* hitNormalZ = nullptr;
-    
-    unsigned char* hitWasFrontFace = nullptr;
-    int* hitPrimitiveType = nullptr;     // 0 = sphere, 1 = triangle 
-    int* hitPrimitiveIndex = nullptr;
-    float* hitU = nullptr;
-    float* hitV = nullptr;
+    PackedHit* packedHits = nullptr;
 };
 
 struct PathQueue {
@@ -2095,46 +2112,11 @@ static void freePathStateBuffers(PathStateBuffers& buffers) {
 // Hit results
 // ----------------------------------------------------------------------------
 static void allocateHitResultBuffers(HitResultBuffers& buffers, int pathCapacity) {
-    allocateDeviceArray(buffers.didHit, pathCapacity);
-    allocateDeviceArray(buffers.hitDistance, pathCapacity);
-
-    allocateDeviceArray(buffers.hitPointX, pathCapacity);
-    allocateDeviceArray(buffers.hitPointY, pathCapacity);
-    allocateDeviceArray(buffers.hitPointZ, pathCapacity);
-
-    allocateDeviceArray(buffers.hitNormalX, pathCapacity);
-    allocateDeviceArray(buffers.hitNormalY, pathCapacity);
-    allocateDeviceArray(buffers.hitNormalZ, pathCapacity);
-
-    allocateDeviceArray(buffers.hitWasFrontFace, pathCapacity);
-    allocateDeviceArray(buffers.hitPrimitiveType, pathCapacity);
-    allocateDeviceArray(buffers.hitPrimitiveIndex, pathCapacity);
-
-    // for textures uv
-    allocateDeviceArray(buffers.hitU, pathCapacity);
-    allocateDeviceArray(buffers.hitV, pathCapacity);
-
+    allocateDeviceArray(buffers.packedHits,pathCapacity);
 }
 
 static void freeHitResultBuffers(HitResultBuffers& buffers) {
-    freeDeviceArray(buffers.didHit);
-    freeDeviceArray(buffers.hitDistance);
-
-    freeDeviceArray(buffers.hitPointX);
-    freeDeviceArray(buffers.hitPointY);
-    freeDeviceArray(buffers.hitPointZ);
-
-    freeDeviceArray(buffers.hitNormalX);
-    freeDeviceArray(buffers.hitNormalY);
-    freeDeviceArray(buffers.hitNormalZ);
-
-    freeDeviceArray(buffers.hitWasFrontFace);
-    freeDeviceArray(buffers.hitPrimitiveType);
-    freeDeviceArray(buffers.hitPrimitiveIndex);
-
-    // for textures uv
-    freeDeviceArray(buffers.hitU);
-    freeDeviceArray(buffers.hitV);
+    freeDeviceArray(buffers.packedHits);
 }
 
 // ----------------------------------------------------------------------------
@@ -2223,43 +2205,34 @@ __global__ void extendKernel(BVH bvh, const sphere* spheres, const triangle* tri
 
     hitRecord hit = bvh.traverseRay(rayOrigin, rayDirection, rayTime, spheres, triangles);
 
-    hitResults.didHit[pathIndex] = hit.didHit ? 1 : 0;
-    if (!hit.didHit) return;
-
-    hitResults.hitDistance[pathIndex] = hit.closestDistance;
-    hitResults.hitPointX[pathIndex] = hit.hitPoint.x;
-    hitResults.hitPointY[pathIndex] = hit.hitPoint.y;
-    hitResults.hitPointZ[pathIndex] = hit.hitPoint.z;
-    hitResults.hitNormalX[pathIndex] = hit.hitNormal.x;
-    hitResults.hitNormalY[pathIndex] = hit.hitNormal.y;
-    hitResults.hitNormalZ[pathIndex] = hit.hitNormal.z;
-    hitResults.hitWasFrontFace[pathIndex] = hit.frontFace ? 1 : 0;
-    hitResults.hitPrimitiveType[pathIndex] = hit.primitiveType;
-    hitResults.hitPrimitiveIndex[pathIndex] = hit.primitiveIndex;
-    hitResults.hitU[pathIndex] = hit.u;
-    hitResults.hitV[pathIndex] = hit.v;
+    PackedHit packedHit;
+    packedHit.hitDistance = hit.closestDistance;
+    packedHit.primitiveType = hit.primitiveType;
+    packedHit.primitiveIndex = hit.primitiveIndex;
+    if(hit.didHit){
+        packedHit.didHit = 1;
+    }else{
+        packedHit.didHit = 0;
+    }
+    hitResults.packedHits[pathIndex] = packedHit;
 }
 
 // A lane that finishes its ray asks for a new one while the other lanes keep traversing.
 // A warp refills only when at least this many of its lanes are idle (tunable: 1, 8, 16).
 static constexpr int minimumIdleLanesBeforeRefill = 8;
 
-__device__ inline void writeHitResult(HitResultBuffers& hitResults, int pathIndex, const hitRecord& hit){
-    hitResults.didHit[pathIndex] = hit.didHit ? 1 : 0;
-    if (!hit.didHit) return;
-
-    hitResults.hitDistance[pathIndex] = hit.closestDistance;
-    hitResults.hitPointX[pathIndex] = hit.hitPoint.x;
-    hitResults.hitPointY[pathIndex] = hit.hitPoint.y;
-    hitResults.hitPointZ[pathIndex] = hit.hitPoint.z;
-    hitResults.hitNormalX[pathIndex] = hit.hitNormal.x;
-    hitResults.hitNormalY[pathIndex] = hit.hitNormal.y;
-    hitResults.hitNormalZ[pathIndex] = hit.hitNormal.z;
-    hitResults.hitWasFrontFace[pathIndex] = hit.frontFace ? 1 : 0;
-    hitResults.hitPrimitiveType[pathIndex] = hit.primitiveType;
-    hitResults.hitPrimitiveIndex[pathIndex] = hit.primitiveIndex;
-    hitResults.hitU[pathIndex] = hit.u;
-    hitResults.hitV[pathIndex] = hit.v;
+__device__ inline void writeHitResult(HitResultBuffers& hitResults, int pathIndex, const ClosestHitCandidate& hit){
+    PackedHit packedHit;
+    packedHit.hitDistance = hit.closestDistance;
+    packedHit.primitiveType = hit.primitiveType;
+    packedHit.primitiveIndex = hit.primitiveIndex;
+    
+    if(hit.primitiveIndex >= 0){
+        packedHit.didHit = 1;
+    }else{
+        packedHit.didHit = 0;
+    }
+    hitResults.packedHits[pathIndex] = packedHit;
 }
 
 __global__ void extendKernelPersistent(BVH bvh, const sphere* spheres, const triangle* triangles, PathStateBuffers pathState, HitResultBuffers hitResults, PathQueue queue, int* workCounter){
@@ -2331,8 +2304,9 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     vec3 throughput(pathState.throughputRed[pathIndex], pathState.throughputGreen[pathIndex], pathState.throughputBlue[pathIndex]);
     vec3 currentSample(pathState.currentSampleRed[pathIndex], pathState.currentSampleGreen[pathIndex], pathState.currentSampleBlue[pathIndex]);
 
+    PackedHit packedHit = hitResults.packedHits[pathIndex];
     // missed
-    if (!hitResults.didHit[pathIndex]) {
+    if (!packedHit.didHit) {
         currentSample = currentSample + throughput * backgroundColor;
         pathState.currentSampleRed[pathIndex] = currentSample.x;
         pathState.currentSampleGreen[pathIndex] = currentSample.y;
@@ -2341,13 +2315,38 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     }
 
     // material
-    int primitiveIndex = hitResults.hitPrimitiveIndex[pathIndex];
-    int primitiveType = hitResults.hitPrimitiveType[pathIndex];
+    int primitiveIndex = packedHit.primitiveIndex;
+    int primitiveType = packedHit.primitiveType;
     Material material = (primitiveType == 0) ? spheres[primitiveIndex].mat : triangles[primitiveIndex].mat;
 
-    vec3 hitPoint(hitResults.hitPointX[pathIndex], hitResults.hitPointY[pathIndex], hitResults.hitPointZ[pathIndex]);
-    vec3 hitNormal(hitResults.hitNormalX[pathIndex], hitResults.hitNormalY[pathIndex], hitResults.hitNormalZ[pathIndex]);
     vec3 incomingRayDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
+    
+    // The extend kernel no longer stores these: recompute them with the same formulas as testPrimitiveHit.
+    vec3 rayOriginAtHit(pathState.rayOriginX[pathIndex], pathState.rayOriginY[pathIndex], pathState.rayOriginZ[pathIndex]);
+    float rayTimeAtHit = pathState.rayTime[pathIndex];
+    vec3 hitPoint = rayOriginAtHit + incomingRayDirection * packedHit.hitDistance;
+    vec3 hitNormal;
+    bool frontFace;
+    float hitU, hitV;
+    if (primitiveType == 0) {
+        vec3 sphereCenter = spheres[primitiveIndex].center_at(rayTimeAtHit);
+        vec3 outwardNormal = (hitPoint - sphereCenter).normalize();
+        frontFace = incomingRayDirection.dot(outwardNormal) < 0.0f;
+        hitNormal = frontFace ? outwardNormal : -outwardNormal;
+        vec2 sphereUv = computeSphereUvFromOutwardNormal(outwardNormal);
+        hitU = sphereUv.x;
+        hitV = sphereUv.y;
+    } else {
+        const triangle& hitTriangle = triangles[primitiveIndex];
+        vec3 edge1 = hitTriangle.v1 - hitTriangle.v0;
+        vec3 edge2 = hitTriangle.v2 - hitTriangle.v0;
+        vec3 triangleNormal = edge1.cross(edge2).normalize();
+        frontFace = incomingRayDirection.dot(triangleNormal) < 0.0f;
+        hitNormal = frontFace ? triangleNormal : -triangleNormal;
+        vec2 triangleUv = computeTriangleUvFromHitPoint(hitTriangle, hitPoint);
+        hitU = triangleUv.x;
+        hitV = triangleUv.y;
+    }
 
     // emission (MIS weighted when it comes from BSDF sampling)
     if (material.type == MaterialType::Emissive) {
@@ -2357,7 +2356,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         if (emissionComesFromBsdfSampling && primitiveType == 1) {
             float cosineAtLight = fmaxf(fabsf(incomingRayDirection.dot(hitNormal)), 1e-4f);
             float lightArea = triangleSurfaceArea(triangles[primitiveIndex]);
-            float lightPdf = lightSolidAnglePdf(1.0f / float(lightCount), hitResults.hitDistance[pathIndex], cosineAtLight, lightArea);
+            float lightPdf = lightSolidAnglePdf(1.0f / float(lightCount), packedHit.hitDistance, cosineAtLight, lightArea);
             emissionWeight = powerHeuristic(pathState.previousBsdfPdf[pathIndex], lightPdf);
         }
         currentSample = currentSample + throughput * material.emittedColor * emissionWeight;
@@ -2368,8 +2367,6 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     }
 
     // throughput (with albedo)
-    float hitU = hitResults.hitU[pathIndex];
-    float hitV = hitResults.hitV[pathIndex];
     throughput = throughput * sampleTexture(material.albedoTexture, hitU, hitV);
 
     curandState randomNumberState = randomNumberStates[pathIndex];
@@ -2423,7 +2420,6 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
 
     if (pathSurvives) {
         vec3 rayDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
-        bool frontFace = hitResults.hitWasFrontFace[pathIndex] != 0;
 
         // same old scatter switch case
         vec3 newDirection;
@@ -2493,21 +2489,6 @@ __global__ void debugShowRayDirectionKernel(vec3* frameBuffer, int imageWidth, i
     frameBuffer[pathIndex] = vec3(pathState.rayDirectionX[pathIndex] * 1.5f + 0.5f,pathState.rayDirectionY[pathIndex] * 1.5f + 0.5f,pathState.rayDirectionZ[pathIndex] * -1.0f);
 }
 
-__global__ void debugShowHitNormalKernel(vec3* frameBuffer, int imageWidth, int imageHeight, HitResultBuffers hitResults)
-{
-    int pixelX = threadIdx.x + blockIdx.x * blockDim.x;
-    int pixelY = threadIdx.y + blockIdx.y * blockDim.y;
-    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
-    int pathIndex = imageWidth * pixelY + pixelX;
-
-    if (!hitResults.didHit[pathIndex]){ 
-        frameBuffer[pathIndex] = vec3(0, 0, 0); 
-        return; 
-    }
-    frameBuffer[pathIndex] = vec3(hitResults.hitNormalX[pathIndex] * 0.5f + 0.5f,
-                                  hitResults.hitNormalY[pathIndex] * 0.5f + 0.5f,
-                                  hitResults.hitNormalZ[pathIndex] * 0.5f + 0.5f);
-}
 
 __global__ void finalizeSampleKernel(vec3* accumBuffer, int imageWidth, int imageHeight, PathStateBuffers pathState)
 {
