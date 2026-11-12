@@ -20,3 +20,6 @@ compile_commands.json
 *.cubin
 *.fatbin
 models/
+/cornell_*.png
+/*.ppm
+!/earth.ppm
