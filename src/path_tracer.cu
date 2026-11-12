@@ -508,6 +508,11 @@ __device__ float lambertianCosinePdf(float cosineAtSurface) {
     return cosineAtSurface / MONOCUDA_PI;
 }
 
+// isotropic scattering spreads uniformly over the sphere, value and pdf are the same constant
+__device__ float isotropicPhasePdf() {
+    return 0.25f / MONOCUDA_PI;
+}
+
 __device__ float triangleSurfaceArea(const triangle& tri) {
     return 0.5f * (tri.v1 - tri.v0).cross(tri.v2 - tri.v0).length();
 }
@@ -1409,6 +1414,7 @@ __host__ void buildCornellScene(hostScene& scene) {
     Material red = make_lambertian(vec3(0.65f, 0.05f, 0.05f));
     Material green  = make_lambertian(vec3(0.12f, 0.45f, 0.15f));
     Material mirror = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.02f);
+    Material smoke  = make_isotropic(vec3(0.8f, 0.8f, 0.85f));
     Material light  = make_emissive(vec3(15.0f, 15.0f, 15.0f));
 
     const float L = -2.f, R = 2.f, B = 0.f, T = 4.f, F = -4.f, N = 0.f;
@@ -1424,6 +1430,8 @@ __host__ void buildCornellScene(hostScene& scene) {
     add_box(scene, boxCenter, vec3(0.55f, 1.1f, 0.55f), 0.3f, white);
     vec3 bigCenter(0.85f, 0.7f, -1.7f);
     scene.spheres.push_back(sphere(bigCenter, 0.7f, mirror));
+    vec3 smokeCenter(0.f, 2.9f, -3.0f);
+    scene.spheres.push_back(sphere(smokeCenter, 0.6f, smoke));
     // earth
     vec3 earthCenter(1.3f, 2.8f, -3.0f);
     float earthRadius = 0.5f;
@@ -1884,7 +1892,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         attenuation = attenuation * sampleTexture(hit.mat.albedoTexture, hit.u, hit.v);
 
         // ---- NEXT EVENT ESTIMATION (direct light) ----
-        if (hit.mat.type == MaterialType::Lambertian && lightCount > 0) {
+        if ((hit.mat.type == MaterialType::Lambertian || hit.mat.type == MaterialType::Isotropic) && lightCount > 0) {
             int selectedLightIndex = min((int)(curand_uniform(&rngState) * lightCount), lightCount - 1);
             const Light& selectedLight = lights[selectedLightIndex];
             float lightSelectionProbability = 1.0f / float(lightCount);
@@ -1894,7 +1902,9 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             float distanceToLight = vectorToLight.length();
             vec3 directionToLight = vectorToLight / distanceToLight;
 
-            float cosineAtSurface = hit.hitNormal.dot(directionToLight);
+            // isotropic scattering has no surface cosine and accepts light from any side
+            bool scatteredIsotropically = (hit.mat.type == MaterialType::Isotropic);
+            float cosineAtSurface = scatteredIsotropically ? 1.0f : hit.hitNormal.dot(directionToLight);
             float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
 
             if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
@@ -1903,8 +1913,10 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 if (!shadowHit.didHit) {
                     float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
                     vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
-                    float neeWeight = powerHeuristic(solidAnglePdf, lambertianCosinePdf(cosineAtSurface));
-                    sampleColor = sampleColor + attenuation * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf)) * neeWeight;
+                    float scatterPdf = scatteredIsotropically ? isotropicPhasePdf() : lambertianCosinePdf(cosineAtSurface);
+                    float scatterValue = scatteredIsotropically ? isotropicPhasePdf() : cosineAtSurface / MONOCUDA_PI;
+                    float neeWeight = powerHeuristic(solidAnglePdf, scatterPdf);
+                    sampleColor = sampleColor + attenuation * lightColor * (scatterValue / solidAnglePdf) * neeWeight;
                 }
             }
         }
@@ -1945,8 +1957,9 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 newDirection = lambertian_scatter_direction(hit.hitNormal, &rngState);
                 break;
         }
-        previousBounceWasSpecular = (hit.mat.type != MaterialType::Lambertian);
-        previousBsdfPdf = lambertianCosinePdf(fmaxf(newDirection.dot(hit.hitNormal), 0.0f));
+        previousBounceWasSpecular = (hit.mat.type != MaterialType::Lambertian && hit.mat.type != MaterialType::Isotropic);
+        previousBsdfPdf = (hit.mat.type == MaterialType::Isotropic) ? isotropicPhasePdf()
+                                                                   : lambertianCosinePdf(fmaxf(newDirection.dot(hit.hitNormal), 0.0f));
         r = Ray(hit.hitPoint, newDirection, r.time);
     }
     // to reduce firefly points
@@ -2387,7 +2400,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     curandState randomNumberState = randomNumberStates[pathIndex];
 
     // NEE again same as before !
-    if (material.type == MaterialType::Lambertian && lightCount > 0) {
+    if ((material.type == MaterialType::Lambertian || material.type == MaterialType::Isotropic) && lightCount > 0) {
         int selectedLightIndex = min((int)(curand_uniform(&randomNumberState) * lightCount), lightCount - 1);
         const Light& selectedLight = lights[selectedLightIndex];
         float lightSelectionProbability = 1.0f / float(lightCount);
@@ -2397,14 +2410,18 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         float distanceToLight = vectorToLight.length();
         vec3 directionToLight = vectorToLight / distanceToLight;
 
-        float cosineAtSurface = hitNormal.dot(directionToLight);
+        // isotropic scattering has no surface cosine and accepts light from any side
+        bool scatteredIsotropically = (material.type == MaterialType::Isotropic);
+        float cosineAtSurface = scatteredIsotropically ? 1.0f : hitNormal.dot(directionToLight);
         float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
 
         if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
             float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
             vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
-            float neeWeight = powerHeuristic(solidAnglePdf, lambertianCosinePdf(cosineAtSurface));
-            vec3 contribution = throughput * lightColor * (cosineAtSurface / (MONOCUDA_PI * solidAnglePdf)) * neeWeight;
+            float scatterPdf = scatteredIsotropically ? isotropicPhasePdf() : lambertianCosinePdf(cosineAtSurface);
+            float scatterValue = scatteredIsotropically ? isotropicPhasePdf() : cosineAtSurface / MONOCUDA_PI;
+            float neeWeight = powerHeuristic(solidAnglePdf, scatterPdf);
+            vec3 contribution = throughput * lightColor * (scatterValue / solidAnglePdf) * neeWeight;
 
             int shadowSlot = atomicAdd(shadowQueue.itemCount, 1);
             shadowQueue.originX[shadowSlot] = hitPoint.x;
@@ -2468,8 +2485,9 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         pathState.throughputRed[pathIndex] = throughput.x;
         pathState.throughputGreen[pathIndex] = throughput.y;
         pathState.throughputBlue[pathIndex] = throughput.z;
-        pathState.previousBounceWasSpecular[pathIndex] = (material.type != MaterialType::Lambertian) ? 1 : 0;
-            pathState.previousBsdfPdf[pathIndex] = lambertianCosinePdf(fmaxf(newDirection.dot(hitNormal), 0.0f));
+        pathState.previousBounceWasSpecular[pathIndex] = (material.type != MaterialType::Lambertian && material.type != MaterialType::Isotropic) ? 1 : 0;
+        pathState.previousBsdfPdf[pathIndex] = (material.type == MaterialType::Isotropic) ? isotropicPhasePdf()
+                                                                                          : lambertianCosinePdf(fmaxf(newDirection.dot(hitNormal), 0.0f));
 
         int nextQueueSlot = atomicAdd(nextQueue.itemCount, 1);
         nextQueue.pathIndices[nextQueueSlot] = pathIndex;
