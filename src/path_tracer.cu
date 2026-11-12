@@ -13,6 +13,7 @@
 #include <string>
 #include <cctype>
 #include <map>
+#include <set>
 #include <cstdlib>
 #include <iostream>
 #include <chrono>
@@ -443,6 +444,7 @@ __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
 struct triangle {
     vec3 v0, v1, v2;
     vec2 uv0, uv1, uv2;
+    vec3 n0, n1, n2;
     Material mat;
     AABB aabb;
 
@@ -471,6 +473,22 @@ __device__ vec2 computeTriangleUvFromHitPoint(const triangle& hitTriangle, const
     float weightOfVertex2 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
 
     return hitTriangle.uv0 * weightOfVertex0 + hitTriangle.uv1 * weightOfVertex1+ hitTriangle.uv2 * weightOfVertex2;
+}
+
+__device__ vec3 computeTriangleShadingNormal(const triangle& hitTriangle, const vec3& hitPoint, const vec3& faceNormal){
+    if (hitTriangle.n0.length_squared() == 0.0f) return faceNormal;
+
+    float wholeTriangleAreaTimesTwo = (hitTriangle.v1 - hitTriangle.v0).cross(hitTriangle.v2 - hitTriangle.v0).length();
+
+    float weightOfVertex0 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex1 = (hitTriangle.v0 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex2 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+
+    vec3 shadingNormal = hitTriangle.n0 * weightOfVertex0 + hitTriangle.n1 * weightOfVertex1 + hitTriangle.n2 * weightOfVertex2;
+    if (shadingNormal.length_squared() < 1e-12f) return faceNormal;
+    shadingNormal = shadingNormal.normalize();
+    if (shadingNormal.dot(faceNormal) < 0.0f) shadingNormal = -shadingNormal;
+    return shadingNormal;
 }
 
 __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
@@ -1240,7 +1258,8 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
 
                 bool front = rayDirection.dot(n) < 0.0f;
                 nearestHit.frontFace = front;
-                nearestHit.hitNormal = front ? n : -n;
+                vec3 shadingNormal = computeTriangleShadingNormal(triangles[primitiveIdx], nearestHit.hitPoint, n);
+                nearestHit.hitNormal = front ? shadingNormal : -shadingNormal;
                 vec2 triangleUv = computeTriangleUvFromHitPoint(triangles[primitiveIdx], nearestHit.hitPoint);
                 nearestHit.u = triangleUv.x;
                 nearestHit.v = triangleUv.y;
@@ -1652,6 +1671,7 @@ __host__ hostScene setup_scene(SceneChoice sceneChoice){
 struct ObjVertexReference {
     int positionIndex;   // -1 = missing
     int uvIndex;         // -1 = missing
+    int normalIndex;
 };
 
 struct ObjTriangleCorners {
@@ -1672,7 +1692,7 @@ static int resolveObjIndex(int rawIndex,int listSize){
 }
 
 // token examples: "7", "7/3", "7/3/5", "7//5"
-static ObjVertexReference parseObjFaceToken(const std::string& token,int positionCount,int uvCount){
+static ObjVertexReference parseObjFaceToken(const std::string& token,int positionCount,int uvCount,int normalCount){
     int rawIndices[3] = {0, 0, 0};
     size_t startOfPiece = 0;
     for (int partIndex = 0; partIndex < 3; partIndex++){
@@ -1689,6 +1709,7 @@ static ObjVertexReference parseObjFaceToken(const std::string& token,int positio
     ObjVertexReference reference;
     reference.positionIndex = resolveObjIndex(rawIndices[0], positionCount);
     reference.uvIndex = resolveObjIndex(rawIndices[1], uvCount);
+    reference.normalIndex = resolveObjIndex(rawIndices[2], normalCount);
     return reference;
 }
 
@@ -1806,12 +1827,14 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
 
     std::vector<vec3> positions;
     std::vector<vec2> uvs;
+    std::vector<vec3> normals;
     std::vector<ObjTriangleCorners> faces;
 
     ObjMaterialLibrary materialLibrary;
     std::map<std::string,cudaTextureObject_t> textureCache;
     int missingTextureCount = 0;
     int currentMaterialIndex = -1;
+    std::set<std::string> unknownMaterialNames;
 
     std::string line;
     while (std::getline(file, line)){
@@ -1827,6 +1850,10 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
             float u, v;
             lineStream >> u >> v;
             uvs.push_back(vec2(u, v));
+        } else if (keyword == "vn"){
+            float x, y, z;
+            lineStream >> x >> y >> z;
+            normals.push_back(vec3(x, y, z));
         } else if (keyword == "mtllib"){
             std::string mtlFileName;
             while (lineStream >> mtlFileName){
@@ -1838,12 +1865,20 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
             std::string materialName;
             lineStream >> materialName;
             std::map<std::string,int>::iterator foundMaterial = materialLibrary.indexByName.find(materialName);
-            currentMaterialIndex = (foundMaterial != materialLibrary.indexByName.end()) ? foundMaterial->second : -1;
+            if (foundMaterial != materialLibrary.indexByName.end()){
+                currentMaterialIndex = foundMaterial->second;
+            } else {
+                currentMaterialIndex = (materialLibrary.materials.size() == 1) ? 0 : -1;
+                if (unknownMaterialNames.insert(materialName).second){
+                    printf("OBJ '%s': material '%s' is not defined in the .mtl file, %s\n", filePath, materialName.c_str(),
+                           currentMaterialIndex >= 0 ? "using the only material it defines" : "falling back to the scene material");
+                }
+            }
         } else if (keyword == "f"){
             std::vector<ObjVertexReference> corners;
             std::string token;
             while (lineStream >> token){
-                corners.push_back(parseObjFaceToken(token, (int)positions.size(), (int)uvs.size()));
+                corners.push_back(parseObjFaceToken(token, (int)positions.size(), (int)uvs.size(), (int)normals.size()));
             }
             // fan triangulation (0, fanIndex, fanIndex + 1)
             for (size_t fanIndex = 1; fanIndex + 1 < corners.size(); fanIndex++){
@@ -1878,6 +1913,21 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
         vec3 normalizedPosition = (positions[positionIndex] - bottomCenter) * (uniformScale / largestSide);
         vec3 rotatedPosition(normalizedPosition.x * cosine + normalizedPosition.z * sine, normalizedPosition.y, -normalizedPosition.x * sine + normalizedPosition.z * cosine);
         transformedPositions[positionIndex] = rotatedPosition + translation;
+    }
+    // models without vn get area-weighted averaged vertex normals, so organic meshes (bunny, dragon, sphere) look smooth
+    std::vector<vec3> averagedNormals;
+    if (normals.empty()){
+        averagedNormals.assign(positions.size(), vec3(0.f, 0.f, 0.f));
+        for (size_t faceIndex = 0; faceIndex < faces.size(); faceIndex++){
+            const ObjTriangleCorners& face = faces[faceIndex];
+            int i0 = face.corner[0].positionIndex, i1 = face.corner[1].positionIndex, i2 = face.corner[2].positionIndex;
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= (int)positions.size() || i1 >= (int)positions.size() || i2 >= (int)positions.size()) continue;
+            // the cross product length is twice the triangle area, so big triangles weigh more
+            vec3 areaWeightedNormal = (transformedPositions[i1] - transformedPositions[i0]).cross(transformedPositions[i2] - transformedPositions[i0]);
+            averagedNormals[i0] = averagedNormals[i0] + areaWeightedNormal;
+            averagedNormals[i1] = averagedNormals[i1] + areaWeightedNormal;
+            averagedNormals[i2] = averagedNormals[i2] + areaWeightedNormal;
+        }
     }
 
     int addedTriangleCount = 0;
@@ -1916,6 +1966,17 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
             int uvIndex = face.corner[cornerIndex].uvIndex;
             if (uvIndex >= 0 && uvIndex < (int)uvs.size()){
                 *uvTargets[cornerIndex] = uvs[uvIndex];
+            }
+        }
+        vec3* normalTargets[3] = {&objectTriangle.n0, &objectTriangle.n1, &objectTriangle.n2};
+        for (int cornerIndex = 0; cornerIndex < 3; cornerIndex++){
+            int normalIndex = face.corner[cornerIndex].normalIndex;
+            if (normalIndex >= 0 && normalIndex < (int)normals.size() && normals[normalIndex].length_squared() > 0.0f){
+                vec3 normal = normals[normalIndex];
+                *normalTargets[cornerIndex] = vec3(normal.x * cosine + normal.z * sine, normal.y, -normal.x * sine + normal.z * cosine).normalize();
+            }else if (!averagedNormals.empty()){
+                const vec3& averaged = averagedNormals[face.corner[cornerIndex].positionIndex];
+                if (averaged.length_squared() > 0.0f) *normalTargets[cornerIndex] = averaged.normalize();
             }
         }
         scene.triangles.push_back(objectTriangle);
@@ -2136,7 +2197,38 @@ __global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int m
     vec3 averagedRadiance = accumBuffer[pixel_index] / float(samplesSoFar) * exposure;
     outputBuffer[pixel_index] = vec3(linearToSrgb(toneMapChannel(averagedRadiance.x, toneMap)),linearToSrgb(toneMapChannel(averagedRadiance.y, toneMap)),linearToSrgb(toneMapChannel(averagedRadiance.z, toneMap)));
 }
+// Sums ln(delta + luminance) over the image so the host can form the geometric mean (log-average luminance).
+// Every thread of a warp takes part in the shuffle (out-of-range threads add 0), then one lane per warp does the atomicAdd.
+__global__ void logLuminanceSumKernel(const vec3* accumBuffer, int maximumX, int maximumY, int samplesSoFar, float* logLuminanceSum){
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    const float delta = 1e-4f;
+    float logLuminance = 0.0f;
+    if (i < maximumX && j < maximumY){
+        vec3 radiance = accumBuffer[maximumX * j + i] / float(samplesSoFar);
+        float luminance = 0.2126f * radiance.x + 0.7152f * radiance.y + 0.0722f * radiance.z;
+        logLuminance = logf(delta + (isfinite(luminance) ? fmaxf(luminance, 0.0f) : 0.0f));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1){
+        logLuminance += __shfl_down_sync(0xffffffffu, logLuminance, offset);
+    }
+    int laneIndex = (threadIdx.y * blockDim.x + threadIdx.x) & 31;
+    if (laneIndex == 0) atomicAdd(logLuminanceSum, logLuminance);
+}
 
+// middle gray of 0.18 in linear radiance is the usual target for the log-average luminance
+static float computeAutoExposure(const vec3* accumBuffer, int imageWidth, int imageHeight, int samplesSoFar, dim3 grid, dim3 block, float targetGray = 0.18f){
+    float* deviceSum = nullptr;
+    CUDA_CHECK(cudaMalloc(&deviceSum, sizeof(float)));
+    CUDA_CHECK(cudaMemset(deviceSum, 0, sizeof(float)));
+    logLuminanceSumKernel<<<grid, block>>>(accumBuffer, imageWidth, imageHeight, samplesSoFar, deviceSum);
+    CUDA_CHECK_KERNEL();
+    float hostSum = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&hostSum, deviceSum, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(deviceSum));
+    float logAverageLuminance = expf(hostSum / float(imageWidth * imageHeight));
+    return targetGray / logAverageLuminance;
+}
 // ============================================================================
 
 // ============================================================================
@@ -2528,7 +2620,8 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         vec3 edge2 = hitTriangle.v2 - hitTriangle.v0;
         vec3 triangleNormal = edge1.cross(edge2).normalize();
         frontFace = incomingRayDirection.dot(triangleNormal) < 0.0f;
-        hitNormal = frontFace ? triangleNormal : -triangleNormal;
+        vec3 shadingNormal = computeTriangleShadingNormal(hitTriangle, hitPoint, triangleNormal);
+        hitNormal = frontFace ? shadingNormal : -shadingNormal;
         vec2 triangleUv = computeTriangleUvFromHitPoint(hitTriangle, hitPoint);
         hitU = triangleUv.x;
         hitV = triangleUv.y;
@@ -2865,6 +2958,7 @@ struct RenderOptions {
     int samplesPerPixelOverride = 0;
     ToneMapOption toneMap = ToneMapOption::None;
     float exposure = 1.0f;
+    bool autoExposure = false;
 };
 
 static RenderOptions parseCommandLine(int argc, char** argv){
@@ -2889,7 +2983,12 @@ static RenderOptions parseCommandLine(int argc, char** argv){
         }else if(std::strcmp(argv[argumentIndex], "--exposure") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
             float parsedExposure = (float)std::atof(argv[argumentIndex]);
-            if(parsedExposure > 0.0f) options.exposure = parsedExposure;
+            if(std::strcmp(argv[argumentIndex], "auto") == 0){
+                options.autoExposure = true;
+            }else{
+                float parsedExposure = (float)std::atof(argv[argumentIndex]);
+                if(parsedExposure > 0.0f) options.exposure = parsedExposure;
+            }
         }
     }
     return options;
@@ -2947,7 +3046,9 @@ static RenderOptions runInteractiveMenu(RenderOptions options){
                     : (toneMapIndex == 2) ? ToneMapOption::ACES
                                           : ToneMapOption::None;
 
-    options.exposure = askNumber("Exposure multiplier", options.exposure, 0.0001f);
+    int exposureMode = askChoice("Exposure", {"manual multiplier", "automatic (log-average luminance)"}, options.autoExposure ? 1 : 0);
+    options.autoExposure = (exposureMode == 1);
+    if(!options.autoExposure) options.exposure = askNumber("Exposure multiplier", options.exposure, 0.0001f);
     options.samplesPerPixelOverride = (int)askNumber("Samples per pixel (0 = scene default)", (float)options.samplesPerPixelOverride, 0.0f);
 
     const char* toneMapNames[] = {"none", "reinhard", "aces"};
@@ -2956,7 +3057,8 @@ static RenderOptions runInteractiveMenu(RenderOptions options){
     if(options.usePersistent) printf(" --persistent");
     printf(" --scene %s", sceneNames[(int)options.scene]);
     if(options.samplesPerPixelOverride > 0) printf(" --spp %d", options.samplesPerPixelOverride);
-    printf(" --tonemap %s --exposure %g\n\n", toneMapNames[(int)options.toneMap], options.exposure);
+    if(options.autoExposure) printf(" --tonemap %s --exposure auto\n\n", toneMapNames[(int)options.toneMap]);
+    else printf(" --tonemap %s --exposure %g\n\n", toneMapNames[(int)options.toneMap], options.exposure);
     return options;
 }
 // ============================================================================
@@ -2976,6 +3078,7 @@ int main(int argc,char** argv) {
     int samplesPerPixelOverride = options.samplesPerPixelOverride;
     ToneMapOption toneMap = options.toneMap;
     float exposure = options.exposure;
+    bool autoExposure = options.autoExposure;
     if(usePersistentThreads && !useWavefrontPathTracing){
         printf("--persistent only applies to the wavefront path tracer, ignoring it (add --wavefront)\n");
     }
@@ -3167,6 +3270,12 @@ int main(int argc,char** argv) {
 
     printf("\nLight triangles in the scene: %zu\n", scene.lights.size());
     printf("\n");
+    if(autoExposure){
+        float chosenExposure = computeAutoExposure(d_accumBuffer, numberOfPixels_X, numberOfPixels_Y, cam.samples_per_pixel, grid, block);
+        printf("Auto exposure: %.3f\n", chosenExposure);
+        resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer, numberOfPixels_X, numberOfPixels_Y, cam.samples_per_pixel, toneMap, chosenExposure);
+        CUDA_CHECK_KERNEL();
+    }
 
     CUDA_CHECK(cudaMemcpy(host_frameBuffer,device_frameBuffer,frameBufferSize,cudaMemcpyDeviceToHost));
 
