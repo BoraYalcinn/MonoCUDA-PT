@@ -2017,14 +2017,32 @@ __device__ float linearToSrgb(float linearValue){
     return srgbValue;
 }
 
-__global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int maximumX, int maximumY, int samplesSoFar) {
+enum class ToneMapOption{None,Reinhard,ACES };
+
+__device__ float toneMapChannel(float linearValue, ToneMapOption toneMap){
+    linearValue = fmaxf(linearValue,0.f);
+    switch(toneMap){
+        case ToneMapOption::Reinhard:{
+            return linearValue / (1.f + linearValue);
+        }
+        case ToneMapOption::ACES:{
+            float mapped = (linearValue * (2.51f * linearValue + 0.03f)) / (linearValue * (2.43f * linearValue + 0.59f) + 0.14f);
+            return fminf(fmaxf(mapped, 0.0f), 1.0f);
+        }
+        case ToneMapOption::None:
+        default:
+            return linearValue;
+    }
+}
+
+__global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int maximumX, int maximumY, int samplesSoFar, ToneMapOption toneMap) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if (i >= maximumX || j >= maximumY) return;
     int pixel_index = maximumX * j + i;
 
     vec3 averagedRadiance = accumBuffer[pixel_index] / float(samplesSoFar);
-    outputBuffer[pixel_index] = vec3(linearToSrgb(averagedRadiance.x),linearToSrgb(averagedRadiance.y),linearToSrgb(averagedRadiance.z));
+    outputBuffer[pixel_index] = vec3(linearToSrgb(toneMapChannel(averagedRadiance.x, toneMap)),linearToSrgb(toneMapChannel(averagedRadiance.y, toneMap)),linearToSrgb(toneMapChannel(averagedRadiance.z, toneMap)));
 }
 
 // ============================================================================
@@ -2105,6 +2123,7 @@ struct WavefrontRenderContext {
 
     bool usePersistentThreads = false;
     bool sceneHasMedium = false;
+    ToneMapOption toneMap = ToneMapOption::None;
 };
 
 template <typename ElementType>
@@ -2680,7 +2699,7 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
         finalizeSampleKernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.imageWidth, context.imageHeight, pathState);
         CUDA_CHECK_KERNEL();
 
-        resolve_kernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.frameBuffer, context.imageWidth, context.imageHeight, sampleIndex + 1);
+        resolve_kernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.frameBuffer, context.imageWidth, context.imageHeight, sampleIndex + 1,context.toneMap);
         CUDA_CHECK_KERNEL();
 
         float percent = 100.0f * float(sampleIndex + 1) / float(context.camera.samples_per_pixel);
@@ -2750,6 +2769,7 @@ int main(int argc,char** argv) {
     bool useWavefrontPathTracing = false;
     SceneChoice sceneChoice = SceneChoice::Cornell;
     int samplesPerPixelOverride = 0;
+    ToneMapOption toneMap = ToneMapOption::None;
     for(int argumentIndex = 1; argumentIndex < argc; ++argumentIndex){
         if(std::strcmp(argv[argumentIndex], "--wavefront") == 0){
             useWavefrontPathTracing = true;
@@ -2761,6 +2781,10 @@ int main(int argc,char** argv) {
         }else if(std::strcmp(argv[argumentIndex], "--spp") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
             samplesPerPixelOverride = std::atoi(argv[argumentIndex]);
+        }else if(std::strcmp(argv[argumentIndex], "--tonemap") == 0 && argumentIndex + 1 < argc){
+            ++argumentIndex;
+            if(std::strcmp(argv[argumentIndex], "reinhard") == 0) toneMap = ToneMapOption::Reinhard;
+            else if(std::strcmp(argv[argumentIndex], "aces") == 0) toneMap = ToneMapOption::ACES;
         }
     }
     if(usePersistentThreads && !useWavefrontPathTracing){
@@ -2915,6 +2939,7 @@ int main(int argc,char** argv) {
         wavefrontContext.imageHeight = numberOfPixels_Y;
         wavefrontContext.gridDimensions = grid;
         wavefrontContext.blockDimensions = block;
+        wavefrontContext.toneMap = toneMap;
         wavefrontContext.usePersistentThreads = usePersistentThreads;
         bool sceneHasMedium = false;
         for (const sphere& s : scene.spheres)    if (s.mat.type == MaterialType::Isotropic) sceneHasMedium = true;
@@ -2926,7 +2951,7 @@ int main(int argc,char** argv) {
             trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, d_rngStates, s,d_lights,lightCount);
             CUDA_CHECK_KERNEL();
 
-            resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1);
+            resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1,toneMap);
             CUDA_CHECK_KERNEL();
 
             // PROGRESS BAR
@@ -2984,7 +3009,6 @@ int main(int argc,char** argv) {
     }
     bvh.free();
     delete[] host_frameBuffer;
-
 
     return 0;
 }
