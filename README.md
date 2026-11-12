@@ -16,15 +16,17 @@ cmake --build --preset release
 ./build/release/monocuda --wavefront                     # wavefront path tracer
 ./build/release/monocuda --wavefront --persistent        # wavefront with persistent threads in the extend kernel
 ./build/release/monocuda --scene sponza --spp 1000       # choose the scene and the sample count
+./build/release/monocuda --wavefront --tonemap aces --exposure 0.6   # tone mapping and exposure
+./build/release/monocuda                                  # no arguments in a terminal: interactive menu
 ```
 
-The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model. The Cornell box scene loads an `earth.ppm` image texture (binary PPM, P6) from the current directory. `--scene` selects `cornell` (default) or `sponza`, and `--spp N` overrides the number of samples per pixel, and `--persistent` (only together with `--wavefront`) selects the persistent-threads extend kernel. The Sponza model is not part of the repository. Download the OBJ version from the McGuire Computer Graphics Archive (https://casual-effects.com/data/), respect the `copyright.txt` that comes with it, and extract it so that `models/sponza.obj` exists. The loader also reads `models/sponza.mtl` (`newmtl`, `Kd`, `map_Kd`; other keywords are ignored). Image textures have to be binary PPM (P6, 8 bit) next to the original file with the extension replaced by `.ppm`, since the loader has no image decoders. Convert them once with ImageMagick:
+The render is written to `render_megakernel.ppm` or `render_wavefront.ppm` in the current directory, depending on the execution model. The Cornell box scene loads an `earth.ppm` image texture (binary PPM, P6) from the current directory. `--scene` selects `cornell` (default) or `sponza`, and `--spp N` overrides the number of samples per pixel, and `--persistent` (only together with `--wavefront`) selects the persistent-threads extend kernel. `--tonemap none|reinhard|aces` selects the tone mapping operator (default `none`) and `--exposure X` multiplies the averaged radiance before tone mapping (default 1.0; ACES is brighter than `none`, so around 0.6 looks closer). Started without any arguments in a terminal, the program shows a small interactive menu for the execution model, the scene, the sample count, the tone mapping and the exposure; runs with arguments and pipes skip it. The Sponza model is not part of the repository. Download the OBJ version from the McGuire Computer Graphics Archive (https://casual-effects.com/data/), respect the `copyright.txt` that comes with it, and extract it so that `models/sponza.obj` exists. The loader also reads `models/sponza.mtl` (`newmtl`, `Kd`, `map_Kd`; other keywords are ignored). Image textures have to be binary PPM (P6, 8 bit) next to the original file with the extension replaced by `.ppm`, since the loader has no image decoders. Convert them once with ImageMagick:
 
 ```
 grep -h "map_Kd" models/sponza.mtl | tr -d '\r' | awk '{print $NF}' | tr '\\' '/' | sort -u | while read f; do magick "models/$f" -depth 8 "ppm:models/${f%.*}.ppm"; done
 ```
 
-The console reports `N materials, M textures loaded, K materials with a missing texture` when the model is loaded. A material whose texture is missing falls back to its `Kd` color. Alpha-masked parts of Sponza (leaves, chains, plants) are not supported yet and render as solid quads. The output has no gamma or tone mapping step yet, so colors look darker and flatter than in other renderers.
+The console reports `N materials, M textures loaded, K materials with a missing texture` when the model is loaded. A material whose texture is missing falls back to its `Kd` color. Alpha-masked parts of Sponza (leaves, chains, plants) are not supported yet and render as solid quads. The accumulation buffer stays in linear radiance; the resolve kernel applies exposure, the selected tone mapping operator and the sRGB transfer function once per pixel. The colors of the built-in scenes are picked by eye, so they are treated as sRGB values and converted to linear when the textures are built (emissive colors are not converted).
 
 The project's implementation status is tracked in CHECKLIST.md. It is licensed under the MIT License.
 
@@ -154,15 +156,16 @@ A higher active-thread ratio therefore does not guarantee a faster kernel; the l
 - [x] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces *(wavefront extend kernel only, `--wavefront --persistent`: fixed grid, one warp-aggregated `atomicAdd` on a global work counter, refill when at least 8 lanes of a warp are idle; 1.13x on Sponza at 1000 spp, bit-identical image; a persistent shadow-ray kernel was tried and was about 5% slower, so it is not used)*
 
 ## 9. Image Output & Post-Processing
-- [x] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp) *(selectable with `--tonemap none|reinhard|aces`, default `none`; applied in the resolve kernel to the averaged linear radiance, before the gamma step; Reinhard is `c / (1 + c)` per channel and ACES is the Narkowicz approximation; there is no exposure control yet)*
-- [x] Gamma correction (linear → sRGB) *(applied once in the resolve kernel with the exact sRGB transfer function; the accumulation buffer stays in linear radiance)*
+- [x] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp) *(selectable with `--tonemap none|reinhard|aces`, default `none`; applied in the resolve kernel to the averaged linear radiance, before the gamma step; Reinhard is `c / (1 + c)` per channel and ACES is the Narkowicz approximation; exposure is a separate multiplier set with `--exposure`, applied before the operator)*
+- [x] Gamma correction (linear → sRGB) *(applied once in the resolve kernel with the exact sRGB transfer function; the accumulation buffer stays in linear radiance; hand-picked scene colors are linearized with `srgbToLinear` in `make_solid_texture` and `make_checker_texture`, so the scenes keep the look they were authored with)*
 - [ ] PNG output (not just PPM) so renders are shareable without conversion
 - [ ] **(stretch)** Simple denoiser pass (even a basic bilateral/edge-aware filter counts) to demonstrate you understand the variance-reduction vs. denoising trade-off
 
 ## 10. Tooling & Validation
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [x] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo *(single-kernel versus wavefront on Cornell and Sponza, see Benchmarks)*
-- [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene cornell|sponza`, plus `--spp N` for the sample count and `--tonemap none|reinhard|aces` for the tone mapping operator)*
+- [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene cornell|sponza`, plus `--spp N` for the sample count, `--tonemap none|reinhard|aces` for the tone mapping operator and `--exposure X` for the exposure)*
+- [x] Interactive terminal menu (execution model, scene, samples per pixel, tone mapping, exposure) *(opens only when the program is started without arguments and both stdin and stdout are terminals, so scripted runs are unaffected; all choices are collected in a `RenderOptions` struct that the command line parser fills as well)*
 - [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor, a checker floor, a textured Earth sphere and a smoke sphere)
 - [x] Sponza atrium test scene (262k triangles loaded from the McGuire OBJ with its MTL materials and 24 textures, a skylight quad above the open roof as the only light)
 
