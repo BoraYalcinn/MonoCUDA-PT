@@ -2,7 +2,7 @@
 // This project is fully written by Bora Yalçın (Undergraduate CSE Student at Yeditepe University)
 // Checkout out my website for related blogs : https://borayalcinn.github.io/
 // Checkout the related repository           : https://github.com/BoraYalcinn/MonoCUDA-PT
-// I have shared the sources such as papers, websites and learning courses etc. under the README.mdHitResultBuffers
+// I have shared the sources such as papers, websites and learning courses etc. under the README.md
 // ==============================================================================
 // === INCLUDE AND MACROS ===
 // ==============================================================================
