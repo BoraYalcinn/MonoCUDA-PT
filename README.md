@@ -3,9 +3,9 @@ MonoCUDA is an original CUDA path tracer written as a single source file. It was
 
 The renderer is deliberately kept in one file. The intent is for the source to read as a continuous explanation of a GPU path tracer's design, from ray generation through BVH traversal, material evaluation, and light transport, rather than as a general-purpose rendering engine split across many files. Kernels are written iteratively rather than recursively, since recursion on GPU forces register spilling and reduces occupancy.
 
-The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, combined with BSDF sampling through multiple importance sampling (power heuristic). The renderer supports motion blur through time-sampled rays and moving spheres, and textured surfaces: solid colors, a procedural checker and image textures, with UV mapping on spheres and triangles and hardware-filtered image sampling through `cudaTextureObject_t`. Triangle meshes can be loaded from Wavefront OBJ files (`v`, `vt` and `f`, flat shaded) together with their MTL materials (`Kd` and `map_Kd`), and the renderer ships with two selectable test scenes: a Cornell box and the Sponza atrium. Correctness checks against a CPU reference implementation are planned (see below checklist). Measured single-kernel versus wavefront timings are listed in the Benchmarks section.
+The project follows a standard Monte Carlo path tracing formulation: primary rays are generated per pixel, intersected against scene geometry accelerated by a bounding volume hierarchy, and shaded using physically based materials (diffuse, dielectric, conductor, and emissive) and a homogeneous isotropic participating medium (smoke). Direct lighting uses next event estimation (NEE) with shadow rays against area lights, combined with BSDF sampling through multiple importance sampling (power heuristic). The renderer supports motion blur through time-sampled rays and moving spheres, and textured surfaces: solid colors, a procedural checker and image textures, with UV mapping on spheres and triangles and hardware-filtered image sampling through `cudaTextureObject_t`. Triangle meshes can be loaded from Wavefront OBJ files (`v`, `vt` and `f`, flat shaded) together with their MTL materials (`Kd` and `map_Kd`), and the renderer ships with two selectable test scenes: a Cornell box and the Sponza atrium. Correctness checks against a CPU reference implementation are planned (see below checklist). Measured single-kernel versus wavefront timings are listed in the Benchmarks section.
 
-Two execution models are implemented side by side and produce the same image: a single-kernel path tracer (the default), where one thread follows a whole path, and a wavefront path tracer (`--wavefront`), which splits every bounce into separate extend, shade and shadow-ray kernels connected by compacted path queues and a structure-of-arrays path state. The wavefront version raises the average number of active threads per warp from about 7 to about 27 on the first bounce, at the cost of extra memory traffic. With `--persistent` the wavefront extend kernel additionally keeps each ray's traversal state in its lane and hands a finished lane a new ray from a global work counter, so warps stay busy on the incoherent later bounces; the image stays bit-identical.
+Two execution models are implemented side by side and produce the same image: a single-kernel path tracer (the default), where one thread follows a whole path, and a wavefront path tracer (`--wavefront`), which splits every bounce into separate extend, shade and shadow-ray kernels connected by compacted path queues and a structure-of-arrays path state. The wavefront version raises the average number of active threads per warp from about 7 to about 27 on the first bounce, at the cost of extra memory traffic. With `--persistent` the wavefront extend kernel additionally keeps each ray's traversal state in its lane and hands a finished lane a new ray from a global work counter, so warps stay busy on the incoherent later bounces; the image stays bit-identical. The extend kernel also stores only a packed 16-byte hit record and the shade kernel rebuilds the surface data from it (deferred hit shading).
 
 Building requires the CUDA Toolkit (12.x or later), CMake 3.24 or later, and a CUDA-capable NVIDIA GPU. From the repository root:
 
@@ -61,6 +61,24 @@ With `--wavefront --persistent` the extend kernel launches a fixed grid that exa
 
 Both rows were measured back to back in the same session. Nsight Compute on the extend kernel at bounce depth 3 showed the average number of active threads per warp rising from 6.35 to 15.33, the kernel time dropping from 18.2 ms to 10.2 ms, and registers per thread dropping from 71 to 56. The gain on the whole frame is smaller because the extend kernel is only part of it: an `nsys` run showed the persistent extend kernel at 66% of the GPU time, the shadow-ray kernel at 28% and the shade kernel at 3%. The shadow-ray kernel still uses one thread per ray. The extend kernel is now limited by memory (about 80% of peak memory throughput), mostly local memory traffic from the traversal stack and scattered stores of the hit results.
 
+## Effect of deferred hit shading
+
+In the wavefront renderer the extend kernel used to carry a full `hitRecord` (hit point, normal, front-face flag, UV and a copy of the `Material`) through the traversal and wrote it out as twelve separate arrays. Nsight Compute showed this as local-memory traffic inside the persistent traversal state and as scattered 4-byte stores that saturate L2. Now `extendKernel` only tracks the closest candidate (`distance`, `primitiveType`, `primitiveIndex`) and writes a single 16-byte `PackedHit`. `shadeKernel` reads it back and recomputes the hit point, normal, front-face flag and UV with the same formulas the traversal used to run, so the extra arithmetic is paid once per hit instead of once per candidate triangle.
+
+| Sponza, wavefront + persistent, 50 spp | Time | Mpaths/s | Speedup |
+|---|---|---|---|
+| Before (hit record built during traversal) | 3.975 s | 4.53 | 1.00x |
+| After (`PackedHit`, shading data rebuilt in `shadeKernel`) | 3.540 s | 5.08 | 1.12x |
+
+Both rows are the mean of three runs measured back to back in the same session (the laptop GPU throttles, so numbers from different sessions are not comparable). The rendered image is byte-identical to the one from before the change (checked with `cmp`). `cuobjdump -sass` shows the number of local-memory instructions (`LDL`/`STL`) in `extendKernelPersistent` dropping from 139 to 33; most of the remaining ones belong to the traversal stack.
+
+## Experiments that did not help
+
+- **`__ldg` / read-only data path on the BVH loads:** no measurable change in time, so it was not kept.
+- **Persistent threads in the shadow-ray kernel:** the average number of active threads per warp rose from 12.66 to 18.09 (Nsight Compute), but the kernel got slower (4.10 ms to 4.31 ms, about 5% on the whole frame). The extra bookkeeping per traversal step (refill vote, state save/restore) costs more than the divergence it removes, because shadow rays are any-hit and terminate early. The change was reverted.
+
+A higher active-thread ratio therefore does not guarantee a faster kernel; the loop adds its own instructions.
+
 # Implementation Checklist
 
 ## 1. Core Rendering Pipeline
@@ -114,9 +132,9 @@ Both rows were measured back to back in the same session. Nsight Compute on the 
 - [ ] **(stretch)** Stratified or low-discrepancy sampling (e.g. Sobol/blue-noise) instead of pure `curand` uniform — measurably reduces noise at equal sample count
 
 ## 6. Volumetric Rendering
-- [ ] Homogeneous participating media (constant-density fog/smoke)
-- [ ] Ray marching through volume bounds — absorption + scattering along the path
-- [ ] Henyey-Greenstein phase function for scattering direction
+- [x] Homogeneous participating media (constant-density fog/smoke) *(sphere-bounded `Isotropic` material with a density and an albedo; NEE from the scattering point and transmittance on shadow rays, in both the single-kernel and the wavefront renderer)*
+- [x] Ray marching through volume bounds — absorption + scattering along the path *(done with analytic free-flight distance sampling instead of ray marching, since the medium is homogeneous; absorption comes from an albedo below 1)*
+- [ ] Henyey-Greenstein phase function for scattering direction *(only the isotropic phase function $1/(4\pi)$ exists so far)*
 - [ ] **(stretch)** Heterogeneous volumes (3D voxel grid for density — real smoke/cloud data)
 
 ## 7. Motion Blur
@@ -128,12 +146,12 @@ Both rows were measured back to back in the same session. Nsight Compute on the 
 ## 8. GPU Architecture-Specific Design
 - [x] Iterative (not recursive) kernels throughout — verified with the register/stack usage report (`cuobjdump --dump-resource-usage`, equivalent to `nvcc --ptxas-options=-v`)
 - [x] Persistent per-pixel RNG state, not reinitialized per sample
-- [ ] Memory access audit: confirm scene/material reads go through `__ldg`/`const __restrict__` *(profiling showed plain `LDG.E` loads in `extendKernel`; the 16-byte aligned `AABB` is done, `const __restrict__` kernel parameters and the child bounds stored inside the parent node are still open)*
+- [ ] Memory access audit: confirm scene/material reads go through `__ldg`/`const __restrict__` *(profiling showed plain `LDG.E` loads in `extendKernel`; the 16-byte aligned `AABB` is done, `__ldg` on the BVH loads gave no measurable gain, and `const __restrict__` kernel parameters and the child bounds stored inside the parent node are still open)*
 - [x] Occupancy measurement (Nsight Compute or `nvidia-smi`) at a baseline milestone
 - [x] **(stretch)** Wavefront path tracing — split trace/shade into separate kernels with stream compaction between bounces (this is how real production renderers like PBRT-on-GPU or Blender Cycles handle divergence; a genuine architectural upgrade over "one big kernel does everything") *(implemented with atomic-counter path queues, a separate shadow-ray queue for NEE, and SoA path state; selectable with `--wavefront`)*
 - [ ] **(stretch)** Material-sorted shading — sort active paths by material ID before shading to reduce warp divergence
-- [x] **(stretch)** Any-hit traversal for shadow rays (early exit on the first occluder, no hit record) *(used by the wavefront shadow kernel; the single-kernel path tracer still uses closest-hit traversal with a max distance)*
-- [x] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces *(wavefront extend kernel only, `--wavefront --persistent`: fixed grid, one warp-aggregated `atomicAdd` on a global work counter, refill when at least 8 lanes of a warp are idle; 1.13x on Sponza at 1000 spp, bit-identical image; the shadow-ray kernel does not use it yet)*
+- [x] **(stretch)** Any-hit traversal for shadow rays (early exit on the first occluder, no hit record) *(used by the wavefront shadow kernel unless the scene contains a participating medium; the single-kernel path tracer still uses closest-hit traversal with a max distance)*
+- [x] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces *(wavefront extend kernel only, `--wavefront --persistent`: fixed grid, one warp-aggregated `atomicAdd` on a global work counter, refill when at least 8 lanes of a warp are idle; 1.13x on Sponza at 1000 spp, bit-identical image; a persistent shadow-ray kernel was tried and was about 5% slower, so it is not used)*
 
 ## 9. Image Output & Post-Processing
 - [ ] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp)
@@ -145,7 +163,7 @@ Both rows were measured back to back in the same session. Nsight Compute on the 
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [x] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo *(single-kernel versus wavefront on Cornell and Sponza, see Benchmarks)*
 - [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene cornell|sponza`, plus `--spp N` for the sample count)*
-- [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor, a checker floor and a textured Earth sphere)
+- [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor, a checker floor, a textured Earth sphere and a smoke sphere)
 - [x] Sponza atrium test scene (262k triangles loaded from the McGuire OBJ with its MTL materials and 24 textures, a skylight quad above the open roof as the only light)
 
 ## References
