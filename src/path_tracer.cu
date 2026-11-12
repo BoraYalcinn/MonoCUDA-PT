@@ -2035,13 +2035,13 @@ __device__ float toneMapChannel(float linearValue, ToneMapOption toneMap){
     }
 }
 
-__global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int maximumX, int maximumY, int samplesSoFar, ToneMapOption toneMap) {
+__global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int maximumX, int maximumY, int samplesSoFar, ToneMapOption toneMap,float exposure) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if (i >= maximumX || j >= maximumY) return;
     int pixel_index = maximumX * j + i;
 
-    vec3 averagedRadiance = accumBuffer[pixel_index] / float(samplesSoFar);
+    vec3 averagedRadiance = accumBuffer[pixel_index] / float(samplesSoFar) * exposure;
     outputBuffer[pixel_index] = vec3(linearToSrgb(toneMapChannel(averagedRadiance.x, toneMap)),linearToSrgb(toneMapChannel(averagedRadiance.y, toneMap)),linearToSrgb(toneMapChannel(averagedRadiance.z, toneMap)));
 }
 
@@ -2124,6 +2124,7 @@ struct WavefrontRenderContext {
     bool usePersistentThreads = false;
     bool sceneHasMedium = false;
     ToneMapOption toneMap = ToneMapOption::None;
+    float exposure = 1.f;
 };
 
 template <typename ElementType>
@@ -2615,8 +2616,7 @@ __global__ void debugShowRayDirectionKernel(vec3* frameBuffer, int imageWidth, i
 }
 
 
-__global__ void finalizeSampleKernel(vec3* accumBuffer, int imageWidth, int imageHeight, PathStateBuffers pathState)
-{
+__global__ void finalizeSampleKernel(vec3* accumBuffer, int imageWidth, int imageHeight, PathStateBuffers pathState){
     int pixelX = threadIdx.x + blockIdx.x * blockDim.x;
     int pixelY = threadIdx.y + blockIdx.y * blockDim.y;
     if (pixelX >= imageWidth || pixelY >= imageHeight) return;
@@ -2699,7 +2699,7 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
         finalizeSampleKernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.imageWidth, context.imageHeight, pathState);
         CUDA_CHECK_KERNEL();
 
-        resolve_kernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.frameBuffer, context.imageWidth, context.imageHeight, sampleIndex + 1,context.toneMap);
+        resolve_kernel<<<context.gridDimensions, context.blockDimensions>>>(context.accumBuffer, context.frameBuffer, context.imageWidth, context.imageHeight, sampleIndex + 1,context.toneMap,context.exposure);
         CUDA_CHECK_KERNEL();
 
         float percent = 100.0f * float(sampleIndex + 1) / float(context.camera.samples_per_pixel);
@@ -2761,32 +2761,56 @@ static dim3 chooseImageGridShape(dim3 blockShape, int imageWidth, int imageHeigh
 // ============================================================================
 
 // ============================================================================
+// === OPTIONS AND UI ===
+// ============================================================================
+struct RenderOptions {
+    bool useWavefront = false;
+    bool usePersistent = false;
+    SceneChoice scene = SceneChoice::Cornell;
+    int samplesPerPixelOverride = 0;
+    ToneMapOption toneMap = ToneMapOption::None;
+    float exposure = 1.0f;
+};
+
+static RenderOptions parseCommandLine(int argc, char** argv){
+    RenderOptions options;
+    for(int argumentIndex = 1; argumentIndex < argc; ++argumentIndex){
+        if(std::strcmp(argv[argumentIndex], "--wavefront") == 0){
+            options.useWavefront = true;
+        }else if(std::strcmp(argv[argumentIndex], "--persistent") == 0){
+            options.usePersistent = true;
+        }else if(std::strcmp(argv[argumentIndex], "--scene") == 0 && argumentIndex + 1 < argc){
+            ++argumentIndex;
+            if(std::strcmp(argv[argumentIndex], "sponza") == 0) options.scene = SceneChoice::Sponza;
+        }else if(std::strcmp(argv[argumentIndex], "--spp") == 0 && argumentIndex + 1 < argc){
+            ++argumentIndex;
+            options.samplesPerPixelOverride = std::atoi(argv[argumentIndex]);
+        }else if(std::strcmp(argv[argumentIndex], "--tonemap") == 0 && argumentIndex + 1 < argc){
+            ++argumentIndex;
+            if(std::strcmp(argv[argumentIndex], "reinhard") == 0) options.toneMap = ToneMapOption::Reinhard;
+            else if(std::strcmp(argv[argumentIndex], "aces") == 0) options.toneMap = ToneMapOption::ACES;
+        }else if(std::strcmp(argv[argumentIndex], "--exposure") == 0 && argumentIndex + 1 < argc){
+            ++argumentIndex;
+            float parsedExposure = (float)std::atof(argv[argumentIndex]);
+            if(parsedExposure > 0.0f) options.exposure = parsedExposure;
+        }
+    }
+    return options;
+}
+// ============================================================================
+
+// ============================================================================
 // === MAIN ===
 // ============================================================================
 int main(int argc,char** argv) {
 
-    bool usePersistentThreads = false;
-    bool useWavefrontPathTracing = false;
-    SceneChoice sceneChoice = SceneChoice::Cornell;
-    int samplesPerPixelOverride = 0;
-    ToneMapOption toneMap = ToneMapOption::None;
-    for(int argumentIndex = 1; argumentIndex < argc; ++argumentIndex){
-        if(std::strcmp(argv[argumentIndex], "--wavefront") == 0){
-            useWavefrontPathTracing = true;
-        }else if(std::strcmp(argv[argumentIndex], "--persistent") == 0){
-            usePersistentThreads = true;
-        }else if(std::strcmp(argv[argumentIndex], "--scene") == 0 && argumentIndex + 1 < argc){
-            ++argumentIndex;
-            if(std::strcmp(argv[argumentIndex], "sponza") == 0) sceneChoice = SceneChoice::Sponza;
-        }else if(std::strcmp(argv[argumentIndex], "--spp") == 0 && argumentIndex + 1 < argc){
-            ++argumentIndex;
-            samplesPerPixelOverride = std::atoi(argv[argumentIndex]);
-        }else if(std::strcmp(argv[argumentIndex], "--tonemap") == 0 && argumentIndex + 1 < argc){
-            ++argumentIndex;
-            if(std::strcmp(argv[argumentIndex], "reinhard") == 0) toneMap = ToneMapOption::Reinhard;
-            else if(std::strcmp(argv[argumentIndex], "aces") == 0) toneMap = ToneMapOption::ACES;
-        }
-    }
+    RenderOptions options = parseCommandLine(argc, argv);
+    bool usePersistentThreads = options.usePersistent;
+    bool useWavefrontPathTracing = options.useWavefront;
+    SceneChoice sceneChoice = options.scene;
+    int samplesPerPixelOverride = options.samplesPerPixelOverride;
+    ToneMapOption toneMap = options.toneMap;
+    float exposure = options.exposure;
     if(usePersistentThreads && !useWavefrontPathTracing){
         printf("--persistent only applies to the wavefront path tracer, ignoring it (add --wavefront)\n");
     }
@@ -2940,6 +2964,7 @@ int main(int argc,char** argv) {
         wavefrontContext.gridDimensions = grid;
         wavefrontContext.blockDimensions = block;
         wavefrontContext.toneMap = toneMap;
+        wavefrontContext.exposure = exposure;
         wavefrontContext.usePersistentThreads = usePersistentThreads;
         bool sceneHasMedium = false;
         for (const sphere& s : scene.spheres)    if (s.mat.type == MaterialType::Isotropic) sceneHasMedium = true;
@@ -2951,7 +2976,7 @@ int main(int argc,char** argv) {
             trace_sample_kernel<<<grid, block>>>(d_accumBuffer, cam, bvh, d_spheres, sphereCount, d_triangles, triangleCount, numberOfPixels_X, numberOfPixels_Y, d_rngStates, s,d_lights,lightCount);
             CUDA_CHECK_KERNEL();
 
-            resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1,toneMap);
+            resolve_kernel<<<grid, block>>>(d_accumBuffer, device_frameBuffer,numberOfPixels_X, numberOfPixels_Y, s + 1,toneMap,exposure);
             CUDA_CHECK_KERNEL();
 
             // PROGRESS BAR
