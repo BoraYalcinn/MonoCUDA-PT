@@ -1418,20 +1418,29 @@ static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m
     add_quad(s, p[2], p[3], p[7], p[6], m);  // +y
 }
 
-enum class SceneChoice {Cornell, Sponza};
+enum class SceneChoice {Cornell, Sponza, Bunny, Dragon, LivingRoom, Sibenik, Sphere};
+static const char* sceneNames[] = {"cornell", "sponza", "bunny", "dragon", "living_room", "sibenik", "sphere"};
+static const char* sceneDescriptions[] = {
+    "Cornell box (small scene with a smoke sphere)",
+    "Sponza atrium (262k triangles, needs models/sponza.obj)",
+    "Stanford bunny in the Cornell box (144k triangles, needs models/bunny/bunny.obj)",
+    "Stanford dragon in the Cornell box (871k triangles, needs models/dragon/dragon.obj)",
+    "Living room (580k triangles, needs models/living_room/living_room.obj)",
+    "Sibenik cathedral (75k triangles, needs models/sibenik/sibenik.obj)",
+    "Textured UV sphere in the Cornell box (8k triangles, needs models/sphere/sphere-cylcoords-16k.obj)"
+};
+static const int sceneCount = 7;
 
 // == FORWARD DECLERATIONS =======================================================
 static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians);
 // ===============================================================================
 
-__host__ void buildCornellScene(hostScene& scene) {
+__host__ void buildCornellRoom(hostScene& scene) {
 
     Material floor = make_lambertian(make_checker_texture(vec3(0.9f,0.9f,0.9f), vec3(0.1f,0.1f,0.1f), 8.f));
     Material white  = make_lambertian(vec3(0.73f, 0.73f, 0.73f));
     Material red = make_lambertian(vec3(0.65f, 0.05f, 0.05f));
     Material green  = make_lambertian(vec3(0.12f, 0.45f, 0.15f));
-    Material mirror = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.02f);
-    Material smoke  = make_isotropic(vec3(0.8f, 0.8f, 0.85f), 1.f);
     Material light  = make_emissive(vec3(15.0f, 15.0f, 15.0f));
 
     const float L = -2.f, R = 2.f, B = 0.f, T = 4.f, F = -4.f, N = 0.f;
@@ -1442,6 +1451,14 @@ __host__ void buildCornellScene(hostScene& scene) {
     add_quad(scene, vec3(R,B,N), vec3(R,B,F), vec3(R,T,F), vec3(R,T,N), green);  // right
 
     add_quad(scene, vec3(-1.f,T-0.01f,-2.6f), vec3(1.f,T-0.01f,-2.6f),vec3(1.f,T-0.01f,-1.4f), vec3(-1.f,T-0.01f,-1.4f), light);
+}
+
+__host__ void buildCornellScene(hostScene& scene) {
+    buildCornellRoom(scene);
+
+    Material white  = make_lambertian(vec3(0.73f, 0.73f, 0.73f));
+    Material mirror = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.02f);
+    Material smoke  = make_isotropic(vec3(0.8f, 0.8f, 0.85f), 1.f);
 
     vec3 boxCenter(-0.8f, 1.1f, -2.8f);
     add_box(scene, boxCenter, vec3(0.55f, 1.1f, 0.55f), 0.3f, white);
@@ -1510,6 +1527,49 @@ __host__ void buildSponzaScene(hostScene& scene){
     add_quad(scene, vec3(-8.8f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, 1.7f), vec3(-8.8f, skylightHeight, 1.7f), skylight);
 }
 
+__host__ void buildBunnyScene(hostScene& scene){
+    buildCornellRoom(scene);
+    Material bunnyMaterial = make_lambertian(vec3(0.75f, 0.75f, 0.75f));
+    if (!loadObject(scene, "models/bunny/bunny.obj", bunnyMaterial, vec3(0.f, 0.f, -2.f), 2.2f, 0.f)){
+        std::fprintf(stderr, "could not load models/bunny/bunny.obj\n");
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+__host__ void buildDragonScene(hostScene& scene){
+    buildCornellRoom(scene);
+    Material dragonMaterial = make_lambertian(vec3(0.75f, 0.75f, 0.75f));
+    if (!loadObject(scene, "models/dragon/dragon.obj", dragonMaterial, vec3(0.f, 0.f, -2.f), 3.f, MONOCUDA_PI * 0.5f)){
+        std::fprintf(stderr, "could not load models/dragon/dragon.obj\n");
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+__host__ void buildSphereScene(hostScene& scene){
+    buildCornellRoom(scene);
+    Material sphereMaterial = make_lambertian(vec3(0.75f, 0.75f, 0.75f));
+    if (!loadObject(scene, "models/sphere/sphere-cylcoords-16k.obj", sphereMaterial, vec3(0.f, 0.f, -2.f), 2.f, 0.f)){
+        std::fprintf(stderr, "could not load models/sphere/sphere-cylcoords-16k.obj\n");
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+__host__ void buildLivingRoomScene(hostScene& scene){
+    Material fallbackMaterial = make_lambertian(vec3(0.75f, 0.72f, 0.68f));
+    if (!loadObject(scene, "models/living_room/living_room.obj", fallbackMaterial, vec3(0.f, 0.f, 0.f), 8.6f, 0.f)){
+        std::fprintf(stderr, "could not load models/living_room/living_room.obj\n");
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+__host__ void buildSibenikScene(hostScene& scene){
+    Material fallbackMaterial = make_lambertian(vec3(0.75f, 0.72f, 0.68f));
+    if (!loadObject(scene, "models/sibenik/sibenik.obj", fallbackMaterial, vec3(0.f, 0.f, 0.f), 40.f, 0.f)){
+        std::fprintf(stderr, "could not load models/sibenik/sibenik.obj\n");
+        std::exit(EXIT_FAILURE);
+    }
+}
+
 // bounding boxes, primitive references for the BVH and the light list (shared by every scene)
 __host__ void finalizeScene(hostScene& scene){
     for (size_t i = 0; i < scene.spheres.size(); i++){
@@ -1571,10 +1631,15 @@ __host__ void finalizeScene(hostScene& scene){
 
 __host__ hostScene setup_scene(SceneChoice sceneChoice){
     hostScene scene;
-    if (sceneChoice == SceneChoice::Sponza){
-        buildSponzaScene(scene);
-    }else{
-        buildCornellScene(scene);
+    switch (sceneChoice){
+        case SceneChoice::Sponza:     buildSponzaScene(scene);     break;
+        case SceneChoice::Bunny:      buildBunnyScene(scene);      break;
+        case SceneChoice::Dragon:     buildDragonScene(scene);     break;
+        case SceneChoice::LivingRoom: buildLivingRoomScene(scene); break;
+        case SceneChoice::Sibenik:    buildSibenikScene(scene);    break;
+        case SceneChoice::Sphere:     buildSphereScene(scene);     break;
+        case SceneChoice::Cornell:
+        default:                      buildCornellScene(scene);    break;
     }
     finalizeScene(scene);
     return scene;
@@ -1667,14 +1732,16 @@ static cudaTextureObject_t getOrLoadObjTexture(hostScene& scene,const std::strin
     return textureHandle;
 }
 
-// reads newmtl / Kd / map_Kd, every material becomes a lambertian (flat color or image texture)
-// Ka, Ks, bump maps and alpha masks are ignored, so are map_Kd options like "-s 2 2 2"
+// reads newmtl / Kd / map_Kd / Ke, every material becomes a lambertian (flat color or image texture)
+// unless it has a non-zero Ke, then it becomes an emissive. Ka, Ks, bump maps and alpha masks
+// are ignored, so are map_Kd options like "-s 2 2 2"
 static bool loadMtlFile(hostScene& scene,const std::string& mtlPath,const std::string& objectDirectory,ObjMaterialLibrary& library,std::map<std::string,cudaTextureObject_t>& textureCache,int& missingTextureCount){
     std::ifstream file(mtlPath);
     if (!file.is_open()) return false;
 
     std::string currentName;
     vec3 currentColor(0.8f, 0.8f, 0.8f);
+    vec3 currentEmission(0.f, 0.f, 0.f);
     std::string currentTexturePath;
     bool hasCurrentMaterial = false;
 
@@ -1682,7 +1749,10 @@ static bool loadMtlFile(hostScene& scene,const std::string& mtlPath,const std::s
     auto finishCurrentMaterial = [&](){
         if (!hasCurrentMaterial) return;
         Material finishedMaterial = make_lambertian(currentColor);
-        if (!currentTexturePath.empty()){
+        bool emitsLight = fmaxf(currentEmission.x, fmaxf(currentEmission.y, currentEmission.z)) > 0.f;
+        if (emitsLight){
+            finishedMaterial = make_emissive(currentEmission);
+        } else if (!currentTexturePath.empty()){
             std::string ppmPath = objectDirectory + "/" + convertTexturePathToPpm(currentTexturePath);
             cudaTextureObject_t textureHandle = getOrLoadObjTexture(scene, ppmPath, textureCache);
             if (textureHandle != 0){
@@ -1706,12 +1776,17 @@ static bool loadMtlFile(hostScene& scene,const std::string& mtlPath,const std::s
             finishCurrentMaterial();
             lineStream >> currentName;
             currentColor = vec3(0.8f, 0.8f, 0.8f);
+            currentEmission = vec3(0.f, 0.f, 0.f);
             currentTexturePath.clear();
             hasCurrentMaterial = true;
         } else if (keyword == "Kd" && hasCurrentMaterial){
             float red, green, blue;
             lineStream >> red >> green >> blue;
             currentColor = vec3(red, green, blue);
+        } else if (keyword == "Ke" && hasCurrentMaterial){
+            float red, green, blue;
+            lineStream >> red >> green >> blue;
+            currentEmission = vec3(red, green, blue);
         } else if (keyword == "map_Kd" && hasCurrentMaterial){
             lineStream >> currentTexturePath;
         }
@@ -2801,7 +2876,9 @@ static RenderOptions parseCommandLine(int argc, char** argv){
             options.usePersistent = true;
         }else if(std::strcmp(argv[argumentIndex], "--scene") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
-            if(std::strcmp(argv[argumentIndex], "sponza") == 0) options.scene = SceneChoice::Sponza;
+            for(int sceneIndex = 0; sceneIndex < sceneCount; sceneIndex++){
+                if(std::strcmp(argv[argumentIndex], sceneNames[sceneIndex]) == 0) options.scene = (SceneChoice)sceneIndex;
+            }
         }else if(std::strcmp(argv[argumentIndex], "--spp") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
             options.samplesPerPixelOverride = std::atoi(argv[argumentIndex]);
@@ -2858,8 +2935,8 @@ static RenderOptions runInteractiveMenu(RenderOptions options){
     printf("\n==================== MonoCUDA-PT ====================\n");
     printf("Press Enter to keep the default of any question.\n");
 
-    int sceneIndex = askChoice("Scene",{"Cornell box (small scene with a smoke sphere)", "Sponza atrium (262k triangles, needs models/sponza.obj)"},options.scene == SceneChoice::Sponza ? 1 : 0);
-    options.scene = (sceneIndex == 1) ? SceneChoice::Sponza : SceneChoice::Cornell;
+    int sceneIndex = askChoice("Scene", std::vector<std::string>(sceneDescriptions, sceneDescriptions + sceneCount), (int)options.scene);
+    options.scene = (SceneChoice)sceneIndex;
 
     int modeIndex = askChoice("Execution model",{"megakernel (one thread per path)", "wavefront", "wavefront + persistent threads"},options.useWavefront ? (options.usePersistent ? 2 : 1) : 0);
     options.useWavefront = (modeIndex >= 1);
@@ -2877,7 +2954,7 @@ static RenderOptions runInteractiveMenu(RenderOptions options){
     printf("\nSame run from the command line:\n  ./build/release/monocuda");
     if(options.useWavefront)  printf(" --wavefront");
     if(options.usePersistent) printf(" --persistent");
-    printf(" --scene %s", options.scene == SceneChoice::Sponza ? "sponza" : "cornell");
+    printf(" --scene %s", sceneNames[(int)options.scene]);
     if(options.samplesPerPixelOverride > 0) printf(" --spp %d", options.samplesPerPixelOverride);
     printf(" --tonemap %s --exposure %g\n\n", toneMapNames[(int)options.toneMap], options.exposure);
     return options;
@@ -2953,6 +3030,18 @@ int main(int argc,char** argv) {
         cam.look_at = vec3(8.f, 3.5f, 0.f);
         cam.vfov = 60.f;
         cam.focus_distance = 10.f;
+    }
+    if (sceneChoice == SceneChoice::LivingRoom){
+        cam.look_from = vec3(0.f, 1.5f, 3.6f);
+        cam.look_at = vec3(0.f, 1.4f, -3.f);
+        cam.vfov = 60.f;
+        cam.focus_distance = 6.f;
+    }
+    if (sceneChoice == SceneChoice::Sibenik){
+        cam.look_from = vec3(-17.f, 4.f, 0.f);
+        cam.look_at = vec3(15.f, 9.f, 0.f);
+        cam.vfov = 60.f;
+        cam.focus_distance = 20.f;
     }
 
     cam.initialize();
