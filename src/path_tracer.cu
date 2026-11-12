@@ -276,7 +276,7 @@ static cudaTextureObject_t createImageTextureObject(const std::vector<unsigned c
     textureDescription.filterMode = cudaFilterModeLinear;
     textureDescription.readMode = cudaReadModeNormalizedFloat;
     textureDescription.normalizedCoords = 1;
-    textureDescription.sRGB = 0;      // 1 once we output gamma-corrected images
+    textureDescription.sRGB = 1; // image textures are sRGB encoded now
 
     cudaTextureObject_t textureHandle = 0;
     CUDA_CHECK(cudaCreateTextureObject(&textureHandle, &resourceDescription, &textureDescription, nullptr));
@@ -2005,13 +2005,26 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
     rngStates[pixel_index] = rngState;
 }
 
+__device__ float linearToSrgb(float linearValue){
+    linearValue = fmaxf(linearValue,0.0f);
+    float srgbValue;
+    if (linearValue <= 0.0031308f){
+        srgbValue = 12.92f * linearValue;
+    }
+    else{
+        srgbValue = 1.055f * powf(linearValue, 1.0f / 2.4f) - 0.055f;
+    }
+    return srgbValue;
+}
+
 __global__ void resolve_kernel(const vec3* accumBuffer, vec3* outputBuffer,int maximumX, int maximumY, int samplesSoFar) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if (i >= maximumX || j >= maximumY) return;
     int pixel_index = maximumX * j + i;
 
-    outputBuffer[pixel_index] = accumBuffer[pixel_index] / float(samplesSoFar);
+    vec3 averagedRadiance = accumBuffer[pixel_index] / float(samplesSoFar);
+    outputBuffer[pixel_index] = vec3(linearToSrgb(averagedRadiance.x),linearToSrgb(averagedRadiance.y),linearToSrgb(averagedRadiance.z));
 }
 
 // ============================================================================
