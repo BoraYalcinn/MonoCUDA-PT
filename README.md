@@ -114,7 +114,7 @@ A higher active-thread ratio therefore does not guarantee a faster kernel; the l
 - [x] UV coordinates on primitives (spherical mapping for sphere, barycentric for triangle)
 - [x] Procedural checker texture and a `Texture` struct (solid / checker / image) wired into the materials' albedo
 - [x] Image loading — dependency-free binary PPM (P6) reader into RGBA8 host memory (PNG/JPG/HDR are converted offline, no `stb_image`, to keep the project single-file)
-- [x] Hardware-accelerated sampling via `cudaTextureObject_t` (bilinear filtering on the GPU, wrap addressing) *(sampled without the sRGB conversion for now, since the output has no gamma step yet; see Image Output)*
+- [x] Hardware-accelerated sampling via `cudaTextureObject_t` (bilinear filtering on the GPU, wrap addressing) *(textures are created with the sRGB flag, so the hardware converts them to linear on fetch and the gamma-corrected output shows them unchanged)*
 - [ ] **(stretch)** Normal mapping (tangent-space perturbation of the shading normal)
 - [ ] **(stretch)** Roughness/metallic texture maps for the conductor BSDF
 
@@ -154,15 +154,15 @@ A higher active-thread ratio therefore does not guarantee a faster kernel; the l
 - [x] **(stretch)** Persistent threads / dynamic work fetching in BVH traversal to reduce divergence on incoherent bounces *(wavefront extend kernel only, `--wavefront --persistent`: fixed grid, one warp-aggregated `atomicAdd` on a global work counter, refill when at least 8 lanes of a warp are idle; 1.13x on Sponza at 1000 spp, bit-identical image; a persistent shadow-ray kernel was tried and was about 5% slower, so it is not used)*
 
 ## 9. Image Output & Post-Processing
-- [ ] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp)
-- [ ] Gamma correction (linear → sRGB)
+- [x] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp) *(selectable with `--tonemap none|reinhard|aces`, default `none`; applied in the resolve kernel to the averaged linear radiance, before the gamma step; Reinhard is `c / (1 + c)` per channel and ACES is the Narkowicz approximation; there is no exposure control yet)*
+- [x] Gamma correction (linear → sRGB) *(applied once in the resolve kernel with the exact sRGB transfer function; the accumulation buffer stays in linear radiance)*
 - [ ] PNG output (not just PPM) so renders are shareable without conversion
 - [ ] **(stretch)** Simple denoiser pass (even a basic bilateral/edge-aware filter counts) to demonstrate you understand the variance-reduction vs. denoising trade-off
 
 ## 10. Tooling & Validation
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [x] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo *(single-kernel versus wavefront on Cornell and Sponza, see Benchmarks)*
-- [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene cornell|sponza`, plus `--spp N` for the sample count)*
+- [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene cornell|sponza`, plus `--spp N` for the sample count and `--tonemap none|reinhard|aces` for the tone mapping operator)*
 - [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor, a checker floor, a textured Earth sphere and a smoke sphere)
 - [x] Sponza atrium test scene (262k triangles loaded from the McGuire OBJ with its MTL materials and 24 textures, a skylight quad above the open roof as the only light)
 
