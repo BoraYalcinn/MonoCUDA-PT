@@ -310,6 +310,7 @@ struct Material{
     vec3 emittedColor;
     float fuzz;
     float refractionIndex;
+    float density = 0.f;
 };
 
 __device__ vec3 random_unit_vector(curandState* rngState){
@@ -388,8 +389,8 @@ __host__ __device__ Material make_emissive(vec3 emittedColor) {
     return Material{MaterialType::Emissive, make_solid_texture(vec3(0,0,0)), emittedColor, 0.f, 0.f};
 }
 
-__host__ __device__ Material make_isotropic(vec3 albedo){
-    return Material{MaterialType::Isotropic,make_solid_texture(albedo),vec3(0,0,0),0.f,0.f};
+__host__ __device__ Material make_isotropic(vec3 albedo, float density){
+    return Material{MaterialType::Isotropic,make_solid_texture(albedo),vec3(0,0,0),0.f,0.f,density};
 }
 
 // ============================================================================
@@ -1414,7 +1415,7 @@ __host__ void buildCornellScene(hostScene& scene) {
     Material red = make_lambertian(vec3(0.65f, 0.05f, 0.05f));
     Material green  = make_lambertian(vec3(0.12f, 0.45f, 0.15f));
     Material mirror = make_conductor(vec3(0.9f, 0.9f, 0.9f), 0.02f);
-    Material smoke  = make_isotropic(vec3(0.8f, 0.8f, 0.85f));
+    Material smoke  = make_isotropic(vec3(0.8f, 0.8f, 0.85f), 1.f);
     Material light  = make_emissive(vec3(15.0f, 15.0f, 15.0f));
 
     const float L = -2.f, R = 2.f, B = 0.f, T = 4.f, F = -4.f, N = 0.f;
@@ -1852,6 +1853,26 @@ __global__ void init_rng_kernel(curandState* rngStates, int maximumX, int maximu
 }
 
 
+__device__ float mediumTransmittance(const BVH& bvh, vec3 rayOrigin, const vec3& rayDirection, float rayTime,
+                                     const sphere* spheres, const triangle* triangles, float maximumDistance){
+    float transmittance = 1.0f;
+    float distanceTravelled = 0.0f;
+
+    for (int boundaryCrossing = 0; boundaryCrossing < 4; boundaryCrossing++){
+        float remainingDistance = maximumDistance - distanceTravelled;
+        if (remainingDistance <= 0.0f) break;
+
+        hitRecord blocker = bvh.traverseRay(rayOrigin, rayDirection, rayTime, spheres, triangles, remainingDistance);
+        if (!blocker.didHit) break;
+        if (blocker.mat.type != MaterialType::Isotropic) return 0.0f;
+
+        if (!blocker.frontFace) transmittance = transmittance * expf(-blocker.mat.density * blocker.closestDistance);
+        distanceTravelled = distanceTravelled + blocker.closestDistance;
+        rayOrigin = blocker.hitPoint;
+    }
+    return transmittance;
+}
+
 __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, sphere* spheres, int sphereCount, triangle* triangles, int triangleCount,
                                     int maximumX, int maximumY, curandState* rngStates, int sampleIndex,Light* lights,int lightCount){
 
@@ -1889,6 +1910,17 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             break;
         }
 
+        vec3 scatterOrigin = hit.hitPoint;
+        if (hit.mat.type == MaterialType::Isotropic) {
+            float scatterDistance = hit.frontFace ? hit.closestDistance
+                                                  : -logf(1.0f - curand_uniform(&rngState)) / hit.mat.density;
+            if (scatterDistance >= hit.closestDistance) {
+                r = Ray(hit.hitPoint, r.direction, r.time);
+                continue;
+            }
+            scatterOrigin = r.origin + r.direction * scatterDistance;
+        }
+
         attenuation = attenuation * sampleTexture(hit.mat.albedoTexture, hit.u, hit.v);
 
         // ---- NEXT EVENT ESTIMATION (direct light) ----
@@ -1898,7 +1930,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             float lightSelectionProbability = 1.0f / float(lightCount);
 
             vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &rngState);
-            vec3 vectorToLight = sampledPointOnLight - hit.hitPoint;
+            vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
             float distanceToLight = vectorToLight.length();
             vec3 directionToLight = vectorToLight / distanceToLight;
 
@@ -1908,15 +1940,15 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
 
             if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
-                hitRecord shadowHit = bvh.traverseRay(hit.hitPoint, directionToLight, r.time, spheres, triangles, distanceToLight * 0.999f);
+                float transmittance = mediumTransmittance(bvh, scatterOrigin, directionToLight, r.time, spheres, triangles, distanceToLight * 0.999f);
 
-                if (!shadowHit.didHit) {
+                if (transmittance > 0.0f) {
                     float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
                     vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
                     float scatterPdf = scatteredIsotropically ? isotropicPhasePdf() : lambertianCosinePdf(cosineAtSurface);
                     float scatterValue = scatteredIsotropically ? isotropicPhasePdf() : cosineAtSurface / MONOCUDA_PI;
                     float neeWeight = powerHeuristic(solidAnglePdf, scatterPdf);
-                    sampleColor = sampleColor + attenuation * lightColor * (scatterValue / solidAnglePdf) * neeWeight;
+                    sampleColor = sampleColor + attenuation * lightColor * (scatterValue / solidAnglePdf) * neeWeight * transmittance;
                 }
             }
         }
@@ -1960,7 +1992,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         previousBounceWasSpecular = (hit.mat.type != MaterialType::Lambertian && hit.mat.type != MaterialType::Isotropic);
         previousBsdfPdf = (hit.mat.type == MaterialType::Isotropic) ? isotropicPhasePdf()
                                                                    : lambertianCosinePdf(fmaxf(newDirection.dot(hit.hitNormal), 0.0f));
-        r = Ray(hit.hitPoint, newDirection, r.time);
+        r = Ray(scatterOrigin, newDirection, r.time);
     }
     // to reduce firefly points
     float brightestChannel = fmaxf(sampleColor.x,fmaxf(sampleColor.y,sampleColor.z));
@@ -2059,6 +2091,7 @@ struct WavefrontRenderContext {
     dim3 blockDimensions;
 
     bool usePersistentThreads = false;
+    bool sceneHasMedium = false;
 };
 
 template <typename ElementType>
@@ -2394,10 +2427,27 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         return;
     }
 
+    curandState randomNumberState = randomNumberStates[pathIndex];
+
+    vec3 scatterOrigin = hitPoint;
+    if (material.type == MaterialType::Isotropic) {
+        float scatterDistance = frontFace ? packedHit.hitDistance
+                                          : -logf(1.0f - curand_uniform(&randomNumberState)) / material.density;
+        if (scatterDistance >= packedHit.hitDistance) {
+            pathState.rayOriginX[pathIndex] = hitPoint.x;
+            pathState.rayOriginY[pathIndex] = hitPoint.y;
+            pathState.rayOriginZ[pathIndex] = hitPoint.z;
+
+            int passThroughSlot = atomicAdd(nextQueue.itemCount, 1);
+            nextQueue.pathIndices[passThroughSlot] = pathIndex;
+            randomNumberStates[pathIndex] = randomNumberState;
+            return;
+        }
+        scatterOrigin = rayOriginAtHit + incomingRayDirection * scatterDistance;
+    }
+
     // throughput (with albedo)
     throughput = throughput * sampleTexture(material.albedoTexture, hitU, hitV);
-
-    curandState randomNumberState = randomNumberStates[pathIndex];
 
     // NEE again same as before !
     if ((material.type == MaterialType::Lambertian || material.type == MaterialType::Isotropic) && lightCount > 0) {
@@ -2406,7 +2456,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         float lightSelectionProbability = 1.0f / float(lightCount);
 
         vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &randomNumberState);
-        vec3 vectorToLight = sampledPointOnLight - hitPoint;
+        vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
         float distanceToLight = vectorToLight.length();
         vec3 directionToLight = vectorToLight / distanceToLight;
 
@@ -2424,9 +2474,9 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
             vec3 contribution = throughput * lightColor * (scatterValue / solidAnglePdf) * neeWeight;
 
             int shadowSlot = atomicAdd(shadowQueue.itemCount, 1);
-            shadowQueue.originX[shadowSlot] = hitPoint.x;
-            shadowQueue.originY[shadowSlot] = hitPoint.y;
-            shadowQueue.originZ[shadowSlot] = hitPoint.z;
+            shadowQueue.originX[shadowSlot] = scatterOrigin.x;
+            shadowQueue.originY[shadowSlot] = scatterOrigin.y;
+            shadowQueue.originZ[shadowSlot] = scatterOrigin.z;
             shadowQueue.directionX[shadowSlot] = directionToLight.x;
             shadowQueue.directionY[shadowSlot] = directionToLight.y;
             shadowQueue.directionZ[shadowSlot] = directionToLight.z;
@@ -2476,9 +2526,9 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
                 break;
         }
 
-        pathState.rayOriginX[pathIndex] = hitPoint.x;
-        pathState.rayOriginY[pathIndex] = hitPoint.y;
-        pathState.rayOriginZ[pathIndex] = hitPoint.z;
+        pathState.rayOriginX[pathIndex] = scatterOrigin.x;
+        pathState.rayOriginY[pathIndex] = scatterOrigin.y;
+        pathState.rayOriginZ[pathIndex] = scatterOrigin.z;
         pathState.rayDirectionX[pathIndex] = newDirection.x;
         pathState.rayDirectionY[pathIndex] = newDirection.y;
         pathState.rayDirectionZ[pathIndex] = newDirection.z;
@@ -2497,7 +2547,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
 }
 
 __global__ void shadowKernel(BVH bvh, const sphere* spheres, const triangle* triangles,
-                             PathStateBuffers pathState, ShadowRayQueue shadowQueue)
+                             PathStateBuffers pathState, ShadowRayQueue shadowQueue, bool sceneHasMedium)
 {
     int shadowSlot = threadIdx.x + blockIdx.x * blockDim.x;
     if (shadowSlot >= *shadowQueue.itemCount) return;
@@ -2507,13 +2557,19 @@ __global__ void shadowKernel(BVH bvh, const sphere* spheres, const triangle* tri
     vec3 shadowRayDirection(shadowQueue.directionX[shadowSlot], shadowQueue.directionY[shadowSlot], shadowQueue.directionZ[shadowSlot]);
     float rayTime = pathState.rayTime[pathIndex];     // motion blur same as before
 
-    bool isOccluded = bvh.traverseAnyHit(shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
+    float transmittance;
+    if (sceneHasMedium) {
+        transmittance = mediumTransmittance(bvh, shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
+    } else {
+        bool isOccluded = bvh.traverseAnyHit(shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
+        transmittance = isOccluded ? 0.0f : 1.0f;
+    }
 
-    if (!isOccluded) {
+    if (transmittance > 0.0f) {
 
-        pathState.currentSampleRed[pathIndex] += shadowQueue.contributionRed[shadowSlot];
-        pathState.currentSampleGreen[pathIndex] += shadowQueue.contributionGreen[shadowSlot];
-        pathState.currentSampleBlue[pathIndex] += shadowQueue.contributionBlue[shadowSlot];
+        pathState.currentSampleRed[pathIndex] += shadowQueue.contributionRed[shadowSlot] * transmittance;
+        pathState.currentSampleGreen[pathIndex] += shadowQueue.contributionGreen[shadowSlot] * transmittance;
+        pathState.currentSampleBlue[pathIndex] += shadowQueue.contributionBlue[shadowSlot] * transmittance;
     }
 }
 
@@ -2601,7 +2657,7 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
             shadeKernel<<<blockCount, blockSize>>>(depth, context.camera.backround_color,context.spheres, context.triangles, context.lights, context.lightCount,context.randomNumberStates, pathState, hitResults, currentQueue, nextQueue, shadowQueue);
             CUDA_CHECK_KERNEL();
 
-            shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles,pathState, shadowQueue);
+                        shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, shadowQueue, context.sceneHasMedium);
             CUDA_CHECK_KERNEL();
 
             CUDA_CHECK(cudaMemcpy(&activePathCount, nextQueue.itemCount, sizeof(int), cudaMemcpyDeviceToHost));
@@ -2847,6 +2903,10 @@ int main(int argc,char** argv) {
         wavefrontContext.gridDimensions = grid;
         wavefrontContext.blockDimensions = block;
         wavefrontContext.usePersistentThreads = usePersistentThreads;
+        bool sceneHasMedium = false;
+        for (const sphere& s : scene.spheres)    if (s.mat.type == MaterialType::Isotropic) sceneHasMedium = true;
+        for (const triangle& t : scene.triangles) if (t.mat.type == MaterialType::Isotropic) sceneHasMedium = true;
+        wavefrontContext.sceneHasMedium = sceneHasMedium;
         renderWithWavefront(wavefrontContext);
     }else{
         for (int s = 0; s < cam.samples_per_pixel; s++) {
