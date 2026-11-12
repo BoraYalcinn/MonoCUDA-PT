@@ -188,12 +188,19 @@ struct Texture {
     cudaTextureObject_t imageHandle;   // for Image textures
 };
 
+__host__ __device__ inline float srgbToLinear(float encodedValue){
+    return encodedValue <= 0.04045f ? encodedValue / 12.92f : powf((encodedValue + 0.055f) / 1.055f, 2.4f);
+}
+__host__ __device__ inline vec3 srgbToLinear(const vec3& encodedColor){
+    return vec3(srgbToLinear(encodedColor.x), srgbToLinear(encodedColor.y), srgbToLinear(encodedColor.z));
+}
+
 __host__ __device__ Texture make_solid_texture(vec3 color) {
-    return Texture{TextureType::Solid, color, vec3(0,0,0), 1.f, 0};
+    return Texture{TextureType::Solid, srgbToLinear(color), vec3(0,0,0), 1.f, 0};
 }
 
 __host__ __device__ Texture make_checker_texture(vec3 colorA, vec3 colorB, float checkerScale) {
-    return Texture{TextureType::Checker, colorA, colorB, checkerScale, 0};
+    return Texture{TextureType::Checker, srgbToLinear(colorA), srgbToLinear(colorB), checkerScale, 0};
 }
 
 __device__ vec3 sampleTexture(const Texture& texture, float u, float v) {
@@ -2013,6 +2020,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
     accumBuffer[pixel_index] = accumBuffer[pixel_index] + sampleColor;
     rngStates[pixel_index] = rngState;
 }
+
 
 __device__ float linearToSrgb(float linearValue){
     linearValue = fmaxf(linearValue,0.0f);
