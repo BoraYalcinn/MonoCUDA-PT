@@ -2657,7 +2657,7 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
             shadeKernel<<<blockCount, blockSize>>>(depth, context.camera.backround_color,context.spheres, context.triangles, context.lights, context.lightCount,context.randomNumberStates, pathState, hitResults, currentQueue, nextQueue, shadowQueue);
             CUDA_CHECK_KERNEL();
 
-                        shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, shadowQueue, context.sceneHasMedium);
+            shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, shadowQueue, context.sceneHasMedium);
             CUDA_CHECK_KERNEL();
 
             CUDA_CHECK(cudaMemcpy(&activePathCount, nextQueue.itemCount, sizeof(int), cudaMemcpyDeviceToHost));
