@@ -39,7 +39,7 @@ def read_hdr(path):
     cursor = 0
     for row in range(height):
         # new style run length encoding: 2, 2, width_hi, width_lo, then 4 planes of runs
-        if width >= 8 and width < 32768 and raw[cursor] == 2 and raw[cursor + 1] == 2 and (raw[cursor + 2] << 8 | raw[cursor + 3]) == width:
+        if width >= 8 and width < 32768 and raw[cursor] == 2 and raw[cursor + 1] == 2 and (int(raw[cursor + 2]) << 8 | int(raw[cursor + 3])) == width:
             cursor += 4
             for channel in range(4):
                 column = 0

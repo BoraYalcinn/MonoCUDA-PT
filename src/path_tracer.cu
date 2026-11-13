@@ -20,6 +20,9 @@
 #include <vector>
 #include <algorithm>
 
+#include "minipbrt.h"
+#include "image_io.h"
+
 #if defined(__unix__) || defined(__APPLE__)
     #include <unistd.h>
     #define MONOCUDA_IS_TERMINAL(fileDescriptor) isatty(fileDescriptor)
@@ -626,6 +629,8 @@ __device__ vec3 computeTriangleShadingNormal(const triangle& hitTriangle, const 
     float weightOfVertex1 = (hitTriangle.v0 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
     float weightOfVertex2 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
 
+    float weightSum = weightOfVertex0 + weightOfVertex1 + weightOfVertex2;
+    if (!(weightSum > 0.0f) || weightSum > 1.01f) return faceNormal;
     vec3 shadingNormal = hitTriangle.n0 * weightOfVertex0 + hitTriangle.n1 * weightOfVertex1 + hitTriangle.n2 * weightOfVertex2;
     if (shadingNormal.length_squared() < 1e-12f) return faceNormal;
     shadingNormal = shadingNormal.normalize();
@@ -1579,21 +1584,33 @@ static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m
     add_quad(s, p[2], p[3], p[7], p[6], m);  // +y
 }
 
-enum class SceneChoice {Cornell, Sponza, Bunny, Dragon, LivingRoom, Sibenik, Sphere};
-static const char* sceneNames[] = {"cornell", "sponza", "bunny", "dragon", "living_room", "sibenik", "sphere"};
+enum class SceneChoice {Cornell, Sponza, Bunny, Dragon, LivingRoom, Sibenik, Sphere, Barcelona, Bathroom, Book, SanMiguel, Pbrt};
+static const char* sceneNames[] = {"cornell", "sponza", "bunny", "dragon", "living_room", "sibenik", "sphere", "barcelona", "bathroom", "book", "sanmiguel", "pbrt"};
+static const char* scenePbrtPaths[] = {"", "", "", "", "", "", "",
+    "models/pbrt-v3-scenes/barcelona-pavilion/pavilion-day.pbrt",
+    "models/pbrt-v3-scenes/contemporary-bathroom/contemporary-bathroom.pbrt",
+    "models/pbrt-v3-scenes/pbrt-book/book.pbrt",
+    "models/pbrt-v3-scenes/sanmiguel/sanmiguel.pbrt", ""};
 static const char* sceneDescriptions[] = {
     "Cornell box (small scene with a smoke sphere)",
-    "Sponza atrium (262k triangles, needs models/sponza.obj)",
+    "Sponza atrium (262k triangles, needs models/sponza/sponza.obj)",
     "Stanford bunny in the Cornell box (144k triangles, needs models/bunny/bunny.obj)",
     "Stanford dragon in the Cornell box (871k triangles, needs models/dragon/dragon.obj)",
     "Living room (580k triangles, needs models/living_room/living_room.obj)",
     "Sibenik cathedral (75k triangles, needs models/sibenik/sibenik.obj)",
-    "Textured UV sphere in the Cornell box (8k triangles, needs models/sphere/sphere-cylcoords-16k.obj)"
+    "Textured UV sphere in the Cornell box (8k triangles, needs models/sphere/sphere-cylcoords-16k.obj)",
+    "Barcelona pavilion, pbrt-v3 (130k triangles, sky from an EXR environment map)",
+    "Contemporary bathroom, pbrt-v3 (536k triangles, lit through the window blinds)",
+    "The pbrt book cover, pbrt-v3 (23k triangles, two spherical area lights)",
+    "San Miguel courtyard, pbrt-v3 (10.5M triangles, needs about 3 GB)",
+    "pbrt-v3 scene file (camera, lights and materials come from the file, pass it with --pbrt)"
 };
-static const int sceneCount = 7;
+static const int sceneCount = 12;
 
 // == FORWARD DECLERATIONS =======================================================
 static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians);
+static std::string getDirectoryOfFile(const std::string& filePath);
+static cudaTextureObject_t getOrLoadObjTexture(hostScene& scene,const std::string& ppmPath,const std::string& originalPath,std::map<std::string,cudaTextureObject_t>& textureCache);
 // ===============================================================================
 
 __host__ void buildCornellRoom(hostScene& scene) {
@@ -1677,8 +1694,8 @@ static bool g_environmentEnabled = false;
 
 __host__ void buildSponzaScene(hostScene& scene){
     Material wallMaterial = make_lambertian(vec3(0.75f, 0.72f, 0.68f));
-    if (!loadObject(scene, "models/sponza.obj", wallMaterial, vec3(0.f, 0.f, 0.f), 37.f, 0.f)){
-        std::fprintf(stderr, "could not load models/sponza.obj\n");
+    if (!loadObject(scene, "models/sponza/sponza.obj", wallMaterial, vec3(0.f, 0.f, 0.f), 37.f, 0.f)){
+        std::fprintf(stderr, "could not load models/sponza/sponza.obj\n");
         std::exit(EXIT_FAILURE);
     }
 
@@ -1693,6 +1710,89 @@ __host__ void buildSponzaScene(hostScene& scene){
     }
 }
 
+// minipbrt brings a ply reader along, so a mesh can be dropped into one of the
+// built-in scenes without going through a wavefront obj first. Placement matches
+// loadObject: centred on x/z, lowest point at y = 0, largest side scaled to
+// uniformScale, then rotated around y and translated.
+static bool loadPlyObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians){
+    minipbrt::PLYMesh plyShape;
+    size_t pathLength = std::strlen(filePath);
+    plyShape.filename = new char[pathLength + 1];
+    std::memcpy(plyShape.filename, filePath, pathLength + 1);
+
+    minipbrt::TriangleMesh* mesh = plyShape.triangle_mesh();
+    if (!mesh) return false;
+
+    vec3 boxMin(mesh->P[0], mesh->P[1], mesh->P[2]);
+    vec3 boxMax = boxMin;
+    for (unsigned int vertexIndex = 1; vertexIndex < mesh->num_vertices; vertexIndex++){
+        const float* position = &mesh->P[vertexIndex * 3];
+        boxMin = vec3(fminf(boxMin.x, position[0]), fminf(boxMin.y, position[1]), fminf(boxMin.z, position[2]));
+        boxMax = vec3(fmaxf(boxMax.x, position[0]), fmaxf(boxMax.y, position[1]), fmaxf(boxMax.z, position[2]));
+    }
+    vec3 modelSize = boxMax - boxMin;
+    float largestSide = fmaxf(modelSize.x, fmaxf(modelSize.y, modelSize.z));
+    if (largestSide <= 0.f){
+        delete mesh;
+        return false;
+    }
+    vec3 bottomCenter((boxMin.x + boxMax.x) * 0.5f, boxMin.y, (boxMin.z + boxMax.z) * 0.5f);
+    float cosine = cosf(rotationAroundYRadians);
+    float sine = sinf(rotationAroundYRadians);
+
+    std::vector<vec3> transformedPositions(mesh->num_vertices);
+    std::vector<vec3> transformedNormals(mesh->N ? mesh->num_vertices : 0);
+    for (unsigned int vertexIndex = 0; vertexIndex < mesh->num_vertices; vertexIndex++){
+        const float* position = &mesh->P[vertexIndex * 3];
+        vec3 normalizedPosition = (vec3(position[0], position[1], position[2]) - bottomCenter) * (uniformScale / largestSide);
+        transformedPositions[vertexIndex] = vec3(normalizedPosition.x * cosine + normalizedPosition.z * sine, normalizedPosition.y, -normalizedPosition.x * sine + normalizedPosition.z * cosine) + translation;
+        if (mesh->N){
+            const float* normal = &mesh->N[vertexIndex * 3];
+            vec3 rotatedNormal(normal[0] * cosine + normal[2] * sine, normal[1], -normal[0] * sine + normal[2] * cosine);
+            if (rotatedNormal.length_squared() > 0.f) transformedNormals[vertexIndex] = rotatedNormal.normalize();
+        }
+    }
+
+    int addedTriangleCount = 0;
+    int skippedFaceCount = 0;
+    for (unsigned int cornerIndex = 0; cornerIndex + 2 < mesh->num_indices; cornerIndex += 3){
+        int cornerIndices[3] = {mesh->indices[cornerIndex], mesh->indices[cornerIndex + 1], mesh->indices[cornerIndex + 2]};
+        bool isValid = true;
+        for (int corner = 0; corner < 3; corner++){
+            if (cornerIndices[corner] < 0 || cornerIndices[corner] >= (int)mesh->num_vertices) isValid = false;
+        }
+        if (!isValid){
+            skippedFaceCount++;
+            continue;
+        }
+        vec3 vertex0 = transformedPositions[cornerIndices[0]];
+        vec3 vertex1 = transformedPositions[cornerIndices[1]];
+        vec3 vertex2 = transformedPositions[cornerIndices[2]];
+        if ((vertex1 - vertex0).cross(vertex2 - vertex0).length() < 1e-9f){
+            skippedFaceCount++;
+            continue;
+        }
+        triangle objectTriangle(vertex0, vertex1, vertex2, mat);
+        if (mesh->uv){
+            vec2* uvTargets[3] = {&objectTriangle.uv0, &objectTriangle.uv1, &objectTriangle.uv2};
+            for (int corner = 0; corner < 3; corner++){
+                const float* uv = &mesh->uv[cornerIndices[corner] * 2];
+                *uvTargets[corner] = vec2(uv[0], uv[1]);
+            }
+        }
+        if (mesh->N){
+            vec3* normalTargets[3] = {&objectTriangle.n0, &objectTriangle.n1, &objectTriangle.n2};
+            for (int corner = 0; corner < 3; corner++) *normalTargets[corner] = transformedNormals[cornerIndices[corner]];
+        }
+        scene.triangles.push_back(objectTriangle);
+        addedTriangleCount++;
+    }
+    delete mesh;
+
+    printf("PLY '%s': %d triangles added, %d faces skipped\n", filePath, addedTriangleCount, skippedFaceCount);
+    return addedTriangleCount > 0;
+}
+
 __host__ void buildBunnyScene(hostScene& scene){
     buildCornellRoom(scene);
     Material bunnyMaterial = make_lambertian(vec3(0.75f, 0.75f, 0.75f));
@@ -1704,9 +1804,9 @@ __host__ void buildBunnyScene(hostScene& scene){
 
 __host__ void buildDragonScene(hostScene& scene){
     buildCornellRoom(scene);
-    Material dragonMaterial = make_lambertian(vec3(0.75f, 0.75f, 0.75f));
-    if (!loadObject(scene, "models/dragon/dragon.obj", dragonMaterial, vec3(0.f, 0.f, -2.f), 3.f, MONOCUDA_PI * 0.5f)){
-        std::fprintf(stderr, "could not load models/dragon/dragon.obj\n");
+    Material dragonMaterial = make_conductor(vec3(0.95f, 0.78f, 0.45f), 0.04f);
+    if (!loadPlyObject(scene, "models/pbrt-v3-scenes/dragon/geometry/dragon_remeshed.ply", dragonMaterial, vec3(-0.1f, 0.f, -2.4f), 2.4f, MONOCUDA_PI * 0.62f)){
+        std::fprintf(stderr, "could not load models/pbrt-v3-scenes/dragon/geometry/dragon_remeshed.ply\n");
         std::exit(EXIT_FAILURE);
     }
 }
@@ -1795,6 +1895,499 @@ __host__ void finalizeScene(hostScene& scene){
     }
 }
 
+// ============================================================================
+// === PBRT SCENE LOADING ===
+// ============================================================================
+// pbrt-v3 files are parsed by minipbrt; what comes out is flattened into the
+// same hostScene the built-in scenes use, geometry and camera taken as they are.
+// Colors in pbrt files are already linear, so the solid textures are built
+// directly instead of through make_solid_texture (which expects sRGB).
+struct PbrtSceneSettings {
+    bool hasCamera = false;
+    vec3 lookFrom;
+    vec3 lookAt;
+    vec3 up;
+    float verticalFovDegrees = 40.f;
+    int imageWidth = 0;
+    int imageHeight = 0;
+    vec3 backgroundColor;
+    std::string environmentPath;
+    float environmentIntensity = 1.f;
+    float environmentRotationDegrees = 0.f;
+};
+static std::string g_pbrtPath;
+static PbrtSceneSettings g_pbrtSettings;
+static long long g_pbrtTriangleBudget = 0;
+
+// Instances are expanded into real triangles, so a scene that pbrt renders from a
+// handful of instanced meshes can turn into hundreds of millions of them here. At
+// 272 bytes per triangle on the host that runs the machine out of memory, and the
+// process is killed before anything is drawn. Counting first turns that into a
+// message. The default budget is what the free device memory can hold.
+static long long pbrtDefaultTriangleBudget(){
+    size_t freeDeviceMemory = 0, totalDeviceMemory = 0;
+    if (cudaMemGetInfo(&freeDeviceMemory, &totalDeviceMemory) != cudaSuccess) return 20000000ll;
+    const long long bytesPerTriangleOnDevice = (long long)sizeof(triangle) + 96ll;   // triangle, bvh node and sorted reference
+    return (long long)((double)freeDeviceMemory * 0.75 / (double)bytesPerTriangleOnDevice);
+}
+
+static long long pbrtCountTriangles(const minipbrt::Scene* pbrtScene){
+    std::vector<long long> trianglesOfShape(pbrtScene->shapes.size(), 0);
+    for (size_t shapeIndex = 0; shapeIndex < pbrtScene->shapes.size(); shapeIndex++){
+        const minipbrt::Shape* shape = pbrtScene->shapes[shapeIndex];
+        if (shape->type() == minipbrt::ShapeType::TriangleMesh){
+            trianglesOfShape[shapeIndex] = static_cast<const minipbrt::TriangleMesh*>(shape)->num_indices / 3;
+        } else if (shape->type() == minipbrt::ShapeType::Sphere){
+            trianglesOfShape[shapeIndex] = 1;
+        }
+    }
+    long long triangleCount = 0;
+    for (size_t shapeIndex = 0; shapeIndex < pbrtScene->shapes.size(); shapeIndex++){
+        if (pbrtScene->shapes[shapeIndex]->object == minipbrt::kInvalidIndex) triangleCount += trianglesOfShape[shapeIndex];
+    }
+    for (size_t instanceIndex = 0; instanceIndex < pbrtScene->instances.size(); instanceIndex++){
+        const minipbrt::Instance* instance = pbrtScene->instances[instanceIndex];
+        if (instance->object == minipbrt::kInvalidIndex || instance->object >= pbrtScene->objects.size()) continue;
+        const minipbrt::Object* object = pbrtScene->objects[instance->object];
+        for (unsigned int shapeOffset = 0; shapeOffset < object->numShapes; shapeOffset++){
+            uint32_t shapeIndex = object->firstShape + shapeOffset;
+            if (shapeIndex < trianglesOfShape.size()) triangleCount += trianglesOfShape[shapeIndex];
+        }
+    }
+    return triangleCount;
+}
+
+static void pbrtMultiply(const float a[4][4], const float b[4][4], float out[4][4]){
+    for (int row = 0; row < 4; row++){
+        for (int column = 0; column < 4; column++){
+            out[row][column] = a[row][0] * b[0][column] + a[row][1] * b[1][column] + a[row][2] * b[2][column] + a[row][3] * b[3][column];
+        }
+    }
+}
+
+static vec3 pbrtTransformPoint(const float m[4][4], const vec3& p){
+    return vec3(m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
+                m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
+                m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3]);
+}
+
+static vec3 pbrtTransformVector(const float m[4][4], const vec3& v){
+    return vec3(m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
+                m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
+                m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z);
+}
+
+static Texture pbrtLinearSolidTexture(const vec3& color){
+    return Texture{TextureType::Solid, color, vec3(0,0,0), 1.f, 0};
+}
+
+static std::string pbrtResolvePath(const std::string& baseDirectory, const char* fileName){
+    if (!fileName) return "";
+    std::string path = fileName;
+    if (!path.empty() && path[0] == '/') return path;
+    FILE* probe = fopen(path.c_str(), "rb");
+    if (probe){
+        fclose(probe);
+        return path;
+    }
+    return baseDirectory + "/" + path;
+}
+
+static Texture pbrtColorTexture(const minipbrt::Scene* pbrtScene, const minipbrt::ColorTex& colorTex, const std::string& baseDirectory, hostScene& scene, std::map<std::string,cudaTextureObject_t>& textureCache, int& unsupportedTextureCount){
+    vec3 color(colorTex.value[0], colorTex.value[1], colorTex.value[2]);
+    if (colorTex.texture != minipbrt::kInvalidIndex && colorTex.texture < pbrtScene->textures.size()){
+        const minipbrt::Texture* texture = pbrtScene->textures[colorTex.texture];
+        if (texture->type() == minipbrt::TextureType::ImageMap){
+            const minipbrt::ImageMapTexture* imageMap = static_cast<const minipbrt::ImageMapTexture*>(texture);
+            std::string imagePath = pbrtResolvePath(baseDirectory, imageMap->filename);
+            cudaTextureObject_t textureHandle = getOrLoadObjTexture(scene, imagePath, imagePath, textureCache);
+            if (textureHandle != 0) return make_image_texture(textureHandle);
+        } else if (texture->type() == minipbrt::TextureType::Constant){
+            const minipbrt::ConstantTexture* constant = static_cast<const minipbrt::ConstantTexture*>(texture);
+            color = vec3(constant->value[0], constant->value[1], constant->value[2]);
+        } else if (texture->type() == minipbrt::TextureType::Scale){
+            const minipbrt::ScaleTexture* scaleTexture = static_cast<const minipbrt::ScaleTexture*>(texture);
+            return pbrtColorTexture(pbrtScene, scaleTexture->tex1, baseDirectory, scene, textureCache, unsupportedTextureCount);
+        } else {
+            unsupportedTextureCount++;
+        }
+    }
+    return pbrtLinearSolidTexture(color);
+}
+
+// reflectance of a conductor at normal incidence from its complex index of refraction
+static vec3 pbrtConductorColor(const float eta[3], const float k[3]){
+    vec3 color;
+    float* channels[3] = {&color.x, &color.y, &color.z};
+    for (int channel = 0; channel < 3; channel++){
+        float etaMinus = eta[channel] - 1.0f;
+        float etaPlus = eta[channel] + 1.0f;
+        float kSquared = k[channel] * k[channel];
+        *channels[channel] = (etaMinus * etaMinus + kSquared) / (etaPlus * etaPlus + kSquared);
+    }
+    return color;
+}
+
+static Material pbrtMaterial(const minipbrt::Scene* pbrtScene, uint32_t materialIndex, const std::string& baseDirectory, hostScene& scene, std::map<std::string,cudaTextureObject_t>& textureCache, int& unsupportedTextureCount, std::set<std::string>& approximatedMaterials){
+    Material fallback = Material{MaterialType::Lambertian, pbrtLinearSolidTexture(vec3(0.5f, 0.5f, 0.5f)), vec3(0,0,0), 0.f, 0.f, 0.f};
+    if (materialIndex == minipbrt::kInvalidIndex || materialIndex >= pbrtScene->materials.size()) return fallback;
+
+    const minipbrt::Material* material = pbrtScene->materials[materialIndex];
+    switch (material->type()){
+        case minipbrt::MaterialType::Matte: {
+            const minipbrt::MatteMaterial* matte = static_cast<const minipbrt::MatteMaterial*>(material);
+            return make_lambertian(pbrtColorTexture(pbrtScene, matte->Kd, baseDirectory, scene, textureCache, unsupportedTextureCount));
+        }
+        case minipbrt::MaterialType::Plastic: {
+            const minipbrt::PlasticMaterial* plastic = static_cast<const minipbrt::PlasticMaterial*>(material);
+            approximatedMaterials.insert("plastic");
+            return make_lambertian(pbrtColorTexture(pbrtScene, plastic->Kd, baseDirectory, scene, textureCache, unsupportedTextureCount));
+        }
+        case minipbrt::MaterialType::Substrate: {
+            const minipbrt::SubstrateMaterial* substrate = static_cast<const minipbrt::SubstrateMaterial*>(material);
+            approximatedMaterials.insert("substrate");
+            return make_lambertian(pbrtColorTexture(pbrtScene, substrate->Kd, baseDirectory, scene, textureCache, unsupportedTextureCount));
+        }
+        case minipbrt::MaterialType::Uber: {
+            const minipbrt::UberMaterial* uber = static_cast<const minipbrt::UberMaterial*>(material);
+            approximatedMaterials.insert("uber");
+            return make_lambertian(pbrtColorTexture(pbrtScene, uber->Kd, baseDirectory, scene, textureCache, unsupportedTextureCount));
+        }
+        case minipbrt::MaterialType::Disney: {
+            const minipbrt::DisneyMaterial* disney = static_cast<const minipbrt::DisneyMaterial*>(material);
+            approximatedMaterials.insert("disney");
+            return make_lambertian(pbrtColorTexture(pbrtScene, disney->color, baseDirectory, scene, textureCache, unsupportedTextureCount));
+        }
+        case minipbrt::MaterialType::Glass: {
+            const minipbrt::GlassMaterial* glass = static_cast<const minipbrt::GlassMaterial*>(material);
+            return make_dielectric(glass->eta.value);
+        }
+        case minipbrt::MaterialType::Mirror: {
+            const minipbrt::MirrorMaterial* mirror = static_cast<const minipbrt::MirrorMaterial*>(material);
+            return Material{MaterialType::Conductor, pbrtLinearSolidTexture(vec3(mirror->Kr.value[0], mirror->Kr.value[1], mirror->Kr.value[2])), vec3(0,0,0), 0.f, 0.f, 0.f};
+        }
+        case minipbrt::MaterialType::Metal: {
+            const minipbrt::MetalMaterial* metal = static_cast<const minipbrt::MetalMaterial*>(material);
+            float fuzz = fminf(fmaxf(metal->uroughness.value, 0.f), 1.f);
+            return Material{MaterialType::Conductor, pbrtLinearSolidTexture(pbrtConductorColor(metal->eta.value, metal->k.value)), vec3(0,0,0), fuzz, 0.f, 0.f};
+        }
+        case minipbrt::MaterialType::Mix: {
+            const minipbrt::MixMaterial* mix = static_cast<const minipbrt::MixMaterial*>(material);
+            approximatedMaterials.insert("mix");
+            return pbrtMaterial(pbrtScene, mix->namedmaterial1, baseDirectory, scene, textureCache, unsupportedTextureCount, approximatedMaterials);
+        }
+        default:
+            approximatedMaterials.insert(material->name ? material->name : "unnamed");
+            return fallback;
+    }
+}
+
+static Material pbrtMediumMaterial(const minipbrt::Medium* medium){
+    vec3 albedo;
+    float density = 0.f;
+    float* albedoChannels[3] = {&albedo.x, &albedo.y, &albedo.z};
+    for (int channel = 0; channel < 3; channel++){
+        float extinction = (medium->sigma_a[channel] + medium->sigma_s[channel]) * medium->scale;
+        *albedoChannels[channel] = extinction > 0.f ? medium->sigma_s[channel] * medium->scale / extinction : 0.f;
+        density += extinction / 3.f;
+    }
+    return Material{MaterialType::Isotropic, pbrtLinearSolidTexture(albedo), vec3(0,0,0), 0.f, 0.f, density};
+}
+
+static int pbrtAddMesh(hostScene& scene, const minipbrt::TriangleMesh* mesh, const float toWorld[4][4], const Material& material){
+    int addedTriangleCount = 0;
+    for (unsigned int triangleIndex = 0; triangleIndex + 2 < mesh->num_indices; triangleIndex += 3){
+        int cornerIndices[3] = {mesh->indices[triangleIndex], mesh->indices[triangleIndex + 1], mesh->indices[triangleIndex + 2]};
+        bool isValid = true;
+        for (int corner = 0; corner < 3; corner++){
+            if (cornerIndices[corner] < 0 || cornerIndices[corner] >= (int)mesh->num_vertices) isValid = false;
+        }
+        if (!isValid) continue;
+
+        vec3 corners[3];
+        for (int corner = 0; corner < 3; corner++){
+            const float* position = &mesh->P[cornerIndices[corner] * 3];
+            corners[corner] = (pbrtTransformPoint(toWorld, vec3(position[0], position[1], position[2])));
+        }
+        if ((corners[1] - corners[0]).cross(corners[2] - corners[0]).length_squared() < 1e-24f) continue;
+
+        triangle objectTriangle(corners[0], corners[1], corners[2], material);
+        if (mesh->uv){
+            vec2* uvTargets[3] = {&objectTriangle.uv0, &objectTriangle.uv1, &objectTriangle.uv2};
+            for (int corner = 0; corner < 3; corner++){
+                const float* uv = &mesh->uv[cornerIndices[corner] * 2];
+                *uvTargets[corner] = vec2(uv[0], uv[1]);
+            }
+        }
+        if (mesh->N){
+            vec3* normalTargets[3] = {&objectTriangle.n0, &objectTriangle.n1, &objectTriangle.n2};
+            for (int corner = 0; corner < 3; corner++){
+                const float* normal = &mesh->N[cornerIndices[corner] * 3];
+                vec3 worldNormal = (pbrtTransformVector(toWorld, vec3(normal[0], normal[1], normal[2])));
+                if (worldNormal.length_squared() > 0.f) *normalTargets[corner] = worldNormal.normalize();
+            }
+        }
+        scene.triangles.push_back(objectTriangle);
+        addedTriangleCount++;
+    }
+    return addedTriangleCount;
+}
+
+// pbrt keeps spheres as quadrics and minipbrt does not triangulate them. A sphere
+// that emits has to become triangles so finalizeScene() picks it up as an area
+// light, every other one goes in as the renderer's own sphere primitive.
+static int pbrtAddTessellatedSphere(hostScene& scene, const vec3& center, float radius, const Material& material){
+    const int meridianCount = 32;
+    const int parallelCount = 16;
+    int addedTriangleCount = 0;
+    for (int parallel = 0; parallel < parallelCount; parallel++){
+        float theta0 = MONOCUDA_PI * parallel / parallelCount;
+        float theta1 = MONOCUDA_PI * (parallel + 1) / parallelCount;
+        for (int meridian = 0; meridian < meridianCount; meridian++){
+            float phi0 = 2.f * MONOCUDA_PI * meridian / meridianCount;
+            float phi1 = 2.f * MONOCUDA_PI * (meridian + 1) / meridianCount;
+            vec3 corners[4];
+            float thetas[4] = {theta0, theta1, theta1, theta0};
+            float phis[4] = {phi0, phi0, phi1, phi1};
+            for (int corner = 0; corner < 4; corner++){
+                corners[corner] = center + vec3(sinf(thetas[corner]) * cosf(phis[corner]), cosf(thetas[corner]), sinf(thetas[corner]) * sinf(phis[corner])) * radius;
+            }
+            int cornerIndices[2][3] = {{0, 1, 2}, {0, 2, 3}};
+            for (int triangleIndex = 0; triangleIndex < 2; triangleIndex++){
+                vec3 v0 = corners[cornerIndices[triangleIndex][0]];
+                vec3 v1 = corners[cornerIndices[triangleIndex][1]];
+                vec3 v2 = corners[cornerIndices[triangleIndex][2]];
+                if ((v1 - v0).cross(v2 - v0).length_squared() < 1e-24f) continue;
+                scene.triangles.push_back(triangle(v0, v1, v2, material));
+                addedTriangleCount++;
+            }
+        }
+    }
+    return addedTriangleCount;
+}
+
+// shape, area light and medium of one shape placed with a given transform
+static int pbrtAddShape(hostScene& scene, const minipbrt::Scene* pbrtScene, const minipbrt::Shape* shape, const float toWorld[4][4], uint32_t areaLightOverride,
+                        const std::string& baseDirectory, std::map<std::string,cudaTextureObject_t>& textureCache, std::map<uint32_t,Material>& materialCache,
+                        int& unsupportedTextureCount, std::set<std::string>& approximatedMaterials, int& skippedShapeCount){
+    if (shape->type() != minipbrt::ShapeType::TriangleMesh && shape->type() != minipbrt::ShapeType::Sphere){
+        skippedShapeCount++;
+        return 0;
+    }
+
+    Material material;
+    uint32_t areaLightIndex = (areaLightOverride != minipbrt::kInvalidIndex) ? areaLightOverride : shape->areaLight;
+    if (areaLightIndex != minipbrt::kInvalidIndex && areaLightIndex < pbrtScene->areaLights.size()){
+        const minipbrt::AreaLight* areaLight = pbrtScene->areaLights[areaLightIndex];
+        const minipbrt::DiffuseAreaLight* diffuse = static_cast<const minipbrt::DiffuseAreaLight*>(areaLight);
+        material = make_emissive(vec3(diffuse->L[0] * diffuse->scale[0], diffuse->L[1] * diffuse->scale[1], diffuse->L[2] * diffuse->scale[2]));
+    } else if (shape->insideMedium != minipbrt::kInvalidIndex && shape->insideMedium < pbrtScene->mediums.size()){
+        material = pbrtMediumMaterial(pbrtScene->mediums[shape->insideMedium]);
+    } else {
+        bool isInvisibleInterface = shape->material != minipbrt::kInvalidIndex && shape->material < pbrtScene->materials.size()
+                                 && pbrtScene->materials[shape->material]->type() == minipbrt::MaterialType::None;
+        if (isInvisibleInterface){
+            skippedShapeCount++;
+            return 0;
+        }
+        std::map<uint32_t,Material>::iterator cached = materialCache.find(shape->material);
+        if (cached == materialCache.end()){
+            material = pbrtMaterial(pbrtScene, shape->material, baseDirectory, scene, textureCache, unsupportedTextureCount, approximatedMaterials);
+            materialCache[shape->material] = material;
+        } else {
+            material = cached->second;
+        }
+    }
+
+    if (shape->type() == minipbrt::ShapeType::Sphere){
+        const minipbrt::Sphere* pbrtSphere = static_cast<const minipbrt::Sphere*>(shape);
+        vec3 center = pbrtTransformPoint(toWorld, vec3(0.f, 0.f, 0.f));
+        float axisLengths[3];
+        for (int axis = 0; axis < 3; axis++){
+            vec3 unitAxis(axis == 0 ? 1.f : 0.f, axis == 1 ? 1.f : 0.f, axis == 2 ? 1.f : 0.f);
+            axisLengths[axis] = pbrtTransformVector(toWorld, unitAxis).length();
+        }
+        float radius = pbrtSphere->radius * (axisLengths[0] + axisLengths[1] + axisLengths[2]) / 3.f;
+        if (radius <= 0.f){
+            skippedShapeCount++;
+            return 0;
+        }
+        if (material.type == MaterialType::Emissive) return pbrtAddTessellatedSphere(scene, center, radius, material);
+        scene.spheres.push_back(sphere(center, radius, material));
+        return 1;
+    }
+
+    const minipbrt::TriangleMesh* mesh = static_cast<const minipbrt::TriangleMesh*>(shape);
+    return pbrtAddMesh(scene, mesh, toWorld, material);
+}
+
+static bool loadPbrtScene(hostScene& scene, const char* filePath){
+    minipbrt::Loader loader;
+    if (!loader.load(filePath)){
+        const minipbrt::Error* error = loader.error();
+        std::fprintf(stderr, "pbrt '%s': %s", filePath, error ? error->message() : "parse error");
+        if (error && error->has_line_and_column()) std::fprintf(stderr, " (line %lld, column %lld)", (long long)error->line(), (long long)error->column());
+        std::fprintf(stderr, "\n");
+        return false;
+    }
+    minipbrt::Scene* pbrtScene = loader.borrow_scene();
+    pbrtScene->load_all_ply_meshes(false);
+    pbrtScene->all_to_triangle_mesh(false);
+
+    long long triangleBudget = g_pbrtTriangleBudget > 0 ? g_pbrtTriangleBudget : pbrtDefaultTriangleBudget();
+    long long triangleCount = pbrtCountTriangles(pbrtScene);
+    if (triangleCount > triangleBudget){
+        std::fprintf(stderr, "pbrt '%s': the scene expands to %lld triangles, more than the %lld that fit (instances are flattened, %zu bytes each).\n",
+                     filePath, triangleCount, triangleBudget, sizeof(triangle));
+        std::fprintf(stderr, "  raise it with --max-triangles N if there is memory for it, or render a variant of the scene with less instanced geometry.\n");
+        return false;
+    }
+
+    std::string baseDirectory = getDirectoryOfFile(filePath);
+    std::map<std::string,cudaTextureObject_t> textureCache;
+    std::map<uint32_t,Material> materialCache;
+    std::set<std::string> approximatedMaterials;
+    int unsupportedTextureCount = 0;
+    int skippedShapeCount = 0;
+    int addedTriangleCount = 0;
+    int instanceCount = 0;
+
+    for (size_t shapeIndex = 0; shapeIndex < pbrtScene->shapes.size(); shapeIndex++){
+        const minipbrt::Shape* shape = pbrtScene->shapes[shapeIndex];
+        if (shape->object != minipbrt::kInvalidIndex) continue;
+        addedTriangleCount += pbrtAddShape(scene, pbrtScene, shape, shape->shapeToWorld.start, minipbrt::kInvalidIndex, baseDirectory, textureCache, materialCache, unsupportedTextureCount, approximatedMaterials, skippedShapeCount);
+    }
+    for (size_t instanceIndex = 0; instanceIndex < pbrtScene->instances.size(); instanceIndex++){
+        const minipbrt::Instance* instance = pbrtScene->instances[instanceIndex];
+        if (instance->object == minipbrt::kInvalidIndex || instance->object >= pbrtScene->objects.size()) continue;
+        const minipbrt::Object* object = pbrtScene->objects[instance->object];
+        float objectToWorld[4][4];
+        pbrtMultiply(instance->instanceToWorld.start, object->objectToInstance.start, objectToWorld);
+        instanceCount++;
+        for (unsigned int shapeOffset = 0; shapeOffset < object->numShapes; shapeOffset++){
+            uint32_t shapeIndex = object->firstShape + shapeOffset;
+            if (shapeIndex >= pbrtScene->shapes.size()) break;
+            const minipbrt::Shape* shape = pbrtScene->shapes[shapeIndex];
+            float toWorld[4][4];
+            pbrtMultiply(objectToWorld, shape->shapeToWorld.start, toWorld);
+            addedTriangleCount += pbrtAddShape(scene, pbrtScene, shape, toWorld, instance->areaLight, baseDirectory, textureCache, materialCache, unsupportedTextureCount, approximatedMaterials, skippedShapeCount);
+        }
+    }
+
+    // the lights that are not geometry need the extent of what was loaded
+    vec3 sceneMinimum(1e30f, 1e30f, 1e30f);
+    vec3 sceneMaximum(-1e30f, -1e30f, -1e30f);
+    for (size_t triangleIndex = 0; triangleIndex < scene.triangles.size(); triangleIndex++){
+        const vec3* corners[3] = {&scene.triangles[triangleIndex].v0, &scene.triangles[triangleIndex].v1, &scene.triangles[triangleIndex].v2};
+        for (int corner = 0; corner < 3; corner++){
+            sceneMinimum = vec3(fminf(sceneMinimum.x, corners[corner]->x), fminf(sceneMinimum.y, corners[corner]->y), fminf(sceneMinimum.z, corners[corner]->z));
+            sceneMaximum = vec3(fmaxf(sceneMaximum.x, corners[corner]->x), fmaxf(sceneMaximum.y, corners[corner]->y), fmaxf(sceneMaximum.z, corners[corner]->z));
+        }
+    }
+    vec3 sceneCenter = (sceneMinimum + sceneMaximum) * 0.5f;
+    float sceneRadius = fmaxf((sceneMaximum - sceneMinimum).length() * 0.5f, 1e-3f);
+
+    int approximatedLightCount = 0;
+    for (size_t lightIndex = 0; lightIndex < pbrtScene->lights.size(); lightIndex++){
+        const minipbrt::Light* light = pbrtScene->lights[lightIndex];
+        switch (light->type()){
+            case minipbrt::LightType::Infinite: {
+                const minipbrt::InfiniteLight* infinite = static_cast<const minipbrt::InfiniteLight*>(light);
+                vec3 radiance(infinite->L[0] * light->scale[0], infinite->L[1] * light->scale[1], infinite->L[2] * light->scale[2]);
+                if (infinite->mapname){
+                    g_pbrtSettings.environmentPath = pbrtResolvePath(baseDirectory, infinite->mapname);
+                    g_pbrtSettings.environmentIntensity = light->scale[0];
+                    // pbrt keeps +z up in light space and puts phi = 90 degrees (the light's +y axis) at u = 0.25;
+                    // find where that axis ends up in the world and turn the map so the same direction reads u = 0.25
+                    vec3 lightAxisY = (pbrtTransformVector(light->lightToWorld.start, vec3(0.f, 1.f, 0.f)));
+                    float rotationRadians = -0.5f * MONOCUDA_PI - atan2f(lightAxisY.z, lightAxisY.x);
+                    g_pbrtSettings.environmentRotationDegrees = rotationRadians * 180.f / MONOCUDA_PI;
+                } else {
+                    g_pbrtSettings.backgroundColor = radiance;
+                }
+                break;
+            }
+            case minipbrt::LightType::Distant: {
+                const minipbrt::DistantLight* distant = static_cast<const minipbrt::DistantLight*>(light);
+                vec3 towardsLight = vec3(distant->from[0] - distant->to[0], distant->from[1] - distant->to[1], distant->from[2] - distant->to[2]);
+                towardsLight = (pbrtTransformVector(light->lightToWorld.start, towardsLight)).normalize();
+                const float halfAngleTangent = tanf(1.0f * MONOCUDA_PI / 180.f);
+                float distance = sceneRadius * 10.f;
+                float halfSize = distance * halfAngleTangent;
+                vec3 radiance(distant->L[0] * light->scale[0], distant->L[1] * light->scale[1], distant->L[2] * light->scale[2]);
+                radiance = radiance / (4.f * halfAngleTangent * halfAngleTangent);
+                vec3 helper = fabsf(towardsLight.y) < 0.9f ? vec3(0.f, 1.f, 0.f) : vec3(1.f, 0.f, 0.f);
+                vec3 sideU = helper.cross(towardsLight).normalize() * halfSize;
+                vec3 sideV = towardsLight.cross(sideU).normalize() * halfSize;
+                vec3 center = sceneCenter + towardsLight * distance;
+                add_quad(scene, center - sideU - sideV, center + sideU - sideV, center + sideU + sideV, center - sideU + sideV, make_emissive(radiance));
+                approximatedLightCount++;
+                break;
+            }
+            case minipbrt::LightType::Point:
+            case minipbrt::LightType::Spot: {
+                const float* from = (light->type() == minipbrt::LightType::Point) ? static_cast<const minipbrt::PointLight*>(light)->from : static_cast<const minipbrt::SpotLight*>(light)->from;
+                const float* intensity = (light->type() == minipbrt::LightType::Point) ? static_cast<const minipbrt::PointLight*>(light)->I : static_cast<const minipbrt::SpotLight*>(light)->I;
+                vec3 position = (pbrtTransformPoint(light->lightToWorld.start, vec3(from[0], from[1], from[2])));
+                float halfSize = sceneRadius * 0.005f;
+                vec3 radiance(intensity[0] * light->scale[0], intensity[1] * light->scale[1], intensity[2] * light->scale[2]);
+                radiance = radiance / (6.f * halfSize * halfSize);
+                add_box(scene, position, vec3(halfSize, halfSize, halfSize), 0.f, make_emissive(radiance));
+                approximatedLightCount++;
+                break;
+            }
+            default:
+                approximatedLightCount++;
+                break;
+        }
+    }
+
+    if (pbrtScene->film && pbrtScene->film->type() == minipbrt::FilmType::Image){
+        pbrtScene->film->get_resolution(g_pbrtSettings.imageWidth, g_pbrtSettings.imageHeight);
+    }
+    if (pbrtScene->camera){
+        const float (*toWorld)[4] = pbrtScene->camera->cameraToWorld.start;
+        g_pbrtSettings.lookFrom = (pbrtTransformPoint(toWorld, vec3(0.f, 0.f, 0.f)));
+        vec3 forward = (pbrtTransformVector(toWorld, vec3(0.f, 0.f, 1.f))).normalize();
+        g_pbrtSettings.lookAt = g_pbrtSettings.lookFrom + forward;
+        g_pbrtSettings.up = (pbrtTransformVector(toWorld, vec3(0.f, 1.f, 0.f))).normalize();
+        g_pbrtSettings.hasCamera = true;
+        float fov = 90.f;
+        if (pbrtScene->camera->type() == minipbrt::CameraType::Perspective){
+            fov = static_cast<const minipbrt::PerspectiveCamera*>(pbrtScene->camera)->fov;
+        }
+        // pbrt's fov belongs to the shorter image side, this camera wants the vertical one
+        float width = (float)(g_pbrtSettings.imageWidth > 0 ? g_pbrtSettings.imageWidth : 1);
+        float height = (float)(g_pbrtSettings.imageHeight > 0 ? g_pbrtSettings.imageHeight : 1);
+        if (width >= height){
+            g_pbrtSettings.verticalFovDegrees = fov;
+        } else {
+            g_pbrtSettings.verticalFovDegrees = 2.f * atanf(tanf(fov * 0.5f * MONOCUDA_PI / 180.f) * height / width) * 180.f / MONOCUDA_PI;
+        }
+    }
+
+    printf("pbrt '%s': %d triangles added, %zu shapes, %d instances, %zu materials, %d skipped shapes, %d approximated lights, %d unsupported textures\n",
+           filePath, addedTriangleCount, pbrtScene->shapes.size(), instanceCount, pbrtScene->materials.size(), skippedShapeCount, approximatedLightCount, unsupportedTextureCount);
+    if (!approximatedMaterials.empty()){
+        printf("pbrt '%s': rendered as lambertian or first component:", filePath);
+        for (std::set<std::string>::iterator name = approximatedMaterials.begin(); name != approximatedMaterials.end(); ++name) printf(" %s", name->c_str());
+        printf("\n");
+    }
+    return addedTriangleCount > 0;
+}
+
+__host__ void buildPbrtScene(hostScene& scene){
+    if (g_pbrtPath.empty()){
+        std::fprintf(stderr, "the pbrt scene needs a file: --pbrt path/to/scene.pbrt\n");
+        std::exit(EXIT_FAILURE);
+    }
+    if (!loadPbrtScene(scene, g_pbrtPath.c_str())){
+        std::fprintf(stderr, "could not load %s\n", g_pbrtPath.c_str());
+        std::exit(EXIT_FAILURE);
+    }
+}
+// ============================================================================
+
 __host__ hostScene setup_scene(SceneChoice sceneChoice){
     hostScene scene;
     switch (sceneChoice){
@@ -1804,6 +2397,11 @@ __host__ hostScene setup_scene(SceneChoice sceneChoice){
         case SceneChoice::LivingRoom: buildLivingRoomScene(scene); break;
         case SceneChoice::Sibenik:    buildSibenikScene(scene);    break;
         case SceneChoice::Sphere:     buildSphereScene(scene);     break;
+        case SceneChoice::Barcelona:
+        case SceneChoice::Bathroom:
+        case SceneChoice::Book:
+        case SceneChoice::SanMiguel:
+        case SceneChoice::Pbrt:       buildPbrtScene(scene);       break;
         case SceneChoice::Cornell:
         default:                      buildCornellScene(scene);    break;
     }
@@ -1881,20 +2479,20 @@ static std::string convertTexturePathToPpm(std::string texturePath){
 }
 
 // every ppm is uploaded to the gpu only once even if many materials use it, returns 0 if it could not be loaded
-static cudaTextureObject_t getOrLoadObjTexture(hostScene& scene,const std::string& ppmPath,std::map<std::string,cudaTextureObject_t>& textureCache){
+static cudaTextureObject_t getOrLoadObjTexture(hostScene& scene,const std::string& ppmPath,const std::string& originalPath,std::map<std::string,cudaTextureObject_t>& textureCache){
     std::map<std::string,cudaTextureObject_t>::iterator cachedEntry = textureCache.find(ppmPath);
     if (cachedEntry != textureCache.end()) return cachedEntry->second;
 
     cudaTextureObject_t textureHandle = 0;
     int imageWidth = 0, imageHeight = 0;
     std::vector<unsigned char> imagePixels;
-    if (loadPpmAsRgba8(ppmPath.c_str(), imageWidth, imageHeight, imagePixels)){
+    if (loadPpmAsRgba8(ppmPath.c_str(), imageWidth, imageHeight, imagePixels) || loadImageRgba8(originalPath.c_str(), imageWidth, imageHeight, imagePixels)){
         cudaArray_t imageArray = nullptr;
         textureHandle = createImageTextureObject(imagePixels, imageWidth, imageHeight, imageArray);
         scene.imageArrays.push_back(imageArray);
         scene.imageTextureHandles.push_back(textureHandle);
     } else {
-        printf("could not load texture '%s' (convert the png to a binary ppm first)\n", ppmPath.c_str());
+        printf("could not load texture '%s'\n", originalPath.c_str());
     }
     textureCache[ppmPath] = textureHandle;
     return textureHandle;
@@ -1922,7 +2520,12 @@ static bool loadMtlFile(hostScene& scene,const std::string& mtlPath,const std::s
             finishedMaterial = make_emissive(currentEmission);
         } else if (!currentTexturePath.empty()){
             std::string ppmPath = objectDirectory + "/" + convertTexturePathToPpm(currentTexturePath);
-            cudaTextureObject_t textureHandle = getOrLoadObjTexture(scene, ppmPath, textureCache);
+            std::string originalPath = currentTexturePath;
+            for (size_t characterIndex = 0; characterIndex < originalPath.size(); characterIndex++){
+                if (originalPath[characterIndex] == '\\') originalPath[characterIndex] = '/';
+            }
+            originalPath = objectDirectory + "/" + originalPath;
+            cudaTextureObject_t textureHandle = getOrLoadObjTexture(scene, ppmPath, originalPath, textureCache);
             if (textureHandle != 0){
                 finishedMaterial = make_lambertian(make_image_texture(textureHandle));
             } else {
@@ -3150,6 +3753,8 @@ struct RenderOptions {
     std::string environmentPath;
     float environmentIntensity = 1.0f;
     float environmentRotationDegrees = 0.0f;
+    std::string pbrtPath;
+    long long maximumTriangles = 0;
 };
 
 static RenderOptions parseCommandLine(int argc, char** argv){
@@ -3186,6 +3791,11 @@ static RenderOptions parseCommandLine(int argc, char** argv){
             options.environmentIntensity = (float)std::atof(argv[++argumentIndex]);
         }else if(std::strcmp(argv[argumentIndex], "--env-rotation") == 0 && argumentIndex + 1 < argc){
             options.environmentRotationDegrees = (float)std::atof(argv[++argumentIndex]);
+        }else if(std::strcmp(argv[argumentIndex], "--pbrt") == 0 && argumentIndex + 1 < argc){
+            options.pbrtPath = argv[++argumentIndex];
+            options.scene = SceneChoice::Pbrt;
+        }else if(std::strcmp(argv[argumentIndex], "--max-triangles") == 0 && argumentIndex + 1 < argc){
+            options.maximumTriangles = std::atoll(argv[++argumentIndex]);
         }
     }
     return options;
@@ -3284,8 +3894,18 @@ int main(int argc,char** argv) {
     fetchDeviceInfo();
 
     // display size
+    g_pbrtPath = options.pbrtPath;
+    if (g_pbrtPath.empty()) g_pbrtPath = scenePbrtPaths[(int)sceneChoice];
+    g_pbrtTriangleBudget = options.maximumTriangles;
+    g_environmentEnabled = !options.environmentPath.empty();
+    hostScene scene = setup_scene(sceneChoice);
+
     int numberOfPixels_X = 600;
     int numberOfPixels_Y = 600;
+    if (g_pbrtSettings.imageWidth > 0 && g_pbrtSettings.imageHeight > 0){
+        numberOfPixels_X = g_pbrtSettings.imageWidth;
+        numberOfPixels_Y = g_pbrtSettings.imageHeight;
+    }
     int totalNumberOfPixels = numberOfPixels_X * numberOfPixels_Y;
 
     // determine the number of block and grid numbers to be used, sized against
@@ -3343,12 +3963,23 @@ int main(int argc,char** argv) {
         cam.vfov = 60.f;
         cam.focus_distance = 20.f;
     }
+    if (g_pbrtSettings.hasCamera){
+        cam.look_from = g_pbrtSettings.lookFrom;
+        cam.look_at = g_pbrtSettings.lookAt;
+        cam.up = g_pbrtSettings.up;
+        cam.vfov = g_pbrtSettings.verticalFovDegrees;
+        cam.focus_distance = 1.f;
+        cam.backround_color = g_pbrtSettings.backgroundColor;
+    }
 
     cam.initialize();
 
-    // scene setup
+    if (options.environmentPath.empty() && !g_pbrtSettings.environmentPath.empty()){
+        options.environmentPath = g_pbrtSettings.environmentPath;
+        options.environmentIntensity = g_pbrtSettings.environmentIntensity;
+        options.environmentRotationDegrees = g_pbrtSettings.environmentRotationDegrees;
+    }
     g_environmentEnabled = !options.environmentPath.empty();
-    hostScene scene = setup_scene(sceneChoice);
 
     cudaArray_t environmentArray = nullptr;
     cudaTextureObject_t environmentTexture = 0;
@@ -3359,8 +3990,11 @@ int main(int argc,char** argv) {
         if(g_environmentEnabled){
             int environmentWidth = 0, environmentHeight = 0;
             std::vector<float> environmentPixels;
-            if(!loadPfmAsRgba32f(options.environmentPath.c_str(), environmentWidth, environmentHeight, environmentPixels)){
-                std::fprintf(stderr, "could not load environment map '%s' (binary little-endian PFM expected)\n", options.environmentPath.c_str());
+            bool isPfm = options.environmentPath.size() >= 4 && options.environmentPath.compare(options.environmentPath.size() - 4, 4, ".pfm") == 0;
+            bool environmentLoaded = isPfm ? loadPfmAsRgba32f(options.environmentPath.c_str(), environmentWidth, environmentHeight, environmentPixels)
+                                           : loadImageRgbaFloat(options.environmentPath.c_str(), environmentWidth, environmentHeight, environmentPixels);
+            if(!environmentLoaded){
+                std::fprintf(stderr, "could not load environment map '%s' (PFM, EXR or HDR)\n", options.environmentPath.c_str());
                 return EXIT_FAILURE;
             }
             environmentTexture = createEnvironmentTexture(environmentPixels, environmentWidth, environmentHeight, environmentArray);
