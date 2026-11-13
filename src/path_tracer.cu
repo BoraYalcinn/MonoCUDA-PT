@@ -304,7 +304,149 @@ __host__ __device__ Texture make_image_texture(cudaTextureObject_t imageHandle) 
     return Texture{TextureType::Image, vec3(1,1,1), vec3(0,0,0), 1.f, imageHandle};
 }
 
+struct EnvironmentMap {
+    cudaTextureObject_t texture;
+    int enabled;
+    float intensity;
+    float rotationRadians;
+    const float* rowCdf;
+    const float* columnCdf;
+    int width;
+    int height;
+    float totalWeight;
+};
+__constant__ EnvironmentMap g_environment;
 
+static bool loadPfmAsRgba32f(const char* filePath, int& imageWidth, int& imageHeight, std::vector<float>& rgbaPixels){
+    FILE* file = fopen(filePath, "rb");
+    if(!file) return false;
+    char magic[3] = {0, 0, 0};
+    float scale = 0.0f;
+    if(fscanf(file, "%2s %d %d %f", magic, &imageWidth, &imageHeight, &scale) != 4 || std::strcmp(magic, "PF") != 0 || imageWidth <= 0 || imageHeight <= 0){
+        fclose(file);
+        return false;
+    }
+    fgetc(file); // exactly one whitespace character separates the header from the pixels
+    if(scale > 0.0f){
+        std::fprintf(stderr, "big-endian PFM files are not supported\n");
+        fclose(file);
+        return false;
+    }
+    std::vector<float> rgbPixels((size_t)imageWidth * imageHeight * 3);
+    size_t floatsRead = fread(rgbPixels.data(), sizeof(float), rgbPixels.size(), file);
+    fclose(file);
+    if(floatsRead != rgbPixels.size()) return false;
+
+    rgbaPixels.resize((size_t)imageWidth * imageHeight * 4);
+    for(int row = 0; row < imageHeight; row++){
+        int sourceRow = imageHeight - 1 - row; // PFM stores the bottom row first
+        for(int column = 0; column < imageWidth; column++){
+            const float* source = &rgbPixels[((size_t)sourceRow * imageWidth + column) * 3];
+            float* target = &rgbaPixels[((size_t)row * imageWidth + column) * 4];
+            target[0] = source[0]; target[1] = source[1]; target[2] = source[2]; target[3] = 1.0f;
+        }
+    }
+    return true;
+}
+
+static void buildEnvironmentSamplingTables(const std::vector<float>& rgbaPixels, int imageWidth, int imageHeight, std::vector<float>& rowCdf, std::vector<float>& columnCdf, float& totalWeight){
+    rowCdf.assign(imageHeight + 1, 0.0f);
+    columnCdf.assign((size_t)imageHeight * (imageWidth + 1), 0.0f);
+    for(int row = 0; row < imageHeight; row++){
+        float sinTheta = sinf(MONOCUDA_PI * (row + 0.5f) / imageHeight);
+        float* cdf = &columnCdf[(size_t)row * (imageWidth + 1)];
+        cdf[0] = 0.0f;
+        for(int column = 0; column < imageWidth; column++){
+            const float* texel = &rgbaPixels[((size_t)row * imageWidth + column) * 4];
+            float luminance = 0.2126f * texel[0] + 0.7152f * texel[1] + 0.0722f * texel[2];
+            cdf[column + 1] = cdf[column] + fmaxf(luminance, 0.0f) * sinTheta;
+        }
+        rowCdf[row + 1] = rowCdf[row] + cdf[imageWidth];
+    }
+    totalWeight = rowCdf[imageHeight];
+}
+
+static cudaTextureObject_t createEnvironmentTexture(const std::vector<float>& rgbaPixels, int imageWidth, int imageHeight, cudaArray_t& imageArray){
+    cudaChannelFormatDesc channelDescription = cudaCreateChannelDesc<float4>();
+    CUDA_CHECK(cudaMallocArray(&imageArray, &channelDescription, imageWidth, imageHeight));
+    CUDA_CHECK(cudaMemcpy2DToArray(imageArray, 0, 0, rgbaPixels.data(), imageWidth * sizeof(float4), imageWidth * sizeof(float4), imageHeight, cudaMemcpyHostToDevice));
+
+    cudaResourceDesc resourceDescription = {};
+    resourceDescription.resType = cudaResourceTypeArray;
+    resourceDescription.res.array.array = imageArray;
+
+    cudaTextureDesc textureDescription = {};
+    textureDescription.addressMode[0] = cudaAddressModeWrap;  // longitude wraps around
+    textureDescription.addressMode[1] = cudaAddressModeClamp; // latitude stops at the poles
+    textureDescription.filterMode = cudaFilterModeLinear;
+    textureDescription.readMode = cudaReadModeElementType;    // HDR values stay as they are, no normalization
+    textureDescription.normalizedCoords = 1;
+
+    cudaTextureObject_t textureHandle = 0;
+    CUDA_CHECK(cudaCreateTextureObject(&textureHandle, &resourceDescription, &textureDescription, nullptr));
+    return textureHandle;
+}
+
+__device__ vec2 environmentUv(const vec3& unitDirection){
+    float u = atan2f(unitDirection.z, unitDirection.x) / (2.0f * MONOCUDA_PI) + 0.5f + g_environment.rotationRadians / (2.0f * MONOCUDA_PI);
+    float v = acosf(fminf(fmaxf(unitDirection.y, -1.0f), 1.0f)) / MONOCUDA_PI;
+    return vec2(u - floorf(u), v);
+}
+
+__device__ vec3 environmentDirection(float u, float v){
+    float phi = (u - 0.5f) * 2.0f * MONOCUDA_PI - g_environment.rotationRadians;
+    float theta = v * MONOCUDA_PI;
+    float sinTheta = sinf(theta);
+    return vec3(cosf(phi) * sinTheta, cosf(theta), sinf(phi) * sinTheta);
+}
+
+__device__ vec3 environmentRadiance(const vec3& direction, const vec3& fallbackColor){
+    if(!g_environment.enabled) return fallbackColor;
+    vec2 uv = environmentUv(direction.normalize());
+    float4 texel = tex2D<float4>(g_environment.texture, uv.x, uv.y);
+    return vec3(texel.x, texel.y, texel.z) * g_environment.intensity;
+}
+
+__device__ float environmentSelectionProbability(int lightCount){
+    if(!g_environment.enabled || g_environment.totalWeight <= 0.0f) return 0.0f;
+    return (lightCount > 0) ? 0.5f : 1.0f;
+}
+
+__device__ int findCdfInterval(const float* cdf, int intervalCount, float value){
+    int low = 0;
+    int high = intervalCount - 1;
+    while(low < high){
+        int middle = (low + high) >> 1;
+        if(cdf[middle + 1] <= value) low = middle + 1;
+        else high = middle;
+    }
+    return low;
+}
+
+__device__ float environmentTexelPdf(int row, int column, float sinTheta){
+    if(sinTheta < 1e-6f) return 0.0f;
+    const float* cdf = g_environment.columnCdf + (size_t)row * (g_environment.width + 1);
+    float texelWeight = cdf[column + 1] - cdf[column];
+    return texelWeight * g_environment.width * g_environment.height / (g_environment.totalWeight * 2.0f * MONOCUDA_PI * MONOCUDA_PI * sinTheta);
+}
+
+__device__ float environmentDirectionPdf(const vec3& direction){
+    vec3 unitDirection = direction.normalize();
+    vec2 uv = environmentUv(unitDirection);
+    int column = min((int)(uv.x * g_environment.width), g_environment.width - 1);
+    int row = min((int)(uv.y * g_environment.height), g_environment.height - 1);
+    return environmentTexelPdf(row, column, sqrtf(fmaxf(1.0f - unitDirection.y * unitDirection.y, 0.0f)));
+}
+
+__device__ vec3 sampleEnvironmentDirection(curandState* rngState, float& directionPdf){
+    int row = findCdfInterval(g_environment.rowCdf, g_environment.height, curand_uniform(rngState) * g_environment.totalWeight);
+    const float* cdf = g_environment.columnCdf + (size_t)row * (g_environment.width + 1);
+    int column = findCdfInterval(cdf, g_environment.width, curand_uniform(rngState) * cdf[g_environment.width]);
+    float u = (column + curand_uniform(rngState)) / g_environment.width;
+    float v = (row + curand_uniform(rngState)) / g_environment.height;
+    directionPdf = environmentTexelPdf(row, column, sinf(v * MONOCUDA_PI));
+    return environmentDirection(u, v);
+}
 // ============================================================================
 
 
@@ -1531,6 +1673,8 @@ __host__ void buildCornellScene(hostScene& scene) {
 
 }
 
+static bool g_environmentEnabled = false;
+
 __host__ void buildSponzaScene(hostScene& scene){
     Material wallMaterial = make_lambertian(vec3(0.75f, 0.72f, 0.68f));
     if (!loadObject(scene, "models/sponza.obj", wallMaterial, vec3(0.f, 0.f, 0.f), 37.f, 0.f)){
@@ -1538,12 +1682,15 @@ __host__ void buildSponzaScene(hostScene& scene){
         std::exit(EXIT_FAILURE);
     }
 
-    // sponza has no light of its own, a quad that fills the open roof acts as the sky.
-    // after the scale above the opening sits at x [-9, 8.5] and z [-1.8, 1.9], anything
-    // wider than that ends up buried in the roof and only wastes shadow rays
-    Material skylight = make_emissive(vec3(6.f, 6.f, 6.f));
-    const float skylightHeight = 14.6f;
-    add_quad(scene, vec3(-8.8f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, 1.7f), vec3(-8.8f, skylightHeight, 1.7f), skylight);
+    if(!g_environmentEnabled){
+        Material skylight = make_emissive(vec3(1.5f, 2.1f, 3.0f));
+        const float skylightHeight = 14.6f;
+        add_quad(scene, vec3(-8.8f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, -1.6f), vec3(8.3f, skylightHeight, 1.7f), vec3(-8.8f, skylightHeight, 1.7f), skylight);
+
+        Material sun = make_emissive(vec3(320.f, 300.f, 260.f));
+        const float sunHeight = 22.f;
+        add_quad(scene, vec3(11.5f, sunHeight, -1.5f), vec3(14.5f, sunHeight, -1.5f), vec3(14.5f, sunHeight, 1.5f), vec3(11.5f, sunHeight, 1.5f), sun);
+    }
 }
 
 __host__ void buildBunnyScene(hostScene& scene){
@@ -2045,7 +2192,12 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         hitRecord hit = bvh.traverseRay(r.origin, r.direction,r.time, spheres, triangles);
 
         if(!hit.didHit){
-            sampleColor = sampleColor + attenuation * camera.backround_color;
+            float environmentWeight = 1.0f;
+            float environmentProbability = environmentSelectionProbability(lightCount);
+            if(!(depth == 0 || previousBounceWasSpecular) && environmentProbability > 0.0f){
+                environmentWeight = powerHeuristic(previousBsdfPdf, environmentProbability * environmentDirectionPdf(r.direction));
+            }
+            sampleColor = sampleColor + attenuation * environmentRadiance(r.direction, camera.backround_color) * environmentWeight;
             break;
         }
         float emissionWeight = 1.0f;
@@ -2053,7 +2205,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         if (emissionComesFromBsdfSampling && hit.mat.type == MaterialType::Emissive && hit.primitiveType == 1) {
             float cosineAtLight = fmaxf(fabsf(r.direction.dot(hit.hitNormal)), 1e-4f);
             float lightArea = triangleSurfaceArea(triangles[hit.primitiveIndex]);
-            float lightPdf = lightSolidAnglePdf(1.0f / float(lightCount), hit.closestDistance, cosineAtLight, lightArea);
+            float lightPdf = lightSolidAnglePdf((1.0f - environmentSelectionProbability(lightCount)) / float(lightCount), hit.closestDistance, cosineAtLight, lightArea);
             emissionWeight = powerHeuristic(previousBsdfPdf, lightPdf);
         }
         sampleColor = sampleColor + attenuation * hit.mat.emittedColor * emissionWeight;
@@ -2076,27 +2228,42 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         attenuation = attenuation * sampleTexture(hit.mat.albedoTexture, hit.u, hit.v);
 
         // ---- NEXT EVENT ESTIMATION (direct light) ----
-        if ((hit.mat.type == MaterialType::Lambertian || hit.mat.type == MaterialType::Isotropic) && lightCount > 0) {
-            int selectedLightIndex = min((int)(curand_uniform(&rngState) * lightCount), lightCount - 1);
-            const Light& selectedLight = lights[selectedLightIndex];
-            float lightSelectionProbability = 1.0f / float(lightCount);
+        float environmentProbability = environmentSelectionProbability(lightCount);
+        if ((hit.mat.type == MaterialType::Lambertian || hit.mat.type == MaterialType::Isotropic) && (lightCount > 0 || environmentProbability > 0.0f)) {
+            vec3 directionToLight;
+            vec3 lightColor;
+            float distanceToLight;
+            float solidAnglePdf;
 
-            vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &rngState);
-            vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
-            float distanceToLight = vectorToLight.length();
-            vec3 directionToLight = vectorToLight / distanceToLight;
+            if (environmentProbability > 0.0f && (lightCount == 0 || curand_uniform(&rngState) < environmentProbability)) {
+                float directionPdf;
+                directionToLight = sampleEnvironmentDirection(&rngState, directionPdf);
+                lightColor = environmentRadiance(directionToLight, vec3(0.f, 0.f, 0.f));
+                distanceToLight = 1e30f;
+                solidAnglePdf = environmentProbability * directionPdf;
+            } else {
+                int selectedLightIndex = min((int)(curand_uniform(&rngState) * lightCount), lightCount - 1);
+                const Light& selectedLight = lights[selectedLightIndex];
+                float lightSelectionProbability = (1.0f - environmentProbability) / float(lightCount);
+
+                vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &rngState);
+                vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
+                distanceToLight = vectorToLight.length();
+                directionToLight = vectorToLight / distanceToLight;
+                lightColor = selectedLight.sourceTriangle.mat.emittedColor;
+
+                float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
+                solidAnglePdf = (cosineAtLight > 1e-4f) ? lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea) : 0.0f;
+            }
 
             // isotropic scattering has no surface cosine and accepts light from any side
             bool scatteredIsotropically = (hit.mat.type == MaterialType::Isotropic);
             float cosineAtSurface = scatteredIsotropically ? 1.0f : hit.hitNormal.dot(directionToLight);
-            float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
 
-            if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
+            if (cosineAtSurface > 0.0f && solidAnglePdf > 0.0f) {
                 float transmittance = mediumTransmittance(bvh, scatterOrigin, directionToLight, r.time, spheres, triangles, distanceToLight * 0.999f);
 
                 if (transmittance > 0.0f) {
-                    float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
-                    vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
                     float scatterPdf = scatteredIsotropically ? isotropicPhasePdf() : lambertianCosinePdf(cosineAtSurface);
                     float scatterValue = scatteredIsotropically ? isotropicPhasePdf() : cosineAtSurface / MONOCUDA_PI;
                     float neeWeight = powerHeuristic(solidAnglePdf, scatterPdf);
@@ -2585,7 +2752,13 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     PackedHit packedHit = hitResults.packedHits[pathIndex];
     // missed
     if (!packedHit.didHit) {
-        currentSample = currentSample + throughput * backgroundColor;
+        vec3 missDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
+        float environmentWeight = 1.0f;
+        float environmentProbability = environmentSelectionProbability(lightCount);
+        if(!(depth == 0 || pathState.previousBounceWasSpecular[pathIndex] != 0) && environmentProbability > 0.0f){
+            environmentWeight = powerHeuristic(pathState.previousBsdfPdf[pathIndex], environmentProbability * environmentDirectionPdf(missDirection));
+        }
+        currentSample = currentSample + throughput * environmentRadiance(missDirection, backgroundColor) * environmentWeight;
         pathState.currentSampleRed[pathIndex] = currentSample.x;
         pathState.currentSampleGreen[pathIndex] = currentSample.y;
         pathState.currentSampleBlue[pathIndex] = currentSample.z;
@@ -2635,7 +2808,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         if (emissionComesFromBsdfSampling && primitiveType == 1) {
             float cosineAtLight = fmaxf(fabsf(incomingRayDirection.dot(hitNormal)), 1e-4f);
             float lightArea = triangleSurfaceArea(triangles[primitiveIndex]);
-            float lightPdf = lightSolidAnglePdf(1.0f / float(lightCount), packedHit.hitDistance, cosineAtLight, lightArea);
+            float lightPdf = lightSolidAnglePdf((1.0f - environmentSelectionProbability(lightCount)) / float(lightCount), packedHit.hitDistance, cosineAtLight, lightArea);
             emissionWeight = powerHeuristic(pathState.previousBsdfPdf[pathIndex], lightPdf);
         }
         currentSample = currentSample + throughput * material.emittedColor * emissionWeight;
@@ -2668,24 +2841,39 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     throughput = throughput * sampleTexture(material.albedoTexture, hitU, hitV);
 
     // NEE again same as before !
-    if ((material.type == MaterialType::Lambertian || material.type == MaterialType::Isotropic) && lightCount > 0) {
-        int selectedLightIndex = min((int)(curand_uniform(&randomNumberState) * lightCount), lightCount - 1);
-        const Light& selectedLight = lights[selectedLightIndex];
-        float lightSelectionProbability = 1.0f / float(lightCount);
+    float environmentProbability = environmentSelectionProbability(lightCount);
+    if ((material.type == MaterialType::Lambertian || material.type == MaterialType::Isotropic) && (lightCount > 0 || environmentProbability > 0.0f)) {
+        vec3 directionToLight;
+        vec3 lightColor;
+        float distanceToLight;
+        float solidAnglePdf;
 
-        vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &randomNumberState);
-        vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
-        float distanceToLight = vectorToLight.length();
-        vec3 directionToLight = vectorToLight / distanceToLight;
+        if (environmentProbability > 0.0f && (lightCount == 0 || curand_uniform(&randomNumberState) < environmentProbability)) {
+            float directionPdf;
+            directionToLight = sampleEnvironmentDirection(&randomNumberState, directionPdf);
+            lightColor = environmentRadiance(directionToLight, vec3(0.f, 0.f, 0.f));
+            distanceToLight = 1e30f;
+            solidAnglePdf = environmentProbability * directionPdf;
+        } else {
+            int selectedLightIndex = min((int)(curand_uniform(&randomNumberState) * lightCount), lightCount - 1);
+            const Light& selectedLight = lights[selectedLightIndex];
+            float lightSelectionProbability = (1.0f - environmentProbability) / float(lightCount);
+
+            vec3 sampledPointOnLight = sample_triangle(selectedLight.sourceTriangle, &randomNumberState);
+            vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
+            distanceToLight = vectorToLight.length();
+            directionToLight = vectorToLight / distanceToLight;
+            lightColor = selectedLight.sourceTriangle.mat.emittedColor;
+
+            float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
+            solidAnglePdf = (cosineAtLight > 1e-4f) ? lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea) : 0.0f;
+        }
 
         // isotropic scattering has no surface cosine and accepts light from any side
         bool scatteredIsotropically = (material.type == MaterialType::Isotropic);
         float cosineAtSurface = scatteredIsotropically ? 1.0f : hitNormal.dot(directionToLight);
-        float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
 
-        if (cosineAtSurface > 0.0f && cosineAtLight > 1e-4f) {
-            float solidAnglePdf = lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea);
-            vec3 lightColor = selectedLight.sourceTriangle.mat.emittedColor;
+        if (cosineAtSurface > 0.0f && solidAnglePdf > 0.0f) {
             float scatterPdf = scatteredIsotropically ? isotropicPhasePdf() : lambertianCosinePdf(cosineAtSurface);
             float scatterValue = scatteredIsotropically ? isotropicPhasePdf() : cosineAtSurface / MONOCUDA_PI;
             float neeWeight = powerHeuristic(solidAnglePdf, scatterPdf);
@@ -2959,6 +3147,9 @@ struct RenderOptions {
     ToneMapOption toneMap = ToneMapOption::None;
     float exposure = 1.0f;
     bool autoExposure = false;
+    std::string environmentPath;
+    float environmentIntensity = 1.0f;
+    float environmentRotationDegrees = 0.0f;
 };
 
 static RenderOptions parseCommandLine(int argc, char** argv){
@@ -2989,6 +3180,12 @@ static RenderOptions parseCommandLine(int argc, char** argv){
                 float parsedExposure = (float)std::atof(argv[argumentIndex]);
                 if(parsedExposure > 0.0f) options.exposure = parsedExposure;
             }
+        }else if(std::strcmp(argv[argumentIndex], "--env") == 0 && argumentIndex + 1 < argc){
+            options.environmentPath = argv[++argumentIndex];
+        }else if(std::strcmp(argv[argumentIndex], "--env-intensity") == 0 && argumentIndex + 1 < argc){
+            options.environmentIntensity = (float)std::atof(argv[++argumentIndex]);
+        }else if(std::strcmp(argv[argumentIndex], "--env-rotation") == 0 && argumentIndex + 1 < argc){
+            options.environmentRotationDegrees = (float)std::atof(argv[++argumentIndex]);
         }
     }
     return options;
@@ -3150,12 +3347,45 @@ int main(int argc,char** argv) {
     cam.initialize();
 
     // scene setup
+    g_environmentEnabled = !options.environmentPath.empty();
     hostScene scene = setup_scene(sceneChoice);
+
+    cudaArray_t environmentArray = nullptr;
+    cudaTextureObject_t environmentTexture = 0;
+    float* d_environmentRowCdf = nullptr;
+    float* d_environmentColumnCdf = nullptr;
+    {
+        EnvironmentMap environmentToUpload = {0, 0, options.environmentIntensity, options.environmentRotationDegrees * MONOCUDA_PI / 180.0f, nullptr, nullptr, 0, 0, 0.0f};
+        if(g_environmentEnabled){
+            int environmentWidth = 0, environmentHeight = 0;
+            std::vector<float> environmentPixels;
+            if(!loadPfmAsRgba32f(options.environmentPath.c_str(), environmentWidth, environmentHeight, environmentPixels)){
+                std::fprintf(stderr, "could not load environment map '%s' (binary little-endian PFM expected)\n", options.environmentPath.c_str());
+                return EXIT_FAILURE;
+            }
+            environmentTexture = createEnvironmentTexture(environmentPixels, environmentWidth, environmentHeight, environmentArray);
+            environmentToUpload.texture = environmentTexture;
+            environmentToUpload.enabled = 1;
+
+            std::vector<float> environmentRowCdf, environmentColumnCdf;
+            buildEnvironmentSamplingTables(environmentPixels, environmentWidth, environmentHeight, environmentRowCdf, environmentColumnCdf, environmentToUpload.totalWeight);
+            CUDA_CHECK(cudaMalloc(&d_environmentRowCdf, environmentRowCdf.size() * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_environmentColumnCdf, environmentColumnCdf.size() * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(d_environmentRowCdf, environmentRowCdf.data(), environmentRowCdf.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_environmentColumnCdf, environmentColumnCdf.data(), environmentColumnCdf.size() * sizeof(float), cudaMemcpyHostToDevice));
+            environmentToUpload.rowCdf = d_environmentRowCdf;
+            environmentToUpload.columnCdf = d_environmentColumnCdf;
+            environmentToUpload.width = environmentWidth;
+            environmentToUpload.height = environmentHeight;
+            printf("Environment map: %s (%dx%d), intensity %g, rotation %g deg\n", options.environmentPath.c_str(), environmentWidth, environmentHeight, options.environmentIntensity, options.environmentRotationDegrees);
+        }
+        CUDA_CHECK(cudaMemcpyToSymbol(g_environment, &environmentToUpload, sizeof(EnvironmentMap)));
+    }
 
     // === BVH MORTON CODE SORT AND DEVICE COPY ===
     std::sort(scene.primitiveRefs.begin(), scene.primitiveRefs.end(),[](const PrimitiveRef& a, const PrimitiveRef& b) {
-            return a.mortonCode < b.mortonCode;
-        });
+        return a.mortonCode < b.mortonCode;
+    });
 
     int numPrimitives = (int)scene.primitiveRefs.size();
 
@@ -3318,6 +3548,10 @@ int main(int argc,char** argv) {
     for(size_t i = 0; i < scene.imageArrays.size(); i++){
         CUDA_CHECK(cudaFreeArray(scene.imageArrays[i]));
     }
+    if(environmentTexture) CUDA_CHECK(cudaDestroyTextureObject(environmentTexture));
+    if(environmentArray) CUDA_CHECK(cudaFreeArray(environmentArray));
+    if(d_environmentRowCdf) CUDA_CHECK(cudaFree(d_environmentRowCdf));
+    if(d_environmentColumnCdf) CUDA_CHECK(cudaFree(d_environmentColumnCdf));
     bvh.free();
     delete[] host_frameBuffer;
 
