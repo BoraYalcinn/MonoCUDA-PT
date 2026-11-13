@@ -21,5 +21,6 @@ compile_commands.json
 *.fatbin
 models/
 /cornell_*.png
+/render_*.png
 /*.ppm
 !/earth.ppm

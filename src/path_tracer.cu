@@ -4144,13 +4144,8 @@ int main(int argc,char** argv) {
     CUDA_CHECK(cudaMemcpy(host_frameBuffer,device_frameBuffer,frameBufferSize,cudaMemcpyDeviceToHost));
 
     // draw the ppm
-    const char* outputFileName = useWavefrontPathTracing ? "render_wavefront.ppm" : "render_megakernel.ppm";
-    FILE* out = fopen(outputFileName, "w");
-    if (!out) {
-        std::fprintf(stderr, "failed to open %s for writing\n",outputFileName);
-        return EXIT_FAILURE;
-    }
-    fprintf(out, "P3\n%d %d\n255\n", numberOfPixels_X, numberOfPixels_Y);
+    const char* outputFileName = useWavefrontPathTracing ? "render_wavefront.png" : "render_megakernel.png";
+    std::vector<unsigned char> outputPixels((size_t)numberOfPixels_X * numberOfPixels_Y * 3);
     for (int j = 0; j < numberOfPixels_Y; j++) {
         for (int i = 0; i < numberOfPixels_X; i++) {
             size_t pixel_index = numberOfPixels_X * j + i;
@@ -4161,13 +4156,16 @@ int main(int argc,char** argv) {
             float gf = isfinite(c.y) ? fminf(fmaxf(c.y, 0.0f), 1.0f) : 0.0f;
             float bf = isfinite(c.z) ? fminf(fmaxf(c.z, 0.0f), 1.0f) : 0.0f;
 
-            int r = int(255.99 * rf);
-            int g = int(255.99 * gf);
-            int b = int(255.99 * bf);
-            fprintf(out, "%d %d %d\n", r, g, b);
+            unsigned char* targetPixel = &outputPixels[pixel_index * 3];
+            targetPixel[0] = (unsigned char)(255.99f * rf);
+            targetPixel[1] = (unsigned char)(255.99f * gf);
+            targetPixel[2] = (unsigned char)(255.99f * bf);
         }
     }
-    fclose(out);
+    if (!saveImageRgb8Png(outputFileName, numberOfPixels_X, numberOfPixels_Y, outputPixels)) {
+        std::fprintf(stderr, "failed to write %s\n", outputFileName);
+        return EXIT_FAILURE;
+    }
 
     // free the memory
     CUDA_CHECK(cudaFree(device_frameBuffer));
