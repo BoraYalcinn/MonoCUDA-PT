@@ -8,6 +8,9 @@
 #define STBI_NO_GIF
 #include "stb_image.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #define TINYEXR_IMPLEMENTATION
 #define TINYEXR_USE_MINIZ 1
 #define TINYEXR_USE_STB_ZLIB 0
@@ -54,4 +57,9 @@ bool loadImageRgbaFloat(const char* filePath, int& imageWidth, int& imageHeight,
     rgbaPixels.assign(pixels, pixels + (size_t)imageWidth * imageHeight * 4);
     stbi_image_free(pixels);
     return true;
+}
+
+bool saveImageRgb8Png(const char* filePath, int imageWidth, int imageHeight, const std::vector<unsigned char>& rgbPixels){
+    if ((size_t)imageWidth * imageHeight * 3 != rgbPixels.size()) return false;
+    return stbi_write_png(filePath, imageWidth, imageHeight, 3, rgbPixels.data(), imageWidth * 3) != 0;
 }
