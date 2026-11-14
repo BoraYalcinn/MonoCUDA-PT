@@ -29,6 +29,21 @@ The console reports `N materials, M textures loaded, K materials with a missing 
 
 The project's implementation status is tracked in CHECKLIST.md. It is licensed under the MIT License.
 
+# Gallery
+
+The twelve selectable scenes, each rendered at 5000 samples per pixel with Reinhard tone mapping. The scenes built in code render at 600x600; the pbrt scenes take their film resolution from their own `.pbrt` file. The full-size PNGs are in `docs/gallery/`.
+
+| | |
+|---|---|
+| <img src="docs/gallery/Scene1_Cornell_Reinhard_5000spp.png" width="420"><br>**`cornell`** — the Cornell box: mirror sphere, textured Earth sphere, smoke sphere, checker floor and an emissive ceiling quad. | <img src="docs/gallery/Scene2_Sponza_Reinhard_5000spp.png" width="420"><br>**`sponza`** — the Sponza atrium, 262k triangles with its 24 MTL textures, lit by a sky quad and a sun above the open roof. |
+| <img src="docs/gallery/Scene3_Bunny_Reinhard_5000spp.png" width="420"><br>**`bunny`** — the Stanford bunny inside the Cornell box, smooth shaded from its vertex normals. | <img src="docs/gallery/Scene4_Dragon_Reinhard_5000spp.png" width="420"><br>**`dragon`** — the Stanford dragon inside the Cornell box. |
+| <img src="docs/gallery/Scene5_LivingRoom_Reinhard_5000spp.png" width="420"><br>**`living_room`** — a living room lit only through the emissive window panels of its own `.mtl`. | <img src="docs/gallery/Scene6_Sibenik_Reinhard_5000spp.png" width="420"><br>**`sibenik`** — the Sibenik cathedral, lit through the `staklo` window glass. |
+| <img src="docs/gallery/Scene7_Staircase_Reinhard_5000spp.png" width="420"><br>**`staircase`** — Bitterli's pbrt-v3 staircase, 720x1280. | <img src="docs/gallery/Scene8_Barcelona_Reinhard_5000spp.png" width="420"><br>**`barcelona`** — the Barcelona pavilion, 1600x850; the architecture only (130k triangles), its 97M-triangle instanced vegetation is left out. |
+| <img src="docs/gallery/Scene9_Bathroom_Reinhard_5000spp.png" width="420"><br>**`bathroom`** — the contemporary bathroom, 400x400. | <img src="docs/gallery/Scene10_Book_Reinhard_5000spp.png" width="420"><br>**`book`** — the pbrt book cover scene, 1280x720. |
+| <img src="docs/gallery/Scene11_Sanmiguel_Reinhard_5000spp.png" width="420"><br>**`sanmiguel`** — the San Miguel courtyard, 726x1600. | <img src="docs/gallery/Scene12_Lamps_Reinhard_5000spp.png" width="420"><br>**`veach_bidir`** — the Veach bidirectional test room with its two lamps, 1024x1024 (the file is named `Scene12_Lamps`). |
+
+The point and spot lights of the pbrt scenes are emulated with small emitters and their `distant` lights with a bright quad far away, so the lighting of the staircase, the bathroom, the book cover and San Miguel is an approximation of what pbrt renders rather than a match.
+
 # Benchmarks
 
 Single-kernel versus wavefront path tracing, measured with the release build on an RTX 5070 Laptop GPU (36 SMs). Settings: 600x600 pixels, 1000 samples per pixel, maximum path depth 20. Times are the render loop only (BVH construction excluded), one run each.
@@ -159,13 +174,13 @@ A higher active-thread ratio therefore does not guarantee a faster kernel; the l
 ## 9. Image Output & Post-Processing
 - [x] Tonemapping operator (start with Reinhard or ACES-approx, not just clamp) *(selectable with `--tonemap none|reinhard|aces`, default `none`; applied in the resolve kernel to the averaged linear radiance, before the gamma step; Reinhard is `c / (1 + c)` per channel and ACES is the Narkowicz approximation; exposure is a separate multiplier set with `--exposure`, applied before the operator)*
 - [x] Gamma correction (linear → sRGB) *(applied once in the resolve kernel with the exact sRGB transfer function; the accumulation buffer stays in linear radiance; hand-picked scene colors are linearized with `srgbToLinear` in `make_solid_texture` and `make_checker_texture`, so the scenes keep the look they were authored with)*
-- [ ] PNG output (not just PPM) so renders are shareable without conversion
+- [x] PNG output (not just PPM) so renders are shareable without conversion *(`render_megakernel.png` / `render_wavefront.png` through `stb_image_write`; the plain-text P3 PPM writer is gone)*
 - [ ] **(stretch)** Simple denoiser pass (even a basic bilateral/edge-aware filter counts) to demonstrate you understand the variance-reduction vs. denoising trade-off
 
 ## 10. Tooling & Validation
 - [ ] Benchmark harness reporting rays/sec and ms/frame at fixed sample counts
 - [x] Numbers for at least one "before vs. after" optimization (e.g. BVH vs. brute force, or single-kernel vs. wavefront) recorded in the repo *(single-kernel versus wavefront on Cornell and Sponza, see Benchmarks)*
-- [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene cornell|sponza`, plus `--spp N` for the sample count, `--tonemap none|reinhard|aces` for the tone mapping operator and `--exposure X` for the exposure)*
+- [x] Command-line scene selection (a couple of hardcoded test scenes, switchable via flag) *(`--scene` with one of the twelve scene names plus `--pbrt file.pbrt` for any other pbrt-v3 scene, `--spp N` for the sample count, `--tonemap none|reinhard|aces` for the tone mapping operator and `--exposure X` for the exposure)*
 - [x] Interactive terminal menu (execution model, scene, samples per pixel, tone mapping, exposure) *(opens only when the program is started without arguments and both stdin and stdout are terminals, so scripted runs are unaffected; all choices are collected in a `RenderOptions` struct that the command line parser fills as well)*
 - [x] Cornell box test scene (quads and a box built from triangles, emissive ceiling light, mirror sphere, many small spheres on the floor, a checker floor, a textured Earth sphere and a smoke sphere)
 - [x] Sponza atrium test scene (262k triangles loaded from the McGuire OBJ with its MTL materials and 24 textures, a skylight quad above the open roof as the only light)
