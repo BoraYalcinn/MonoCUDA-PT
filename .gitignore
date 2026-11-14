@@ -19,8 +19,9 @@ compile_commands.json
 *.ptx
 *.cubin
 *.fatbin
-models/
+models/*
+!models/earth.ppm
+!models/earth.jpeg
 /cornell_*.png
 /render_*.png
 /*.ppm
-!/earth.ppm

@@ -1584,13 +1584,15 @@ static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m
     add_quad(s, p[2], p[3], p[7], p[6], m);  // +y
 }
 
-enum class SceneChoice {Cornell, Sponza, Bunny, Dragon, LivingRoom, Sibenik, Sphere, Barcelona, Bathroom, Book, SanMiguel, Pbrt};
-static const char* sceneNames[] = {"cornell", "sponza", "bunny", "dragon", "living_room", "sibenik", "sphere", "barcelona", "bathroom", "book", "sanmiguel", "pbrt"};
-static const char* scenePbrtPaths[] = {"", "", "", "", "", "", "",
+enum class SceneChoice {Cornell, Sponza, Bunny, Dragon, LivingRoom, Sibenik, Staircase, Barcelona, Bathroom, Book, SanMiguel, VeachBidir, Pbrt};
+static const char* sceneNames[] = {"cornell", "sponza", "bunny", "dragon", "living_room", "sibenik", "staircase", "barcelona", "bathroom", "book", "sanmiguel", "veach_bidir", "pbrt"};
+static const char* scenePbrtPaths[] = {"", "", "", "", "", "",
+    "models/staircase/scene.pbrt",
     "models/pbrt-v3-scenes/barcelona-pavilion/pavilion-day.pbrt",
     "models/pbrt-v3-scenes/contemporary-bathroom/contemporary-bathroom.pbrt",
     "models/pbrt-v3-scenes/pbrt-book/book.pbrt",
-    "models/pbrt-v3-scenes/sanmiguel/sanmiguel.pbrt", ""};
+    "models/pbrt-v3-scenes/sanmiguel/sanmiguel.pbrt",
+    "models/veach-bidir/scene.pbrt", ""};
 static const char* sceneDescriptions[] = {
     "Cornell box (small scene with a smoke sphere)",
     "Sponza atrium (262k triangles, needs models/sponza/sponza.obj)",
@@ -1598,14 +1600,15 @@ static const char* sceneDescriptions[] = {
     "Stanford dragon in the Cornell box (871k triangles, needs models/dragon/dragon.obj)",
     "Living room (580k triangles, needs models/living_room/living_room.obj)",
     "Sibenik cathedral (75k triangles, needs models/sibenik/sibenik.obj)",
-    "Textured UV sphere in the Cornell box (8k triangles, needs models/sphere/sphere-cylcoords-16k.obj)",
+    "Staircase, pbrt-v3 (263k triangles, daylight through the stairwell)",
     "Barcelona pavilion, pbrt-v3 (130k triangles, sky from an EXR environment map)",
     "Contemporary bathroom, pbrt-v3 (536k triangles, lit through the window blinds)",
     "The pbrt book cover, pbrt-v3 (23k triangles, two spherical area lights)",
     "San Miguel courtyard, pbrt-v3 (10.5M triangles, needs about 3 GB)",
+    "Veach bidirectional test, pbrt-v3 (12k triangles, light through a door gap)",
     "pbrt-v3 scene file (camera, lights and materials come from the file, pass it with --pbrt)"
 };
-static const int sceneCount = 12;
+static const int sceneCount = 13;
 
 // == FORWARD DECLERATIONS =======================================================
 static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians);
@@ -1650,8 +1653,8 @@ __host__ void buildCornellScene(hostScene& scene) {
 
     int earthImageWidth = 0, earthImageHeight = 0;
     std::vector<unsigned char> earthImagePixels;
-    if (!loadPpmAsRgba8("earth.ppm", earthImageWidth, earthImageHeight, earthImagePixels)) {
-        std::fprintf(stderr, "could not load earth.ppm\n");
+    if (!loadPpmAsRgba8("models/earth.ppm", earthImageWidth, earthImageHeight, earthImagePixels)) {
+        std::fprintf(stderr, "could not load models/earth.ppm\n");
         std::exit(EXIT_FAILURE);
     }
     cudaArray_t earthImageArray = nullptr;
@@ -1710,89 +1713,6 @@ __host__ void buildSponzaScene(hostScene& scene){
     }
 }
 
-// minipbrt brings a ply reader along, so a mesh can be dropped into one of the
-// built-in scenes without going through a wavefront obj first. Placement matches
-// loadObject: centred on x/z, lowest point at y = 0, largest side scaled to
-// uniformScale, then rotated around y and translated.
-static bool loadPlyObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians){
-    minipbrt::PLYMesh plyShape;
-    size_t pathLength = std::strlen(filePath);
-    plyShape.filename = new char[pathLength + 1];
-    std::memcpy(plyShape.filename, filePath, pathLength + 1);
-
-    minipbrt::TriangleMesh* mesh = plyShape.triangle_mesh();
-    if (!mesh) return false;
-
-    vec3 boxMin(mesh->P[0], mesh->P[1], mesh->P[2]);
-    vec3 boxMax = boxMin;
-    for (unsigned int vertexIndex = 1; vertexIndex < mesh->num_vertices; vertexIndex++){
-        const float* position = &mesh->P[vertexIndex * 3];
-        boxMin = vec3(fminf(boxMin.x, position[0]), fminf(boxMin.y, position[1]), fminf(boxMin.z, position[2]));
-        boxMax = vec3(fmaxf(boxMax.x, position[0]), fmaxf(boxMax.y, position[1]), fmaxf(boxMax.z, position[2]));
-    }
-    vec3 modelSize = boxMax - boxMin;
-    float largestSide = fmaxf(modelSize.x, fmaxf(modelSize.y, modelSize.z));
-    if (largestSide <= 0.f){
-        delete mesh;
-        return false;
-    }
-    vec3 bottomCenter((boxMin.x + boxMax.x) * 0.5f, boxMin.y, (boxMin.z + boxMax.z) * 0.5f);
-    float cosine = cosf(rotationAroundYRadians);
-    float sine = sinf(rotationAroundYRadians);
-
-    std::vector<vec3> transformedPositions(mesh->num_vertices);
-    std::vector<vec3> transformedNormals(mesh->N ? mesh->num_vertices : 0);
-    for (unsigned int vertexIndex = 0; vertexIndex < mesh->num_vertices; vertexIndex++){
-        const float* position = &mesh->P[vertexIndex * 3];
-        vec3 normalizedPosition = (vec3(position[0], position[1], position[2]) - bottomCenter) * (uniformScale / largestSide);
-        transformedPositions[vertexIndex] = vec3(normalizedPosition.x * cosine + normalizedPosition.z * sine, normalizedPosition.y, -normalizedPosition.x * sine + normalizedPosition.z * cosine) + translation;
-        if (mesh->N){
-            const float* normal = &mesh->N[vertexIndex * 3];
-            vec3 rotatedNormal(normal[0] * cosine + normal[2] * sine, normal[1], -normal[0] * sine + normal[2] * cosine);
-            if (rotatedNormal.length_squared() > 0.f) transformedNormals[vertexIndex] = rotatedNormal.normalize();
-        }
-    }
-
-    int addedTriangleCount = 0;
-    int skippedFaceCount = 0;
-    for (unsigned int cornerIndex = 0; cornerIndex + 2 < mesh->num_indices; cornerIndex += 3){
-        int cornerIndices[3] = {mesh->indices[cornerIndex], mesh->indices[cornerIndex + 1], mesh->indices[cornerIndex + 2]};
-        bool isValid = true;
-        for (int corner = 0; corner < 3; corner++){
-            if (cornerIndices[corner] < 0 || cornerIndices[corner] >= (int)mesh->num_vertices) isValid = false;
-        }
-        if (!isValid){
-            skippedFaceCount++;
-            continue;
-        }
-        vec3 vertex0 = transformedPositions[cornerIndices[0]];
-        vec3 vertex1 = transformedPositions[cornerIndices[1]];
-        vec3 vertex2 = transformedPositions[cornerIndices[2]];
-        if ((vertex1 - vertex0).cross(vertex2 - vertex0).length() < 1e-9f){
-            skippedFaceCount++;
-            continue;
-        }
-        triangle objectTriangle(vertex0, vertex1, vertex2, mat);
-        if (mesh->uv){
-            vec2* uvTargets[3] = {&objectTriangle.uv0, &objectTriangle.uv1, &objectTriangle.uv2};
-            for (int corner = 0; corner < 3; corner++){
-                const float* uv = &mesh->uv[cornerIndices[corner] * 2];
-                *uvTargets[corner] = vec2(uv[0], uv[1]);
-            }
-        }
-        if (mesh->N){
-            vec3* normalTargets[3] = {&objectTriangle.n0, &objectTriangle.n1, &objectTriangle.n2};
-            for (int corner = 0; corner < 3; corner++) *normalTargets[corner] = transformedNormals[cornerIndices[corner]];
-        }
-        scene.triangles.push_back(objectTriangle);
-        addedTriangleCount++;
-    }
-    delete mesh;
-
-    printf("PLY '%s': %d triangles added, %d faces skipped\n", filePath, addedTriangleCount, skippedFaceCount);
-    return addedTriangleCount > 0;
-}
-
 __host__ void buildBunnyScene(hostScene& scene){
     buildCornellRoom(scene);
     Material bunnyMaterial = make_lambertian(vec3(0.75f, 0.75f, 0.75f));
@@ -1802,28 +1722,20 @@ __host__ void buildBunnyScene(hostScene& scene){
     }
 }
 
-__host__ void buildDragonScene(hostScene& scene){
-    buildCornellRoom(scene);
-    Material dragonMaterial = make_conductor(vec3(0.95f, 0.78f, 0.45f), 0.04f);
-    if (!loadPlyObject(scene, "models/pbrt-v3-scenes/dragon/geometry/dragon_remeshed.ply", dragonMaterial, vec3(-0.1f, 0.f, -2.4f), 2.4f, MONOCUDA_PI * 0.62f)){
-        std::fprintf(stderr, "could not load models/pbrt-v3-scenes/dragon/geometry/dragon_remeshed.ply\n");
-        std::exit(EXIT_FAILURE);
-    }
-}
-
-__host__ void buildSphereScene(hostScene& scene){
-    buildCornellRoom(scene);
-    Material sphereMaterial = make_lambertian(vec3(0.75f, 0.75f, 0.75f));
-    if (!loadObject(scene, "models/sphere/sphere-cylcoords-16k.obj", sphereMaterial, vec3(0.f, 0.f, -2.f), 2.f, 0.f)){
-        std::fprintf(stderr, "could not load models/sphere/sphere-cylcoords-16k.obj\n");
-        std::exit(EXIT_FAILURE);
-    }
-}
-
 __host__ void buildLivingRoomScene(hostScene& scene){
     Material fallbackMaterial = make_lambertian(vec3(0.75f, 0.72f, 0.68f));
     if (!loadObject(scene, "models/living_room/living_room.obj", fallbackMaterial, vec3(0.f, 0.f, 0.f), 8.6f, 0.f)){
         std::fprintf(stderr, "could not load models/living_room/living_room.obj\n");
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+__host__ void buildDragonScene(hostScene& scene){
+    buildCornellRoom(scene);
+    Material dragonMaterial = make_conductor(vec3(0.95f, 0.78f, 0.45f), 0.02f);
+    // the model is y up with its body along z, so it is turned to face across the box
+    if (!loadObject(scene, "models/dragon/dragon.obj", dragonMaterial, vec3(0.f, 0.f, -2.3f), 2.6f, MONOCUDA_PI * 0.5f)){
+        std::fprintf(stderr, "could not load models/dragon/dragon.obj\n");
         std::exit(EXIT_FAILURE);
     }
 }
@@ -2393,14 +2305,15 @@ __host__ hostScene setup_scene(SceneChoice sceneChoice){
     switch (sceneChoice){
         case SceneChoice::Sponza:     buildSponzaScene(scene);     break;
         case SceneChoice::Bunny:      buildBunnyScene(scene);      break;
-        case SceneChoice::Dragon:     buildDragonScene(scene);     break;
         case SceneChoice::LivingRoom: buildLivingRoomScene(scene); break;
         case SceneChoice::Sibenik:    buildSibenikScene(scene);    break;
-        case SceneChoice::Sphere:     buildSphereScene(scene);     break;
+        case SceneChoice::Dragon:     buildDragonScene(scene);     break;
+        case SceneChoice::Staircase:
         case SceneChoice::Barcelona:
         case SceneChoice::Bathroom:
         case SceneChoice::Book:
         case SceneChoice::SanMiguel:
+        case SceneChoice::VeachBidir:
         case SceneChoice::Pbrt:       buildPbrtScene(scene);       break;
         case SceneChoice::Cornell:
         default:                      buildCornellScene(scene);    break;
@@ -3766,8 +3679,18 @@ static RenderOptions parseCommandLine(int argc, char** argv){
             options.usePersistent = true;
         }else if(std::strcmp(argv[argumentIndex], "--scene") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
+            bool sceneNameIsKnown = false;
             for(int sceneIndex = 0; sceneIndex < sceneCount; sceneIndex++){
-                if(std::strcmp(argv[argumentIndex], sceneNames[sceneIndex]) == 0) options.scene = (SceneChoice)sceneIndex;
+                if(std::strcmp(argv[argumentIndex], sceneNames[sceneIndex]) == 0){
+                    options.scene = (SceneChoice)sceneIndex;
+                    sceneNameIsKnown = true;
+                }
+            }
+            if(!sceneNameIsKnown){
+                std::fprintf(stderr, "unknown scene '%s', the names are:", argv[argumentIndex]);
+                for(int sceneIndex = 0; sceneIndex < sceneCount; sceneIndex++) std::fprintf(stderr, " %s", sceneNames[sceneIndex]);
+                std::fprintf(stderr, "\n");
+                std::exit(EXIT_FAILURE);
             }
         }else if(std::strcmp(argv[argumentIndex], "--spp") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
