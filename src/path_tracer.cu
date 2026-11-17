@@ -586,6 +586,30 @@ __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
 }
 
+struct triangle {
+    vec3 v0, v1, v2;
+    vec2 uv0, uv1, uv2;
+    vec3 n0, n1, n2;
+    Material mat;
+    AABB aabb;
+
+    __host__ __device__ triangle() {}
+    __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_) : v0(v0_), v1(v1_), v2(v2_) {}
+    __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_,Material mat_) : v0(v0_), v1(v1_), v2(v2_), mat(mat_) {}
+
+    __host__ __device__ vec3 calculateCentroid(){
+        return (v0 + v1 + v2)/3.;
+    }
+
+    __host__ __device__ void calculate_bounding_box(){
+        const float eps = 1e-3f;
+        aabb.minInterval = { fminf(v0.x, fminf(v1.x, v2.x)) - eps, fminf(v0.y, fminf(v1.y, v2.y)) - eps, fminf(v0.z, fminf(v1.z, v2.z)) - eps };
+        aabb.maxInterval = { fmaxf(v0.x, fmaxf(v1.x, v2.x)) + eps, fmaxf(v0.y, fmaxf(v1.y, v2.y)) + eps, fmaxf(v0.z, fmaxf(v1.z, v2.z)) + eps };
+    }
+
+    __host__ __device__ AABB get_bounding_box(){return aabb;}
+};
+
 struct triangle_hot {
     vec3 v0, v1, v2;
 
@@ -596,12 +620,14 @@ struct triangle_hot {
         return (v0 + v1 + v2)/3.;
     }
 };
+static_assert(sizeof(triangle_hot) == 36, "triangle_hot must stay 36 bytes");
 
 struct triangle_cold{
     vec2 uv0,uv1,uv2;
     vec3 n0,n1,n2;
     Material mat;
     AABB aabb;
+    __host__ __device__ triangle_cold() {}
     __host__ __device__ triangle_cold(vec2 uv0_,vec2 uv1_,vec2 uv2_,vec3 n0_,vec3 n1_,vec3 n2_,Material mat_,AABB aabb_) : uv0(uv0_),uv1(uv1_),uv2(uv2_),n0(n0_),n1(n1_),n2(n2_),mat(mat_),aabb(aabb_){}
     __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
@@ -610,12 +636,6 @@ struct TriangleView {
     const triangle_hot*  hot;
     const triangle_cold* cold;
 };
-
-inline __host__ __device__ void calculate_bounding_box(triangle_cold tc,triangle_hot th){
-    const float eps = 1e-3f;
-    tc.aabb.minInterval = { fminf(th.v0.x, fminf(th.v1.x, th.v2.x)) - eps, fminf(th.v0.y, fminf(th.v1.y, th.v2.y)) - eps, fminf(th.v0.z, fminf(th.v1.z, th.v2.z)) - eps };
-    tc.aabb.maxInterval = { fmaxf(th.v0.x, fmaxf(th.v1.x, th.v2.x)) + eps, fmaxf(th.v0.y, fmaxf(th.v1.y, th.v2.y)) + eps, fmaxf(th.v0.z, fmaxf(th.v1.z, th.v2.z)) + eps };
-}
 
 __device__ vec2 computeTriangleUvFromHitPoint(const triangle_hot& hitTriangle_hot,const triangle_cold& hitTriangle_c , const vec3& hitPoint){
     float wholeTriangleAreaTimesTwo = (hitTriangle_hot.v1 - hitTriangle_hot.v0).cross(hitTriangle_hot.v2 - hitTriangle_hot.v0).length();
@@ -808,7 +828,8 @@ __host__ __device__ inline unsigned int morton3D(const vec3& centroid, const AAB
 // === Lights ===
 // ============================================================================
 struct Light{
-    triangle sourceTriangle;
+    triangle_hot sourceTriangle;
+    vec3 emittedColor;
     float surfaceArea;
     vec3 surfaceNormal;
 };
@@ -1397,24 +1418,24 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
         }
     } else {
         float intersectionDistance;
-        if (hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) {
+        if (hit_triangle(triangles.hot[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) {
             if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
                 nearestHit.didHit = true;
                 nearestHit.primitiveType = primitiveType;
                 nearestHit.primitiveIndex = primitiveIdx;
                 nearestHit.closestDistance = intersectionDistance;
                 nearestHit.hitPoint = rayOrigin + rayDirection * intersectionDistance;
-                nearestHit.mat = triangles[primitiveIdx].mat;
+                nearestHit.mat = triangles.cold[primitiveIdx].mat;
 
-                vec3 edge1 = triangles[primitiveIdx].v1 - triangles[primitiveIdx].v0;
-                vec3 edge2 = triangles[primitiveIdx].v2 - triangles[primitiveIdx].v0;
+                vec3 edge1 = triangles.hot[primitiveIdx].v1 - triangles.hot[primitiveIdx].v0;
+                vec3 edge2 = triangles.hot[primitiveIdx].v2 - triangles.hot[primitiveIdx].v0;
                 vec3 n = edge1.cross(edge2).normalize();
 
                 bool front = rayDirection.dot(n) < 0.0f;
                 nearestHit.frontFace = front;
-                vec3 shadingNormal = computeTriangleShadingNormal(triangles[primitiveIdx], nearestHit.hitPoint, n);
+                vec3 shadingNormal = computeTriangleShadingNormal(triangles.hot[primitiveIdx], triangles.cold[primitiveIdx], nearestHit.hitPoint, n);
                 nearestHit.hitNormal = front ? shadingNormal : -shadingNormal;
-                vec2 triangleUv = computeTriangleUvFromHitPoint(triangles[primitiveIdx], nearestHit.hitPoint);
+                vec2 triangleUv = computeTriangleUvFromHitPoint(triangles.hot[primitiveIdx], triangles.cold[primitiveIdx], nearestHit.hitPoint);
                 nearestHit.u = triangleUv.x;
                 nearestHit.v = triangleUv.y;
             }
@@ -1429,7 +1450,7 @@ __device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx,
         vec3 outwardNormal;
         if (!hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, time, intersectionDistance, frontFace, outwardNormal)) return;
     } else {
-        if (!hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) return;
+        if (!hit_triangle(triangles.hot[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) return;
     }
     if (intersectionDistance < nearestHit.closestDistance && intersectionDistance > 0.0001f) {
         nearestHit.closestDistance = intersectionDistance;
@@ -1445,7 +1466,7 @@ __device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx
         vec3 outwardNormal;
         if (!hit_sphere(spheres[primitiveIdx], rayOrigin, rayDirection, time, intersectionDistance, frontFace, outwardNormal)) return false;
     } else {
-        if (!hit_triangle(triangles[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) return false;
+        if (!hit_triangle(triangles.hot[primitiveIdx], rayOrigin, rayDirection, intersectionDistance)) return false;
     }
     return (intersectionDistance > 0.0001f) && (intersectionDistance < maximumDistance);
 }
@@ -1806,7 +1827,8 @@ __host__ void finalizeScene(hostScene& scene){
             vec3 areaVector = edgeOne.cross(edgeTwo);
 
             Light light;
-            light.sourceTriangle = emissiveTriangle;
+            light.sourceTriangle = triangle_hot(emissiveTriangle.v0, emissiveTriangle.v1, emissiveTriangle.v2);
+            light.emittedColor = emissiveTriangle.mat.emittedColor;
             light.surfaceArea = 0.5f * areaVector.length();
             light.surfaceNormal = areaVector.normalize();
             scene.lights.push_back(light);
@@ -2727,7 +2749,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
         bool emissionComesFromBsdfSampling = !(depth == 0 || previousBounceWasSpecular);
         if (emissionComesFromBsdfSampling && hit.mat.type == MaterialType::Emissive && hit.primitiveType == 1) {
             float cosineAtLight = fmaxf(fabsf(r.direction.dot(hit.hitNormal)), 1e-4f);
-            float lightArea = triangleSurfaceArea(triangles[hit.primitiveIndex]);
+            float lightArea = triangleSurfaceArea(triangles.hot[hit.primitiveIndex]);
             float lightPdf = lightSolidAnglePdf((1.0f - environmentSelectionProbability(lightCount)) / float(lightCount), hit.closestDistance, cosineAtLight, lightArea);
             emissionWeight = powerHeuristic(previousBsdfPdf, lightPdf);
         }
@@ -2773,7 +2795,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
                 distanceToLight = vectorToLight.length();
                 directionToLight = vectorToLight / distanceToLight;
-                lightColor = selectedLight.sourceTriangle.mat.emittedColor;
+                lightColor = selectedLight.emittedColor;
 
                 float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
                 solidAnglePdf = (cosineAtLight > 1e-4f) ? lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea) : 0.0f;
@@ -3290,7 +3312,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     // material
     int primitiveIndex = packedHit.primitiveIndex;
     int primitiveType = packedHit.primitiveType;
-    Material material = (primitiveType == 0) ? spheres[primitiveIndex].mat : triangles[primitiveIndex].mat;
+    Material material = (primitiveType == 0) ? spheres[primitiveIndex].mat : triangles.cold[primitiveIndex].mat;
 
     vec3 incomingRayDirection(pathState.rayDirectionX[pathIndex], pathState.rayDirectionY[pathIndex], pathState.rayDirectionZ[pathIndex]);
 
@@ -3310,14 +3332,15 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         hitU = sphereUv.x;
         hitV = sphereUv.y;
     } else {
-        const triangle& hitTriangle = triangles[primitiveIndex];
-        vec3 edge1 = hitTriangle.v1 - hitTriangle.v0;
-        vec3 edge2 = hitTriangle.v2 - hitTriangle.v0;
+        const triangle_hot&  hitHot  = triangles.hot[primitiveIndex];
+        const triangle_cold& hitCold = triangles.cold[primitiveIndex];
+        vec3 edge1 = hitHot.v1 - hitHot.v0;
+        vec3 edge2 = hitHot.v2 - hitHot.v0;
         vec3 triangleNormal = edge1.cross(edge2).normalize();
         frontFace = incomingRayDirection.dot(triangleNormal) < 0.0f;
-        vec3 shadingNormal = computeTriangleShadingNormal(hitTriangle, hitPoint, triangleNormal);
+        vec3 shadingNormal = computeTriangleShadingNormal(hitHot, hitCold, hitPoint, triangleNormal);
         hitNormal = frontFace ? shadingNormal : -shadingNormal;
-        vec2 triangleUv = computeTriangleUvFromHitPoint(hitTriangle, hitPoint);
+        vec2 triangleUv = computeTriangleUvFromHitPoint(hitHot, hitCold, hitPoint);
         hitU = triangleUv.x;
         hitV = triangleUv.y;
     }
@@ -3329,7 +3352,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         bool emissionComesFromBsdfSampling = !(depth == 0 || previousBounceWasSpecular);
         if (emissionComesFromBsdfSampling && primitiveType == 1) {
             float cosineAtLight = fmaxf(fabsf(incomingRayDirection.dot(hitNormal)), 1e-4f);
-            float lightArea = triangleSurfaceArea(triangles[primitiveIndex]);
+            float lightArea = triangleSurfaceArea(triangles.hot[primitiveIndex]);
             float lightPdf = lightSolidAnglePdf((1.0f - environmentSelectionProbability(lightCount)) / float(lightCount), packedHit.hitDistance, cosineAtLight, lightArea);
             emissionWeight = powerHeuristic(pathState.previousBsdfPdf[pathIndex], lightPdf);
         }
@@ -3385,7 +3408,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
             vec3 vectorToLight = sampledPointOnLight - scatterOrigin;
             distanceToLight = vectorToLight.length();
             directionToLight = vectorToLight / distanceToLight;
-            lightColor = selectedLight.sourceTriangle.mat.emittedColor;
+            lightColor = selectedLight.emittedColor;
 
             float cosineAtLight = fabsf(selectedLight.surfaceNormal.dot(directionToLight));
             solidAnglePdf = (cosineAtLight > 1e-4f) ? lightSelectionProbability * (distanceToLight * distanceToLight) / (cosineAtLight * selectedLight.surfaceArea) : 0.0f;
@@ -3993,6 +4016,7 @@ int main(int argc,char** argv) {
     CUDA_CHECK(cudaMalloc(&d_spheres, sphereCount * sizeof(sphere)));
     CUDA_CHECK(cudaMemcpy(d_spheres, scene.spheres.data(),sphereCount * sizeof(sphere), cudaMemcpyHostToDevice));
 
+    int triangleCount = (int)scene.triangles.size();
     std::vector<triangle_hot>  hotHost(triangleCount);
     std::vector<triangle_cold> coldHost(triangleCount);
     for (int i = 0; i < triangleCount; i++) {
@@ -4108,7 +4132,8 @@ int main(int argc,char** argv) {
     // free the memory
     CUDA_CHECK(cudaFree(device_frameBuffer));
     CUDA_CHECK(cudaFree(d_spheres));
-    CUDA_CHECK(cudaFree(d_triangles));
+    CUDA_CHECK(cudaFree(d_trisHot));
+    CUDA_CHECK(cudaFree(d_trisCold));
     CUDA_CHECK(cudaFree(d_accumBuffer));
     CUDA_CHECK(cudaFree(d_rngStates));
     CUDA_CHECK(cudaFree(d_lights));
