@@ -586,59 +586,66 @@ __device__ float edge_function(const vec3& a, const vec3& b, const vec3& c) {
     return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
 }
 
-struct triangle {
+struct triangle_hot {
     vec3 v0, v1, v2;
-    vec2 uv0, uv1, uv2;
-    vec3 n0, n1, n2;
-    Material mat;
-    AABB aabb;
 
-    __host__ __device__ triangle() {}
-    __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_) : v0(v0_), v1(v1_), v2(v2_) {}
-    __host__ __device__ triangle(vec3 v0_, vec3 v1_, vec3 v2_,Material mat_) : v0(v0_), v1(v1_), v2(v2_), mat(mat_) {}
+    __host__ __device__ triangle_hot() {}
+    __host__ __device__ triangle_hot(vec3 v0_, vec3 v1_, vec3 v2_) : v0(v0_), v1(v1_), v2(v2_) {}
 
     __host__ __device__ vec3 calculateCentroid(){
         return (v0 + v1 + v2)/3.;
     }
+};
 
-    __host__ __device__ void calculate_bounding_box(){
-        const float eps = 1e-3f;
-        aabb.minInterval = { fminf(v0.x, fminf(v1.x, v2.x)) - eps, fminf(v0.y, fminf(v1.y, v2.y)) - eps, fminf(v0.z, fminf(v1.z, v2.z)) - eps };
-        aabb.maxInterval = { fmaxf(v0.x, fmaxf(v1.x, v2.x)) + eps, fmaxf(v0.y, fmaxf(v1.y, v2.y)) + eps, fmaxf(v0.z, fmaxf(v1.z, v2.z)) + eps };
-    }
-
+struct triangle_cold{
+    vec2 uv0,uv1,uv2;
+    vec3 n0,n1,n2;
+    Material mat;
+    AABB aabb;
+    __host__ __device__ triangle_cold(vec2 uv0_,vec2 uv1_,vec2 uv2_,vec3 n0_,vec3 n1_,vec3 n2_,Material mat_,AABB aabb_) : uv0(uv0_),uv1(uv1_),uv2(uv2_),n0(n0_),n1(n1_),n2(n2_),mat(mat_),aabb(aabb_){}
     __host__ __device__ AABB get_bounding_box(){return aabb;}
 };
 
-__device__ vec2 computeTriangleUvFromHitPoint(const triangle& hitTriangle, const vec3& hitPoint){
-    float wholeTriangleAreaTimesTwo = (hitTriangle.v1 - hitTriangle.v0).cross(hitTriangle.v2 - hitTriangle.v0).length();
+struct TriangleView {
+    const triangle_hot*  hot;
+    const triangle_cold* cold;
+};
 
-    float weightOfVertex0 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
-    float weightOfVertex1 = (hitTriangle.v0 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
-    float weightOfVertex2 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
-
-    return hitTriangle.uv0 * weightOfVertex0 + hitTriangle.uv1 * weightOfVertex1+ hitTriangle.uv2 * weightOfVertex2;
+inline __host__ __device__ void calculate_bounding_box(triangle_cold tc,triangle_hot th){
+    const float eps = 1e-3f;
+    tc.aabb.minInterval = { fminf(th.v0.x, fminf(th.v1.x, th.v2.x)) - eps, fminf(th.v0.y, fminf(th.v1.y, th.v2.y)) - eps, fminf(th.v0.z, fminf(th.v1.z, th.v2.z)) - eps };
+    tc.aabb.maxInterval = { fmaxf(th.v0.x, fmaxf(th.v1.x, th.v2.x)) + eps, fmaxf(th.v0.y, fmaxf(th.v1.y, th.v2.y)) + eps, fmaxf(th.v0.z, fmaxf(th.v1.z, th.v2.z)) + eps };
 }
 
-__device__ vec3 computeTriangleShadingNormal(const triangle& hitTriangle, const vec3& hitPoint, const vec3& faceNormal){
-    if (hitTriangle.n0.length_squared() == 0.0f) return faceNormal;
+__device__ vec2 computeTriangleUvFromHitPoint(const triangle_hot& hitTriangle_hot,const triangle_cold& hitTriangle_c , const vec3& hitPoint){
+    float wholeTriangleAreaTimesTwo = (hitTriangle_hot.v1 - hitTriangle_hot.v0).cross(hitTriangle_hot.v2 - hitTriangle_hot.v0).length();
 
-    float wholeTriangleAreaTimesTwo = (hitTriangle.v1 - hitTriangle.v0).cross(hitTriangle.v2 - hitTriangle.v0).length();
+    float weightOfVertex0 = (hitTriangle_hot.v1 - hitPoint).cross(hitTriangle_hot.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex1 = (hitTriangle_hot.v0 - hitPoint).cross(hitTriangle_hot.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex2 = (hitTriangle_hot.v1 - hitPoint).cross(hitTriangle_hot.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
 
-    float weightOfVertex0 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
-    float weightOfVertex1 = (hitTriangle.v0 - hitPoint).cross(hitTriangle.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
-    float weightOfVertex2 = (hitTriangle.v1 - hitPoint).cross(hitTriangle.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    return hitTriangle_c.uv0 * weightOfVertex0 + hitTriangle_c.uv1 * weightOfVertex1+ hitTriangle_c.uv2 * weightOfVertex2;
+}
+
+__device__ vec3 computeTriangleShadingNormal(const triangle_hot& hitTriangle_h,const triangle_cold& hitTriangle_c, const vec3& hitPoint, const vec3& faceNormal){
+    if (hitTriangle_c.n0.length_squared() == 0.0f) return faceNormal;
+
+    float wholeTriangleAreaTimesTwo = (hitTriangle_h.v1 - hitTriangle_h.v0).cross(hitTriangle_h.v2 - hitTriangle_h.v0).length();
+
+    float weightOfVertex0 = (hitTriangle_h.v1 - hitPoint).cross(hitTriangle_h.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex1 = (hitTriangle_h.v0 - hitPoint).cross(hitTriangle_h.v2 - hitPoint).length() / wholeTriangleAreaTimesTwo;
+    float weightOfVertex2 = (hitTriangle_h.v1 - hitPoint).cross(hitTriangle_h.v0 - hitPoint).length() / wholeTriangleAreaTimesTwo;
 
     float weightSum = weightOfVertex0 + weightOfVertex1 + weightOfVertex2;
     if (!(weightSum > 0.0f) || weightSum > 1.01f) return faceNormal;
-    vec3 shadingNormal = hitTriangle.n0 * weightOfVertex0 + hitTriangle.n1 * weightOfVertex1 + hitTriangle.n2 * weightOfVertex2;
+    vec3 shadingNormal = hitTriangle_c.n0 * weightOfVertex0 + hitTriangle_c.n1 * weightOfVertex1 + hitTriangle_c.n2 * weightOfVertex2;
     if (shadingNormal.length_squared() < 1e-12f) return faceNormal;
     shadingNormal = shadingNormal.normalize();
     if (shadingNormal.dot(faceNormal) < 0.0f) shadingNormal = -shadingNormal;
     return shadingNormal;
 }
 
-__device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
+__device__ bool hit_triangle(const triangle_hot &tri,const vec3& rayOrig,const vec3& rayDir, float& intersectionDistance){
     vec3 edge1 = tri.v1 - tri.v0;
     vec3 edge2 = tri.v2 - tri.v0;
     vec3 triangleNormal = edge1.cross(edge2).normalize();
@@ -667,7 +674,7 @@ __device__ bool hit_triangle(const triangle &tri,const vec3& rayOrig,const vec3&
 }
 
 // to pick a random point on triangles surface
-__device__ vec3 sample_triangle(const triangle& tri,curandState* rngState){
+__device__ vec3 sample_triangle(const triangle_hot& tri,curandState* rngState){
     float randomValue_1 = curand_uniform(rngState);
     float randomValue_2 = curand_uniform(rngState);
     // we are taking its squareRoot so that the random values spread out evenly inside the triangle
@@ -695,7 +702,7 @@ __device__ float isotropicPhasePdf() {
     return 0.25f / MONOCUDA_PI;
 }
 
-__device__ float triangleSurfaceArea(const triangle& tri) {
+__device__ float triangleSurfaceArea(const triangle_hot& tri) {
     return 0.5f * (tri.v1 - tri.v0).cross(tri.v2 - tri.v0).length();
 }
 
@@ -888,9 +895,9 @@ __global__ void refitBoundsKernel(BVH_Node* d_internalNodes, BVH_Node* d_leafNod
 __host__ __device__ inline bool intersects(const AABB& leftHandSide, const AABB& rightHandSide);
 __host__ __device__ inline AABB merge(const AABB& leftHandSide, const AABB& rightHandSide);
 __host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin, const vec3& rayDirection, float& nearestEntryDistance, float& farthestExitDistance);
-__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit);
-__device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, float maximumDistance);
-__device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, ClosestHitCandidate& nearestHit);
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, TriangleView triangles, hitRecord& nearestHit);
+__device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, TriangleView triangles, float maximumDistance);
+__device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, TriangleView triangles, ClosestHitCandidate& nearestHit);
 // ===============================================================================
 // One ray's traversal progress. Lives in a lane for as long as the ray is being traversed,
 // so a lane can be handed a new ray the moment its old one is finished.
@@ -951,7 +958,7 @@ public:
         CUDA_CHECK(cudaFree(d_atomicCounters));
     }
 
-    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles,float maxDistance = 1e30f) const {
+    __device__ hitRecord traverseRay(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, TriangleView triangles,float maxDistance = 1e30f) const {
         hitRecord nearestHit;
         nearestHit.closestDistance = maxDistance;
 
@@ -1016,7 +1023,7 @@ public:
         return nearestHit;
     }
 
-    __device__ bool traverseAnyHit(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles,float maxDistance = 1e30f) const {
+    __device__ bool traverseAnyHit(const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, TriangleView triangles,float maxDistance = 1e30f) const {
 
         const int MAX_STACK = 64;
         int stackIdx[MAX_STACK];
@@ -1151,7 +1158,7 @@ public:
     }
 
     // Executes exactly one iteration of the traverseRay loop. Returns true when the traversal is finished.
-    __device__ bool stepTraversal(TraversalState& traversal, const sphere* spheres, const triangle* triangles) const {
+    __device__ bool stepTraversal(TraversalState& traversal, const sphere* spheres, TriangleView triangles) const {
         const BVH_Node& node = traversal.nodeIsLeaf ? d_leafNode[traversal.nodeIdx] : d_internalNodes[traversal.nodeIdx];
 
         int childLIdx = node.leftChild;
@@ -1368,7 +1375,7 @@ __host__ __device__ inline bool hit_aabb(const AABB& box, const vec3& rayOrigin,
     return true;
 }
 
-__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection,float time, const sphere* spheres, const triangle* triangles, hitRecord& nearestHit){
+__device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection,float time, const sphere* spheres, TriangleView triangles, hitRecord& nearestHit){
     if (primitiveType == 0) {
         float intersectionDistance;
         bool frontFace;
@@ -1415,7 +1422,7 @@ __device__ inline void testPrimitiveHit(int primitiveType, int primitiveIdx, con
     }
 }
 
-__device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, ClosestHitCandidate& nearestHit){
+__device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, TriangleView triangles, ClosestHitCandidate& nearestHit){
     float intersectionDistance;
     if (primitiveType == 0) {
         bool frontFace;
@@ -1431,7 +1438,7 @@ __device__ inline void testPrimitiveClosest(int primitiveType, int primitiveIdx,
     }
 }
 
-__device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, const triangle* triangles, float maximumDistance){
+__device__ inline bool doesPrimitiveBlockRay(int primitiveType, int primitiveIdx, const vec3& rayOrigin, const vec3& rayDirection, float time, const sphere* spheres, TriangleView triangles, float maximumDistance){
     float intersectionDistance;
     if (primitiveType == 0) {
         bool frontFace;
@@ -2669,7 +2676,7 @@ __global__ void init_rng_kernel(curandState* rngStates, int maximumX, int maximu
 
 
 __device__ float mediumTransmittance(const BVH& bvh, vec3 rayOrigin, const vec3& rayDirection, float rayTime,
-                                     const sphere* spheres, const triangle* triangles, float maximumDistance){
+                                     const sphere* spheres, TriangleView triangles, float maximumDistance){
     float transmittance = 1.0f;
     float distanceTravelled = 0.0f;
 
@@ -2688,7 +2695,7 @@ __device__ float mediumTransmittance(const BVH& bvh, vec3 rayOrigin, const vec3&
     return transmittance;
 }
 
-__global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, sphere* spheres, int sphereCount, triangle* triangles, int triangleCount,
+__global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, sphere* spheres, int sphereCount, TriangleView triangles, int triangleCount,
                                     int maximumX, int maximumY, curandState* rngStates, int sampleIndex,Light* lights,int lightCount){
 
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -2973,7 +2980,7 @@ struct WavefrontRenderContext {
     sphere* spheres;
     int sphereCount;
 
-    triangle* triangles;
+    TriangleView triangles;
     int triangleCount;
 
     Light* lights;
@@ -3155,7 +3162,7 @@ __global__ void generateCameraRaysKernel(Camera camera, int imageWidth, int imag
     randomNumberStates[pathIndex] = randomNumberState;
 }
 
-__global__ void extendKernel(BVH bvh, const sphere* spheres, const triangle* triangles, PathStateBuffers pathState, HitResultBuffers hitResults, PathQueue queue){
+__global__ void extendKernel(BVH bvh, const sphere* spheres, TriangleView triangles, PathStateBuffers pathState, HitResultBuffers hitResults, PathQueue queue){
     int queueSlot = threadIdx.x + blockIdx.x * blockDim.x;
     if (queueSlot >= *queue.itemCount) return;
     int pathIndex = queue.pathIndices[queueSlot];
@@ -3179,7 +3186,6 @@ __global__ void extendKernel(BVH bvh, const sphere* spheres, const triangle* tri
 }
 
 // A lane that finishes its ray asks for a new one while the other lanes keep traversing.
-// A warp refills only when at least this many of its lanes are idle (tunable: 1, 8, 16).
 static constexpr int minimumIdleLanesBeforeRefill = 8;
 
 __device__ inline void writeHitResult(HitResultBuffers& hitResults, int pathIndex, const ClosestHitCandidate& hit){
@@ -3196,7 +3202,7 @@ __device__ inline void writeHitResult(HitResultBuffers& hitResults, int pathInde
     hitResults.packedHits[pathIndex] = packedHit;
 }
 
-__global__ void extendKernelPersistent(BVH bvh, const sphere* spheres, const triangle* triangles, PathStateBuffers pathState, HitResultBuffers hitResults, PathQueue queue, int* workCounter){
+__global__ void extendKernelPersistent(BVH bvh, const sphere* spheres, TriangleView triangles, PathStateBuffers pathState, HitResultBuffers hitResults, PathQueue queue, int* workCounter){
     const unsigned int fullWarpMask = 0xffffffffu;
     const int laneIndex = threadIdx.x & 31;
     const int totalPathCount = *queue.itemCount;
@@ -3251,7 +3257,7 @@ __global__ void extendKernelPersistent(BVH bvh, const sphere* spheres, const tri
 }
 
 __global__ void shadeKernel(int depth, vec3 backgroundColor,
-                            const sphere* spheres, const triangle* triangles,
+                            const sphere* spheres, TriangleView triangles,
                             const Light* lights, int lightCount,
                             curandState* randomNumberStates,
                             PathStateBuffers pathState, HitResultBuffers hitResults,
@@ -3468,7 +3474,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     randomNumberStates[pathIndex] = randomNumberState;
 }
 
-__global__ void shadowKernel(BVH bvh, const sphere* spheres, const triangle* triangles,
+__global__ void shadowKernel(BVH bvh, const sphere* spheres, TriangleView triangles,
                              PathStateBuffers pathState, ShadowRayQueue shadowQueue, bool sceneHasMedium)
 {
     int shadowSlot = threadIdx.x + blockIdx.x * blockDim.x;
@@ -3987,10 +3993,19 @@ int main(int argc,char** argv) {
     CUDA_CHECK(cudaMalloc(&d_spheres, sphereCount * sizeof(sphere)));
     CUDA_CHECK(cudaMemcpy(d_spheres, scene.spheres.data(),sphereCount * sizeof(sphere), cudaMemcpyHostToDevice));
 
-    triangle* d_triangles;
-    int triangleCount = (int)scene.triangles.size();
-    CUDA_CHECK(cudaMalloc(&d_triangles, triangleCount * sizeof(triangle)));
-    CUDA_CHECK(cudaMemcpy(d_triangles, scene.triangles.data(),triangleCount * sizeof(triangle), cudaMemcpyHostToDevice));
+    std::vector<triangle_hot>  hotHost(triangleCount);
+    std::vector<triangle_cold> coldHost(triangleCount);
+    for (int i = 0; i < triangleCount; i++) {
+        const triangle& t = scene.triangles[i];
+        hotHost[i]  = triangle_hot(t.v0, t.v1, t.v2);
+        coldHost[i] = triangle_cold(t.uv0, t.uv1, t.uv2, t.n0, t.n1, t.n2, t.mat, t.aabb);
+    }
+    triangle_hot*  d_trisHot;  triangle_cold* d_trisCold;
+    CUDA_CHECK(cudaMalloc(&d_trisHot,  triangleCount * sizeof(triangle_hot)));
+    CUDA_CHECK(cudaMalloc(&d_trisCold, triangleCount * sizeof(triangle_cold)));
+    CUDA_CHECK(cudaMemcpy(d_trisHot,  hotHost.data(),  triangleCount * sizeof(triangle_hot),  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_trisCold, coldHost.data(), triangleCount * sizeof(triangle_cold), cudaMemcpyHostToDevice));
+    TriangleView d_triangles{d_trisHot, d_trisCold};
 
     vec3* d_accumBuffer;
     CUDA_CHECK(cudaMalloc(&d_accumBuffer, frameBufferSize));
