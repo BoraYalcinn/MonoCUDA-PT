@@ -56,6 +56,7 @@ The render is written to `render_megakernel.png` or `render_wavefront.png` in th
 | `--exposure X\|auto` | Multiplier applied to the averaged radiance before tone mapping (default 1.0). `auto` picks an exposure so the log-average luminance maps to 0.18. ACES is brighter than `none`, so around 0.6 looks closer. |
 | `--env FILE` | Equirectangular environment map: Radiance `.hdr`, OpenEXR `.exr` or binary little-endian `.pfm`. |
 | `--env-intensity X`, `--env-rotation DEG` | Scale the map; turn it around the vertical axis. |
+| `--phase-g X` | Henyey-Greenstein asymmetry for every medium in the scene, clamped to ±0.99 (default 0, isotropic). Positive scatters forward, negative back. |
 | `--max-triangles N` | Raise the triangle limit of the pbrt importer (see below). |
 
 Started without arguments in a terminal, the program shows a small interactive menu (execution model, scene, samples, tone mapping, exposure); runs with arguments and pipes skip it.
@@ -204,7 +205,8 @@ Everything below is implemented. What was left out is listed under [Future work]
 - [x] Environment map lighting with importance sampling *(a row CDF and per-row column CDFs over luminance times $\sin\theta$ are built once on the host; NEE picks the environment with probability 0.5 next to the area lights, 1.0 when the scene has none, samples a texel, jitters inside it and sends an unbounded shadow ray; the pdf is converted to solid angle, $p(\omega)=\frac{w_\text{texel}}{W_\text{total}}\cdot\frac{WH}{2\pi^2\sin\theta}$, and both the environment and the area lights get the matching selection probability in the power heuristic)*
 
 ### 6. Volumetric rendering
-- [x] Homogeneous participating medium *(sphere-bounded `Isotropic` material with density and albedo; analytic free-flight distance sampling, NEE from the scattering point and transmittance on shadow rays, in both renderers; only the isotropic phase function $1/4\pi$ exists)*
+- [x] Homogeneous participating medium *(sphere-bounded `Isotropic` material with density and albedo; analytic free-flight distance sampling, NEE from the scattering point and transmittance on shadow rays, in both renderers)*
+- [x] Henyey-Greenstein phase function *(sampled from its inverse CDF around the incoming direction; the phase function is normalized, so it doubles as the pdf for NEE and the MIS power heuristic. `g` comes from the medium in pbrt scenes or from `--phase-g`, and at `g = 0` it reduces to the isotropic $1/4\pi$ exactly, which keeps older renders reproducible)*
 
 ### 7. Motion blur
 - [x] Per-sample time on each ray, time-interpolated sphere centers, BVH box covering the full motion range
@@ -233,7 +235,7 @@ These are not implemented, although I will be moving on with my next big project
 - SAH BVH build; motion-aware BVH; `const __restrict__` kernel parameters and child bounds stored inside the parent BVH node (the remaining open points of the memory-access audit)
 - Microfacet (GGX) BSDF, energy-conserving material blending, normal mapping, roughness and metallic maps
 - Sphere light sampling; stratified or low-discrepancy sampling
-- Henyey-Greenstein phase function, heterogeneous volumes
+- Heterogeneous volumes (3D density grid, for smoke and cloud data)
 - Material-sorted shading
 - Denoiser (edge-avoiding à-trous filter on albedo-demodulated irradiance)
 - A benchmark harness reporting rays/s at fixed sample counts
