@@ -801,7 +801,7 @@ __device__ inline float heterogeneousFreeFlightDistance(const nanovdb::FloatGrid
     if (!(majorant > 0.0f)) return maximumDistance;
 
     float distanceTravelled = 0.0f;
-    for (int step = 0; step < 512; step++) {
+    for (int step = 0; step < 8192; step++) {
         distanceTravelled -= logf(1.0f - curand_uniform(rngState)) / majorant;
         if (distanceTravelled >= maximumDistance) return maximumDistance;
 
@@ -823,7 +823,7 @@ __device__ inline float heterogeneousTransmittance(const nanovdb::FloatGrid* den
 
     float transmittance = 1.0f;
     float distanceTravelled = 0.0f;
-    for (int step = 0; step < 512; step++) {
+    for (int step = 0; step < 8192; step++) {
         distanceTravelled -= logf(1.0f - curand_uniform(rngState)) / majorant;
         if (distanceTravelled >= segmentLength) break;
 
@@ -1621,6 +1621,10 @@ public:
     float aperture;
     float lens_radius;
     float focus_distance = 10;
+    // A cloud scatters almost losslessly, so the usual 0.95 cap ends paths after
+    // about twenty events and the volume never brightens. Scenes that need the
+    // deep multiple scattering raise this and lean on max_depth instead.
+    float russianRouletteCap = 0.95f;
 
     __host__ __device__ Camera(){}
 
@@ -1734,6 +1738,9 @@ static const char* scenePbrtPaths[] = {"", "", "", "", "", "",
     "models/pbrt-v3-scenes/sanmiguel/sanmiguel.pbrt",
     "models/veach-bidir/scene.pbrt", "", ""};
 static const char* defaultCloudVolumePath = "models/wdas_cloud/wdas_cloud_quarter.nvdb";
+// from wdas_cloud_mitsuba_scene.xml, shipped with the data set
+static const float cloudDensityScale = 4.0f;
+static const float cloudPhaseG = 0.877f;
 static const char* sceneDescriptions[] = {
     "Cornell box (small scene with a smoke sphere)",
     "Sponza atrium (262k triangles, needs models/sponza/sponza.obj)",
@@ -1874,21 +1881,34 @@ __host__ void buildCloudScene(hostScene& scene){
     float enclosingRadius = (gridMaximum - gridMinimum).length() * 0.5f;
     if (!(enclosingRadius > 0.f)) return;
 
-    const float targetOpticalDepth = 20.f;
-    float extinctionScale = targetOpticalDepth / (2.f * enclosingRadius);
-
-    // clouds scatter strongly forward; setup_scene() lets --phase-g override it
-    Material cloud = make_isotropic(vec3(1.f, 1.f, 1.f), extinctionScale, 0.85f);
+    // Everything below comes from wdas_cloud_mitsuba_scene.xml, the reference
+    // scene Disney ships with the data, rather than from taste.
+    Material cloud = make_isotropic(vec3(1.f, 1.f, 1.f), cloudDensityScale, cloudPhaseG);
     scene.spheres.push_back(sphere(gridCenter, enclosingRadius, cloud));
 
+    // a ground plane, which is what lights the underside of the cloud
+    const float groundExtent = 20000.f, groundHeight = -1000.f;
+    Material ground = make_lambertian(vec3(0.2f, 0.2f, 0.2f));
+    add_quad(scene, vec3(-groundExtent, groundHeight, -groundExtent), vec3(groundExtent, groundHeight, -groundExtent),
+                    vec3(groundExtent, groundHeight, groundExtent),   vec3(-groundExtent, groundHeight, groundExtent), ground);
+
     if (!g_environmentEnabled){
-        Material sun = make_emissive(vec3(60.f, 56.f, 50.f));
-        float sunSize = enclosingRadius * 0.8f;
-        float sunDistance = enclosingRadius * 4.f;
-        vec3 sunCenter = gridCenter + vec3(sunDistance * 0.6f, sunDistance, sunDistance * 0.3f);
-        add_quad(scene,
-                 sunCenter + vec3(-sunSize, 0.f, -sunSize), sunCenter + vec3(sunSize, 0.f, -sunSize),
-                 sunCenter + vec3(sunSize, 0.f, sunSize),   sunCenter + vec3(-sunSize, 0.f, sunSize), sun);
+        // The reference light is directional, which this renderer has no primitive
+        // for, so it becomes a quad far enough away to subtend a small angle. Its
+        // radiance is picked so the irradiance reaching the cloud matches:
+        // E = L * area / distance^2, hence L = E * distance^2 / area.
+        vec3 towardsSun = -vec3(-0.5826f, -0.7660f, -0.2717f);
+        const float sunDistance = 8.f * enclosingRadius;
+        const float sunHalfSize = 0.1f * sunDistance;
+        float radianceScale = (sunDistance * sunDistance) / (4.f * sunHalfSize * sunHalfSize);
+        Material sun = make_emissive(vec3(2.6f, 2.5f, 2.3f) * radianceScale);
+
+        vec3 sunCenter = gridCenter + towardsSun * sunDistance;
+        vec3 helperAxis = (fabsf(towardsSun.x) > 0.9f) ? vec3(0.f, 1.f, 0.f) : vec3(1.f, 0.f, 0.f);
+        vec3 sunTangent = helperAxis.cross(towardsSun).normalize() * sunHalfSize;
+        vec3 sunBitangent = towardsSun.cross(sunTangent.normalize()) * sunHalfSize;
+        add_quad(scene, sunCenter - sunTangent - sunBitangent, sunCenter + sunTangent - sunBitangent,
+                        sunCenter + sunTangent + sunBitangent, sunCenter - sunTangent + sunBitangent, sun);
     }
 }
 
@@ -3011,7 +3031,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
 
         if(depth > 3){
             float maxComponent = fmaxf(attenuation.x , fmaxf(attenuation.y,attenuation.z));
-            float continueProbability =  fminf(maxComponent,0.95f);
+            float continueProbability =  fminf(maxComponent, camera.russianRouletteCap);
             if(curand_uniform(&rngState) > continueProbability)break;
 
             attenuation = attenuation / continueProbability;
@@ -3468,7 +3488,7 @@ __global__ void extendKernelPersistent(BVH bvh, const sphere* spheres, TriangleV
     }
 }
 
-__global__ void shadeKernel(int depth, vec3 backgroundColor,
+__global__ void shadeKernel(int depth, vec3 backgroundColor, float russianRouletteCap,
                             const sphere* spheres, TriangleView triangles,
                             const Light* lights, int lightCount,
                             curandState* randomNumberStates,
@@ -3642,7 +3662,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
     bool pathSurvives = true;
     if (depth > 3) {
         float maxComponent = fmaxf(throughput.x, fmaxf(throughput.y, throughput.z));
-        float continueProbability = fminf(maxComponent, 0.95f);
+        float continueProbability = fminf(maxComponent, russianRouletteCap);
         if (curand_uniform(&randomNumberState) > continueProbability) {
             pathSurvives = false;
         } else {
@@ -3808,7 +3828,7 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
             }
             CUDA_CHECK_KERNEL();
 
-            shadeKernel<<<blockCount, blockSize>>>(depth, context.camera.backround_color,context.spheres, context.triangles, context.lights, context.lightCount,context.randomNumberStates, pathState, hitResults, currentQueue, nextQueue, shadowQueue);
+            shadeKernel<<<blockCount, blockSize>>>(depth, context.camera.backround_color, context.camera.russianRouletteCap,context.spheres, context.triangles, context.lights, context.lightCount,context.randomNumberStates, pathState, hitResults, currentQueue, nextQueue, shadowQueue);
             CUDA_CHECK_KERNEL();
 
             shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, shadowQueue, context.sceneHasMedium, context.randomNumberStates);
@@ -4080,6 +4100,11 @@ int main(int argc,char** argv) {
 
     int numberOfPixels_X = 600;
     int numberOfPixels_Y = 600;
+    if (sceneChoice == SceneChoice::Cloud){
+        // the reference film is 333x180, kept at three times that
+        numberOfPixels_X = 999;
+        numberOfPixels_Y = 540;
+    }
     if (g_pbrtSettings.imageWidth > 0 && g_pbrtSettings.imageHeight > 0){
         numberOfPixels_X = g_pbrtSettings.imageWidth;
         numberOfPixels_Y = g_pbrtSettings.imageHeight;
@@ -4142,15 +4167,23 @@ int main(int argc,char** argv) {
         cam.focus_distance = 20.f;
     }
     if (sceneChoice == SceneChoice::Cloud && g_volumeDeviceGrid){
-        vec3 gridMinimum(g_volumeGrid.worldMinimum[0], g_volumeGrid.worldMinimum[1], g_volumeGrid.worldMinimum[2]);
-        vec3 gridMaximum(g_volumeGrid.worldMaximum[0], g_volumeGrid.worldMaximum[1], g_volumeGrid.worldMaximum[2]);
-        vec3 gridCenter = (gridMinimum + gridMaximum) * 0.5f;
-        float enclosingRadius = (gridMaximum - gridMinimum).length() * 0.5f;
-        cam.look_from = gridCenter + vec3(0.f, 0.f, enclosingRadius * 3.2f);
-        cam.look_at = gridCenter;
-        cam.vfov = 40.f;
-        cam.focus_distance = enclosingRadius * 3.2f;
-        cam.backround_color = vec3(0.06f, 0.10f, 0.18f);
+        // the reference sensor and the constant sky emitter, from the Mitsuba scene
+        cam.look_from = vec3(648.064f, -82.473f, -63.856f);
+        cam.look_at = vec3(6.021f, 100.043f, -43.679f);
+        cam.up = vec3(0.273f, 0.962f, -0.009f);
+        // the reference gives fov 54.43 on the x axis, so it has to be turned
+        // into the vertical one our camera takes
+        {
+            float horizontalFovRadians = 54.43f * MONOCUDA_PI / 180.f;
+            float aspect = (float)numberOfPixels_X / (float)numberOfPixels_Y;
+            cam.vfov = 2.f * atanf(tanf(horizontalFovRadians * 0.5f) / aspect) * 180.f / MONOCUDA_PI;
+        }
+        cam.focus_distance = (cam.look_at - cam.look_from).length();
+        cam.backround_color = vec3(0.03f, 0.07f, 0.23f);
+        // a cloud needs hundreds of scattering events, so roulette stops culling
+        // and the depth limit becomes the thing that ends a path
+        cam.russianRouletteCap = 1.0f;
+        cam.max_depth = 256;
     }
     if (g_pbrtSettings.hasCamera){
         cam.look_from = g_pbrtSettings.lookFrom;
