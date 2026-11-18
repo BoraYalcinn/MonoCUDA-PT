@@ -489,6 +489,10 @@ struct Material{
     float refractionIndex;
     float density = 0.f;
     float phaseG = 0.f;   // Henyey-Greenstein asymmetry, 0 is isotropic
+    // A null grid means the medium is homogeneous and `density` is the whole
+    // story. With a grid, `density` scales it and the grid modulates it.
+    const nanovdb::FloatGrid* densityGrid = nullptr;
+    float gridMaximumDensity = 0.f;
 };
 
 __device__ vec3 random_unit_vector(curandState* rngState){
@@ -782,6 +786,52 @@ __device__ inline float sampleVolumeDensity(const nanovdb::FloatGrid* densityGri
     const nanovdb::Vec3f indexPoint = densityGrid->worldToIndexF(nanovdb::Vec3f(worldPoint.x, worldPoint.y, worldPoint.z));
     auto accessor = densityGrid->tree().getAccessor();
     return nanovdb::math::createSampler<1>(accessor)(indexPoint);
+}
+
+// Delta tracking. Stepping with the majorant would collide too often, so a
+// tentative collision is kept only in proportion to how much of the majorant
+// the local density actually accounts for; the rest are null collisions that
+// leave the path alone. Returns maximumDistance when the ray leaves the medium
+// without a real collision, which is what the homogeneous path returns too.
+__device__ inline float heterogeneousFreeFlightDistance(const nanovdb::FloatGrid* densityGrid,
+                                                        float extinctionScale, float gridMaximumDensity,
+                                                        const vec3& origin, const vec3& direction,
+                                                        float maximumDistance, curandState* rngState) {
+    float majorant = extinctionScale * gridMaximumDensity;
+    if (!(majorant > 0.0f)) return maximumDistance;
+
+    float distanceTravelled = 0.0f;
+    for (int step = 0; step < 512; step++) {
+        distanceTravelled -= logf(1.0f - curand_uniform(rngState)) / majorant;
+        if (distanceTravelled >= maximumDistance) return maximumDistance;
+
+        float localDensity = sampleVolumeDensity(densityGrid, origin + direction * distanceTravelled);
+        if (curand_uniform(rngState) < localDensity / gridMaximumDensity) return distanceTravelled;
+    }
+    return maximumDistance;   // a dense volume can spin here, so give it a ceiling
+}
+
+// Ratio tracking, the transmittance counterpart: every null collision the delta
+// tracker would have rejected becomes a factor of (1 - density/majorant), which
+// keeps the estimate unbiased without terminating the shadow ray.
+__device__ inline float heterogeneousTransmittance(const nanovdb::FloatGrid* densityGrid,
+                                                   float extinctionScale, float gridMaximumDensity,
+                                                   const vec3& origin, const vec3& direction,
+                                                   float segmentLength, curandState* rngState) {
+    float majorant = extinctionScale * gridMaximumDensity;
+    if (!(majorant > 0.0f)) return 1.0f;
+
+    float transmittance = 1.0f;
+    float distanceTravelled = 0.0f;
+    for (int step = 0; step < 512; step++) {
+        distanceTravelled -= logf(1.0f - curand_uniform(rngState)) / majorant;
+        if (distanceTravelled >= segmentLength) break;
+
+        float localDensity = sampleVolumeDensity(densityGrid, origin + direction * distanceTravelled);
+        transmittance = transmittance * (1.0f - localDensity / gridMaximumDensity);
+        if (transmittance < 1e-4f) return 0.0f;
+    }
+    return transmittance;
 }
 
 __device__ float triangleSurfaceArea(const triangle_hot& tri) {
@@ -1918,6 +1968,8 @@ struct PbrtSceneSettings {
     float environmentIntensity = 1.f;
     float environmentRotationDegrees = 0.f;
 };
+static VolumeGrid g_volumeGrid;                          // host side, for the bounds and the majorant
+static const nanovdb::FloatGrid* g_volumeDeviceGrid = nullptr;
 static float g_phaseGOverride = 0.f;
 static bool g_phaseGWasSet = false;
 static std::string g_pbrtPath;
@@ -2417,6 +2469,18 @@ __host__ hostScene setup_scene(SceneChoice sceneChoice){
         for (sphere& s : scene.spheres)   if (s.mat.type == MaterialType::Isotropic) s.mat.phaseG = g_phaseGOverride;
         for (triangle& t : scene.triangles) if (t.mat.type == MaterialType::Isotropic) t.mat.phaseG = g_phaseGOverride;
     }
+    if (g_volumeDeviceGrid){
+        for (sphere& s : scene.spheres){
+            if (s.mat.type != MaterialType::Isotropic) continue;
+            s.mat.densityGrid = g_volumeDeviceGrid;
+            s.mat.gridMaximumDensity = g_volumeGrid.maximumDensity;
+        }
+        for (triangle& t : scene.triangles){
+            if (t.mat.type != MaterialType::Isotropic) continue;
+            t.mat.densityGrid = g_volumeDeviceGrid;
+            t.mat.gridMaximumDensity = g_volumeGrid.maximumDensity;
+        }
+    }
     finalizeScene(scene);
     return scene;
 }
@@ -2771,7 +2835,8 @@ __global__ void init_rng_kernel(curandState* rngStates, int maximumX, int maximu
 
 
 __device__ float mediumTransmittance(const BVH& bvh, vec3 rayOrigin, const vec3& rayDirection, float rayTime,
-                                     const sphere* spheres, TriangleView triangles, float maximumDistance){
+                                     const sphere* spheres, TriangleView triangles, float maximumDistance,
+                                     curandState* rngState){
     float transmittance = 1.0f;
     float distanceTravelled = 0.0f;
 
@@ -2783,7 +2848,12 @@ __device__ float mediumTransmittance(const BVH& bvh, vec3 rayOrigin, const vec3&
         if (!blocker.didHit) break;
         if (blocker.mat.type != MaterialType::Isotropic) return 0.0f;
 
-        if (!blocker.frontFace) transmittance = transmittance * expf(-blocker.mat.density * blocker.closestDistance);
+        if (!blocker.frontFace){
+            transmittance = transmittance * (blocker.mat.densityGrid
+                ? heterogeneousTransmittance(blocker.mat.densityGrid, blocker.mat.density, blocker.mat.gridMaximumDensity,
+                                             rayOrigin, rayDirection, blocker.closestDistance, rngState)
+                : expf(-blocker.mat.density * blocker.closestDistance));
+        }
         distanceTravelled = distanceTravelled + blocker.closestDistance;
         rayOrigin = blocker.hitPoint;
     }
@@ -2834,8 +2904,15 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
 
         vec3 scatterOrigin = hit.hitPoint;
         if (hit.mat.type == MaterialType::Isotropic) {
-            float scatterDistance = hit.frontFace ? hit.closestDistance
-                                                  : -logf(1.0f - curand_uniform(&rngState)) / hit.mat.density;
+            float scatterDistance;
+            if (hit.frontFace){
+                scatterDistance = hit.closestDistance;            // this hit only enters the medium
+            } else if (hit.mat.densityGrid){
+                scatterDistance = heterogeneousFreeFlightDistance(hit.mat.densityGrid, hit.mat.density, hit.mat.gridMaximumDensity,
+                                                                  r.origin, r.direction, hit.closestDistance, &rngState);
+            } else {
+                scatterDistance = -logf(1.0f - curand_uniform(&rngState)) / hit.mat.density;
+            }
             if (scatterDistance >= hit.closestDistance) {
                 r = Ray(hit.hitPoint, r.direction, r.time);
                 continue;
@@ -2879,7 +2956,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
             float cosineAtSurface = scatteredIsotropically ? 1.0f : hit.hitNormal.dot(directionToLight);
 
             if (cosineAtSurface > 0.0f && solidAnglePdf > 0.0f) {
-                float transmittance = mediumTransmittance(bvh, scatterOrigin, directionToLight, r.time, spheres, triangles, distanceToLight * 0.999f);
+                float transmittance = mediumTransmittance(bvh, scatterOrigin, directionToLight, r.time, spheres, triangles, distanceToLight * 0.999f, &rngState);
 
                 if (transmittance > 0.0f) {
                     // the phase function is its own pdf, so the value and the pdf coincide
@@ -3442,8 +3519,15 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
 
     vec3 scatterOrigin = hitPoint;
     if (material.type == MaterialType::Isotropic) {
-        float scatterDistance = frontFace ? packedHit.hitDistance
-                                          : -logf(1.0f - curand_uniform(&randomNumberState)) / material.density;
+        float scatterDistance;
+        if (frontFace){
+            scatterDistance = packedHit.hitDistance;              // this hit only enters the medium
+        } else if (material.densityGrid){
+            scatterDistance = heterogeneousFreeFlightDistance(material.densityGrid, material.density, material.gridMaximumDensity,
+                                                              rayOriginAtHit, incomingRayDirection, packedHit.hitDistance, &randomNumberState);
+        } else {
+            scatterDistance = -logf(1.0f - curand_uniform(&randomNumberState)) / material.density;
+        }
         if (scatterDistance >= packedHit.hitDistance) {
             pathState.rayOriginX[pathIndex] = hitPoint.x;
             pathState.rayOriginY[pathIndex] = hitPoint.y;
@@ -3575,7 +3659,8 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
 }
 
 __global__ void shadowKernel(BVH bvh, const sphere* spheres, TriangleView triangles,
-                             PathStateBuffers pathState, ShadowRayQueue shadowQueue, bool sceneHasMedium)
+                             PathStateBuffers pathState, ShadowRayQueue shadowQueue, bool sceneHasMedium,
+                             curandState* randomNumberStates)
 {
     int shadowSlot = threadIdx.x + blockIdx.x * blockDim.x;
     if (shadowSlot >= *shadowQueue.itemCount) return;
@@ -3587,7 +3672,11 @@ __global__ void shadowKernel(BVH bvh, const sphere* spheres, TriangleView triang
 
     float transmittance;
     if (sceneHasMedium) {
-        transmittance = mediumTransmittance(bvh, shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
+        // ratio tracking draws random numbers, so the path's own state is used
+        // and written back; a homogeneous medium leaves it untouched
+        curandState randomNumberState = randomNumberStates[pathIndex];
+        transmittance = mediumTransmittance(bvh, shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot], &randomNumberState);
+        randomNumberStates[pathIndex] = randomNumberState;
     } else {
         bool isOccluded = bvh.traverseAnyHit(shadowRayOrigin, shadowRayDirection, rayTime, spheres, triangles, shadowQueue.maximumDistance[shadowSlot]);
         transmittance = isOccluded ? 0.0f : 1.0f;
@@ -3684,7 +3773,7 @@ static void renderWithWavefront(const WavefrontRenderContext& context){
             shadeKernel<<<blockCount, blockSize>>>(depth, context.camera.backround_color,context.spheres, context.triangles, context.lights, context.lightCount,context.randomNumberStates, pathState, hitResults, currentQueue, nextQueue, shadowQueue);
             CUDA_CHECK_KERNEL();
 
-            shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, shadowQueue, context.sceneHasMedium);
+            shadowKernel<<<blockCount, blockSize>>>(context.bvh, context.spheres, context.triangles, pathState, shadowQueue, context.sceneHasMedium, context.randomNumberStates);
             CUDA_CHECK_KERNEL();
 
             CUDA_CHECK(cudaMemcpy(&activePathCount, nextQueue.itemCount, sizeof(int), cudaMemcpyDeviceToHost));
@@ -3776,6 +3865,7 @@ struct RenderOptions {
     long long maximumTriangles = 0;
     float phaseG = 0.0f;
     bool phaseGWasSet = false;
+    std::string volumePath;
 };
 
 static RenderOptions parseCommandLine(int argc, char** argv){
@@ -3824,6 +3914,8 @@ static RenderOptions parseCommandLine(int argc, char** argv){
         }else if(std::strcmp(argv[argumentIndex], "--pbrt") == 0 && argumentIndex + 1 < argc){
             options.pbrtPath = argv[++argumentIndex];
             options.scene = SceneChoice::Pbrt;
+        }else if(std::strcmp(argv[argumentIndex], "--volume") == 0 && argumentIndex + 1 < argc){
+            options.volumePath = argv[++argumentIndex];
         }else if(std::strcmp(argv[argumentIndex], "--phase-g") == 0 && argumentIndex + 1 < argc){
             options.phaseG = (float)std::atof(argv[++argumentIndex]);
             options.phaseGWasSet = true;
@@ -3933,6 +4025,17 @@ int main(int argc,char** argv) {
     if (g_pbrtPath.empty()) g_pbrtPath = scenePbrtPaths[(int)sceneChoice];
     g_pbrtTriangleBudget = options.maximumTriangles;
     g_environmentEnabled = !options.environmentPath.empty();
+
+    // The grid buffer is self-contained, so the device copy is the same bytes
+    // and the material only has to carry a pointer into it.
+    if (!options.volumePath.empty()){
+        if (!loadNanoVdbGrid(options.volumePath.c_str(), g_volumeGrid)) return 1;
+        void* deviceGridBytes = nullptr;
+        CUDA_CHECK(cudaMalloc(&deviceGridBytes, g_volumeGrid.gridBytes.size()));
+        CUDA_CHECK(cudaMemcpy(deviceGridBytes, g_volumeGrid.gridBytes.data(), g_volumeGrid.gridBytes.size(), cudaMemcpyHostToDevice));
+        g_volumeDeviceGrid = reinterpret_cast<const nanovdb::FloatGrid*>(deviceGridBytes);
+    }
+
     hostScene scene = setup_scene(sceneChoice);
 
     int numberOfPixels_X = 600;
