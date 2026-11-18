@@ -544,17 +544,16 @@ __device__ vec3 isotropic_scatter_direction(curandState* rngState){
 // the direction the ray was already travelling, so g > 0 keeps it going forward,
 // g < 0 turns it back and g = 0 reduces to the isotropic sphere above.
 __device__ vec3 henyeyGreenstein_scatter_direction(const vec3& incomingDirection, float g, curandState* rngState){
+    // at g = 0 the distribution is rotation invariant, so the plain isotropic
+    // sampler is just as correct and draws the same two uniforms
+    if (fabsf(g) < 1e-3f) return isotropic_scatter_direction(rngState);
+
     float u1 = curand_uniform(rngState);
     float u2 = curand_uniform(rngState);
 
-    float cosTheta;
-    if (fabsf(g) < 1e-3f){
-        cosTheta = 1.0f - 2.0f * u1;                 // the isotropic limit, where the formula below cancels
-    } else {
-        float squareTerm = (1.0f - g * g) / (1.0f + g - 2.0f * g * u1);
-        cosTheta = (1.0f + g * g - squareTerm * squareTerm) / (2.0f * g);
-        cosTheta = fminf(fmaxf(cosTheta, -1.0f), 1.0f);
-    }
+    float squareTerm = (1.0f - g * g) / (1.0f + g - 2.0f * g * u1);
+    float cosTheta = (1.0f + g * g - squareTerm * squareTerm) / (2.0f * g);
+    cosTheta = fminf(fmaxf(cosTheta, -1.0f), 1.0f);
 
     float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
     float phi = 2.0f * MONOCUDA_PI * u2;
@@ -2860,8 +2859,10 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 float transmittance = mediumTransmittance(bvh, scatterOrigin, directionToLight, r.time, spheres, triangles, distanceToLight * 0.999f);
 
                 if (transmittance > 0.0f) {
-                    float scatterPdf = scatteredIsotropically ? isotropicPhasePdf() : lambertianCosinePdf(cosineAtSurface);
-                    float scatterValue = scatteredIsotropically ? isotropicPhasePdf() : cosineAtSurface / MONOCUDA_PI;
+                    // the phase function is its own pdf, so the value and the pdf coincide
+                    float phasePdf = henyeyGreensteinPhasePdf(r.direction.dot(directionToLight), hit.mat.phaseG);
+                    float scatterPdf = scatteredIsotropically ? phasePdf : lambertianCosinePdf(cosineAtSurface);
+                    float scatterValue = scatteredIsotropically ? phasePdf : cosineAtSurface / MONOCUDA_PI;
                     float neeWeight = powerHeuristic(solidAnglePdf, scatterPdf);
                     sampleColor = sampleColor + attenuation * lightColor * (scatterValue / solidAnglePdf) * neeWeight * transmittance;
                 }
@@ -2896,7 +2897,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 break;
             }
             case MaterialType::Isotropic:{
-                newDirection = isotropic_scatter_direction(&rngState);
+                newDirection = henyeyGreenstein_scatter_direction(r.direction, hit.mat.phaseG, &rngState);
                 break;
             }
             case MaterialType::Lambertian:
@@ -2905,7 +2906,7 @@ __global__ void trace_sample_kernel(vec3* accumBuffer, Camera camera, BVH bvh, s
                 break;
         }
         previousBounceWasSpecular = (hit.mat.type != MaterialType::Lambertian && hit.mat.type != MaterialType::Isotropic);
-        previousBsdfPdf = (hit.mat.type == MaterialType::Isotropic) ? isotropicPhasePdf()
+        previousBsdfPdf = (hit.mat.type == MaterialType::Isotropic) ? henyeyGreensteinPhasePdf(r.direction.dot(newDirection), hit.mat.phaseG)
                                                                    : lambertianCosinePdf(fmaxf(newDirection.dot(hit.hitNormal), 0.0f));
         r = Ray(scatterOrigin, newDirection, r.time);
     }
@@ -3470,8 +3471,10 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         float cosineAtSurface = scatteredIsotropically ? 1.0f : hitNormal.dot(directionToLight);
 
         if (cosineAtSurface > 0.0f && solidAnglePdf > 0.0f) {
-            float scatterPdf = scatteredIsotropically ? isotropicPhasePdf() : lambertianCosinePdf(cosineAtSurface);
-            float scatterValue = scatteredIsotropically ? isotropicPhasePdf() : cosineAtSurface / MONOCUDA_PI;
+            // the phase function is its own pdf, so the value and the pdf coincide
+            float phasePdf = henyeyGreensteinPhasePdf(incomingRayDirection.dot(directionToLight), material.phaseG);
+            float scatterPdf = scatteredIsotropically ? phasePdf : lambertianCosinePdf(cosineAtSurface);
+            float scatterValue = scatteredIsotropically ? phasePdf : cosineAtSurface / MONOCUDA_PI;
             float neeWeight = powerHeuristic(solidAnglePdf, scatterPdf);
             vec3 contribution = throughput * lightColor * (scatterValue / solidAnglePdf) * neeWeight;
 
@@ -3519,7 +3522,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
                 break;
             }
             case MaterialType::Isotropic:{
-                newDirection = isotropic_scatter_direction(&randomNumberState);
+                newDirection = henyeyGreenstein_scatter_direction(incomingRayDirection, material.phaseG, &randomNumberState);
                 break;
             }
             case MaterialType::Lambertian:
@@ -3538,7 +3541,7 @@ __global__ void shadeKernel(int depth, vec3 backgroundColor,
         pathState.throughputGreen[pathIndex] = throughput.y;
         pathState.throughputBlue[pathIndex] = throughput.z;
         pathState.previousBounceWasSpecular[pathIndex] = (material.type != MaterialType::Lambertian && material.type != MaterialType::Isotropic) ? 1 : 0;
-        pathState.previousBsdfPdf[pathIndex] = (material.type == MaterialType::Isotropic) ? isotropicPhasePdf()
+        pathState.previousBsdfPdf[pathIndex] = (material.type == MaterialType::Isotropic) ? henyeyGreensteinPhasePdf(incomingRayDirection.dot(newDirection), material.phaseG)
                                                                                           : lambertianCosinePdf(fmaxf(newDirection.dot(hitNormal), 0.0f));
 
         int nextQueueSlot = atomicAdd(nextQueue.itemCount, 1);
