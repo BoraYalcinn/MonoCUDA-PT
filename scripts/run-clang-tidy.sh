@@ -76,6 +76,7 @@ INCLUDES=(
     -isystem "$DEPS/stb-src"
     -isystem "$DEPS/tinyexr-src"
     -isystem "$DEPS/tinyexr-src/deps/miniz"
+    -isystem "$DEPS/nanovdb-src/nanovdb"
 )
 
 # clang-tidy flags from the command line, source files collected separately so
