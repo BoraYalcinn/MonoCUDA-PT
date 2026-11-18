@@ -1861,7 +1861,8 @@ __host__ void buildSponzaScene(hostScene& scene){
 // diameter of optical depth ~20 reads as a cloud whatever units the file uses.
 __host__ void buildCloudScene(hostScene& scene){
     if (!g_volumeDeviceGrid){
-        std::fprintf(stderr, "the cloud scene needs a density grid, pass --volume FILE.nvdb\n");
+        std::fprintf(stderr, "the cloud scene needs a density grid, pass --volume FILE.nvdb "
+                             "(.vdb files have to be converted first: vdb_tool -read in.vdb -write out.nvdb)\n");
         return;
     }
 
@@ -4206,6 +4207,11 @@ int main(int argc,char** argv) {
     });
 
     int numPrimitives = (int)scene.primitiveRefs.size();
+    if (numPrimitives == 0){
+        std::fprintf(stderr, "the scene has no primitives, so there is nothing to build a BVH over "
+                             "(a model or a volume that failed to load is the usual reason)\n");
+        return 1;
+    }
 
     std::vector<unsigned int> sortedMortonCodes(numPrimitives);
     std::vector<int> sortedPrimitiveIDs(numPrimitives);
