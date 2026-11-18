@@ -588,8 +588,8 @@ __host__ __device__ Material make_emissive(vec3 emittedColor) {
     return Material{MaterialType::Emissive, make_solid_texture(vec3(0,0,0)), emittedColor, 0.f, 0.f};
 }
 
-__host__ __device__ Material make_isotropic(vec3 albedo, float density){
-    return Material{MaterialType::Isotropic,make_solid_texture(albedo),vec3(0,0,0),0.f,0.f,density};
+__host__ __device__ Material make_isotropic(vec3 albedo, float density, float phaseG = 0.f){
+    return Material{MaterialType::Isotropic,make_solid_texture(albedo),vec3(0,0,0),0.f,0.f,density,phaseG};
 }
 
 // ============================================================================
@@ -1903,6 +1903,8 @@ struct PbrtSceneSettings {
     float environmentIntensity = 1.f;
     float environmentRotationDegrees = 0.f;
 };
+static float g_phaseGOverride = 0.f;
+static bool g_phaseGWasSet = false;
 static std::string g_pbrtPath;
 static PbrtSceneSettings g_pbrtSettings;
 static long long g_pbrtTriangleBudget = 0;
@@ -2079,7 +2081,9 @@ static Material pbrtMediumMaterial(const minipbrt::Medium* medium){
         *albedoChannels[channel] = extinction > 0.f ? medium->sigma_s[channel] * medium->scale / extinction : 0.f;
         density += extinction / 3.f;
     }
-    return Material{MaterialType::Isotropic, pbrtLinearSolidTexture(albedo), vec3(0,0,0), 0.f, 0.f, density};
+    // pbrt names the asymmetry on the medium itself
+    float phaseG = fminf(fmaxf(medium->g, -0.99f), 0.99f);
+    return Material{MaterialType::Isotropic, pbrtLinearSolidTexture(albedo), vec3(0,0,0), 0.f, 0.f, density, phaseG};
 }
 
 static int pbrtAddMesh(hostScene& scene, const minipbrt::TriangleMesh* mesh, const float toWorld[4][4], const Material& material){
@@ -2393,6 +2397,10 @@ __host__ hostScene setup_scene(SceneChoice sceneChoice){
         case SceneChoice::Pbrt:       buildPbrtScene(scene);       break;
         case SceneChoice::Cornell:
         default:                      buildCornellScene(scene);    break;
+    }
+    if (g_phaseGWasSet){
+        for (sphere& s : scene.spheres)   if (s.mat.type == MaterialType::Isotropic) s.mat.phaseG = g_phaseGOverride;
+        for (triangle& t : scene.triangles) if (t.mat.type == MaterialType::Isotropic) t.mat.phaseG = g_phaseGOverride;
     }
     finalizeScene(scene);
     return scene;
@@ -3751,6 +3759,8 @@ struct RenderOptions {
     float environmentRotationDegrees = 0.0f;
     std::string pbrtPath;
     long long maximumTriangles = 0;
+    float phaseG = 0.0f;
+    bool phaseGWasSet = false;
 };
 
 static RenderOptions parseCommandLine(int argc, char** argv){
@@ -3799,6 +3809,9 @@ static RenderOptions parseCommandLine(int argc, char** argv){
         }else if(std::strcmp(argv[argumentIndex], "--pbrt") == 0 && argumentIndex + 1 < argc){
             options.pbrtPath = argv[++argumentIndex];
             options.scene = SceneChoice::Pbrt;
+        }else if(std::strcmp(argv[argumentIndex], "--phase-g") == 0 && argumentIndex + 1 < argc){
+            options.phaseG = (float)std::atof(argv[++argumentIndex]);
+            options.phaseGWasSet = true;
         }else if(std::strcmp(argv[argumentIndex], "--max-triangles") == 0 && argumentIndex + 1 < argc){
             options.maximumTriangles = std::atoll(argv[++argumentIndex]);
         }
@@ -3899,6 +3912,8 @@ int main(int argc,char** argv) {
     fetchDeviceInfo();
 
     // display size
+    g_phaseGOverride = fminf(fmaxf(options.phaseG, -0.99f), 0.99f);
+    g_phaseGWasSet = options.phaseGWasSet;
     g_pbrtPath = options.pbrtPath;
     if (g_pbrtPath.empty()) g_pbrtPath = scenePbrtPaths[(int)sceneChoice];
     g_pbrtTriangleBudget = options.maximumTriangles;
