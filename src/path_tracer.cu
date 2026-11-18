@@ -1724,15 +1724,15 @@ static void add_box(hostScene& s, vec3 center, vec3 half, float rotY, Material m
     add_quad(s, p[2], p[3], p[7], p[6], m);  // +y
 }
 
-enum class SceneChoice {Cornell, Sponza, Bunny, Dragon, LivingRoom, Sibenik, Staircase, Barcelona, Bathroom, Book, SanMiguel, VeachBidir, Pbrt};
-static const char* sceneNames[] = {"cornell", "sponza", "bunny", "dragon", "living_room", "sibenik", "staircase", "barcelona", "bathroom", "book", "sanmiguel", "veach_bidir", "pbrt"};
+enum class SceneChoice {Cornell, Sponza, Bunny, Dragon, LivingRoom, Sibenik, Staircase, Barcelona, Bathroom, Book, SanMiguel, VeachBidir, Cloud, Pbrt};
+static const char* sceneNames[] = {"cornell", "sponza", "bunny", "dragon", "living_room", "sibenik", "staircase", "barcelona", "bathroom", "book", "sanmiguel", "veach_bidir", "cloud", "pbrt"};
 static const char* scenePbrtPaths[] = {"", "", "", "", "", "",
     "models/staircase/scene.pbrt",
     "models/pbrt-v3-scenes/barcelona-pavilion/pavilion-day.pbrt",
     "models/pbrt-v3-scenes/contemporary-bathroom/contemporary-bathroom.pbrt",
     "models/pbrt-v3-scenes/pbrt-book/book.pbrt",
     "models/pbrt-v3-scenes/sanmiguel/sanmiguel.pbrt",
-    "models/veach-bidir/scene.pbrt", ""};
+    "models/veach-bidir/scene.pbrt", "", ""};
 static const char* sceneDescriptions[] = {
     "Cornell box (small scene with a smoke sphere)",
     "Sponza atrium (262k triangles, needs models/sponza/sponza.obj)",
@@ -1746,9 +1746,10 @@ static const char* sceneDescriptions[] = {
     "The pbrt book cover, pbrt-v3 (23k triangles, two spherical area lights)",
     "San Miguel courtyard, pbrt-v3 (10.5M triangles, needs about 3 GB)",
     "Veach bidirectional test, pbrt-v3 (12k triangles, light through a door gap)",
+    "Heterogeneous cloud from a NanoVDB density grid (pass it with --volume FILE.nvdb)",
     "pbrt-v3 scene file (camera, lights and materials come from the file, pass it with --pbrt)"
 };
-static const int sceneCount = 13;
+static const int sceneCount = 14;
 
 // == FORWARD DECLERATIONS =======================================================
 static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 translation,float uniformScale,float rotationAroundYRadians);
@@ -1834,6 +1835,8 @@ __host__ void buildCornellScene(hostScene& scene) {
 }
 
 static bool g_environmentEnabled = false;
+static VolumeGrid g_volumeGrid;                          // host side, for the bounds and the majorant
+static const nanovdb::FloatGrid* g_volumeDeviceGrid = nullptr;
 
 __host__ void buildSponzaScene(hostScene& scene){
     Material wallMaterial = make_lambertian(vec3(0.75f, 0.72f, 0.68f));
@@ -1850,6 +1853,39 @@ __host__ void buildSponzaScene(hostScene& scene){
         Material sun = make_emissive(vec3(320.f, 300.f, 260.f));
         const float sunHeight = 22.f;
         add_quad(scene, vec3(11.5f, sunHeight, -1.5f), vec3(14.5f, sunHeight, -1.5f), vec3(14.5f, sunHeight, 1.5f), vec3(11.5f, sunHeight, 1.5f), sun);
+    }
+}
+
+// A density grid in a sphere that swallows its bounding box. The grid decides
+// the scale, so the extinction is derived from it rather than hard coded: a
+// diameter of optical depth ~20 reads as a cloud whatever units the file uses.
+__host__ void buildCloudScene(hostScene& scene){
+    if (!g_volumeDeviceGrid){
+        std::fprintf(stderr, "the cloud scene needs a density grid, pass --volume FILE.nvdb\n");
+        return;
+    }
+
+    vec3 gridMinimum(g_volumeGrid.worldMinimum[0], g_volumeGrid.worldMinimum[1], g_volumeGrid.worldMinimum[2]);
+    vec3 gridMaximum(g_volumeGrid.worldMaximum[0], g_volumeGrid.worldMaximum[1], g_volumeGrid.worldMaximum[2]);
+    vec3 gridCenter = (gridMinimum + gridMaximum) * 0.5f;
+    float enclosingRadius = (gridMaximum - gridMinimum).length() * 0.5f;
+    if (!(enclosingRadius > 0.f)) return;
+
+    const float targetOpticalDepth = 20.f;
+    float extinctionScale = targetOpticalDepth / (2.f * enclosingRadius);
+
+    // clouds scatter strongly forward; setup_scene() lets --phase-g override it
+    Material cloud = make_isotropic(vec3(1.f, 1.f, 1.f), extinctionScale, 0.85f);
+    scene.spheres.push_back(sphere(gridCenter, enclosingRadius, cloud));
+
+    if (!g_environmentEnabled){
+        Material sun = make_emissive(vec3(60.f, 56.f, 50.f));
+        float sunSize = enclosingRadius * 0.8f;
+        float sunDistance = enclosingRadius * 4.f;
+        vec3 sunCenter = gridCenter + vec3(sunDistance * 0.6f, sunDistance, sunDistance * 0.3f);
+        add_quad(scene,
+                 sunCenter + vec3(-sunSize, 0.f, -sunSize), sunCenter + vec3(sunSize, 0.f, -sunSize),
+                 sunCenter + vec3(sunSize, 0.f, sunSize),   sunCenter + vec3(-sunSize, 0.f, sunSize), sun);
     }
 }
 
@@ -1968,8 +2004,6 @@ struct PbrtSceneSettings {
     float environmentIntensity = 1.f;
     float environmentRotationDegrees = 0.f;
 };
-static VolumeGrid g_volumeGrid;                          // host side, for the bounds and the majorant
-static const nanovdb::FloatGrid* g_volumeDeviceGrid = nullptr;
 static float g_phaseGOverride = 0.f;
 static bool g_phaseGWasSet = false;
 static std::string g_pbrtPath;
@@ -2455,6 +2489,7 @@ __host__ hostScene setup_scene(SceneChoice sceneChoice){
         case SceneChoice::LivingRoom: buildLivingRoomScene(scene); break;
         case SceneChoice::Sibenik:    buildSibenikScene(scene);    break;
         case SceneChoice::Dragon:     buildDragonScene(scene);     break;
+        case SceneChoice::Cloud:      buildCloudScene(scene);      break;
         case SceneChoice::Staircase:
         case SceneChoice::Barcelona:
         case SceneChoice::Bathroom:
@@ -4100,6 +4135,17 @@ int main(int argc,char** argv) {
         cam.look_at = vec3(15.f, 9.f, 0.f);
         cam.vfov = 60.f;
         cam.focus_distance = 20.f;
+    }
+    if (sceneChoice == SceneChoice::Cloud && g_volumeDeviceGrid){
+        vec3 gridMinimum(g_volumeGrid.worldMinimum[0], g_volumeGrid.worldMinimum[1], g_volumeGrid.worldMinimum[2]);
+        vec3 gridMaximum(g_volumeGrid.worldMaximum[0], g_volumeGrid.worldMaximum[1], g_volumeGrid.worldMaximum[2]);
+        vec3 gridCenter = (gridMinimum + gridMaximum) * 0.5f;
+        float enclosingRadius = (gridMaximum - gridMinimum).length() * 0.5f;
+        cam.look_from = gridCenter + vec3(0.f, 0.f, enclosingRadius * 3.2f);
+        cam.look_at = gridCenter;
+        cam.vfov = 40.f;
+        cam.focus_distance = enclosingRadius * 3.2f;
+        cam.backround_color = vec3(0.06f, 0.10f, 0.18f);
     }
     if (g_pbrtSettings.hasCamera){
         cam.look_from = g_pbrtSettings.lookFrom;
