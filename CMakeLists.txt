@@ -23,6 +23,10 @@ option(MONOCUDA_BENCH "Build the benchmark target" OFF)
 #   minipbrt  - pbrt-v3 scene parser (MIT)
 #   stb       - stb_image / stb_image_write, PNG/JPG/HDR decoding (public domain)
 #   tinyexr   - OpenEXR decoding, uses its bundled miniz (BSD)
+#   nanovdb   - header-only VDB grids, read on the host and sampled on the
+#               device; only the nanovdb/ subdirectory of the openvdb repo is
+#               used, and its read and sample paths need neither OpenVDB
+#               itself nor TBB (Apache-2.0)
 # SOURCE_SUBDIR points at a directory without a CMakeLists.txt on purpose, so
 # FetchContent only downloads the sources and we compile what we need below.
 include(FetchContent)
@@ -38,10 +42,16 @@ FetchContent_Declare(tinyexr
     GIT_REPOSITORY https://github.com/syoyo/tinyexr.git
     GIT_TAG        e48a52fb3711da47494e518a229f04aa5ae8e0ac
     SOURCE_SUBDIR  cmake_not_used)
-FetchContent_MakeAvailable(minipbrt stb tinyexr)
+FetchContent_Declare(nanovdb
+    GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openvdb.git
+    GIT_TAG        v12.0.1
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  cmake_not_used)
+FetchContent_MakeAvailable(minipbrt stb tinyexr nanovdb)
 
 add_library(monocuda_deps STATIC
     src/image_io.cpp
+    src/volume_io.cpp
     ${minipbrt_SOURCE_DIR}/minipbrt.cpp
     ${tinyexr_SOURCE_DIR}/deps/miniz/miniz.c)
 target_include_directories(monocuda_deps PUBLIC src)
@@ -49,7 +59,8 @@ target_include_directories(monocuda_deps SYSTEM PUBLIC
     ${minipbrt_SOURCE_DIR}
     ${stb_SOURCE_DIR}
     ${tinyexr_SOURCE_DIR}
-    ${tinyexr_SOURCE_DIR}/deps/miniz)
+    ${tinyexr_SOURCE_DIR}/deps/miniz
+    ${nanovdb_SOURCE_DIR}/nanovdb)
 target_compile_features(monocuda_deps PRIVATE cxx_std_17)
 
 add_executable(monocuda src/path_tracer.cu)

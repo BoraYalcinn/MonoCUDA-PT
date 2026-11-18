@@ -22,6 +22,7 @@
 
 #include "minipbrt.h"
 #include "image_io.h"
+#include "volume_io.h"
 
 #if defined(__unix__) || defined(__APPLE__)
     #include <unistd.h>
@@ -33,6 +34,11 @@
 
 #include "cuda_runtime.h"
 #include <curand_kernel.h>
+
+// only the data structure and the sampler, the file reading side lives in
+// volume_io.cpp so nvcc never sees NanoVDB's host IO code
+#include <nanovdb/NanoVDB.h>
+#include <nanovdb/math/SampleFromVoxels.h>
 
 
 #define MONOCUDA_PI 3.14159265358979323846f
@@ -767,6 +773,15 @@ __device__ float henyeyGreensteinPhasePdf(float cosTheta, float g) {
     float gSquared = g * g;
     float denominator = fmaxf(1.0f + gSquared - 2.0f * g * cosTheta, 1e-6f);
     return (1.0f - gSquared) / (4.0f * MONOCUDA_PI * denominator * sqrtf(denominator));
+}
+
+// Trilinear density lookup in world space. The grid carries its own
+// world-to-index transform, so the scene does not have to track one.
+__device__ inline float sampleVolumeDensity(const nanovdb::FloatGrid* densityGrid, const vec3& worldPoint) {
+    if (!densityGrid) return 0.0f;
+    const nanovdb::Vec3f indexPoint = densityGrid->worldToIndexF(nanovdb::Vec3f(worldPoint.x, worldPoint.y, worldPoint.z));
+    auto accessor = densityGrid->tree().getAccessor();
+    return nanovdb::math::createSampler<1>(accessor)(indexPoint);
 }
 
 __device__ float triangleSurfaceArea(const triangle_hot& tri) {
