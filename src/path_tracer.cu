@@ -1733,6 +1733,7 @@ static const char* scenePbrtPaths[] = {"", "", "", "", "", "",
     "models/pbrt-v3-scenes/pbrt-book/book.pbrt",
     "models/pbrt-v3-scenes/sanmiguel/sanmiguel.pbrt",
     "models/veach-bidir/scene.pbrt", "", ""};
+static const char* defaultCloudVolumePath = "models/wdas_cloud/wdas_cloud_quarter.nvdb";
 static const char* sceneDescriptions[] = {
     "Cornell box (small scene with a smoke sphere)",
     "Sponza atrium (262k triangles, needs models/sponza/sponza.obj)",
@@ -1746,7 +1747,7 @@ static const char* sceneDescriptions[] = {
     "The pbrt book cover, pbrt-v3 (23k triangles, two spherical area lights)",
     "San Miguel courtyard, pbrt-v3 (10.5M triangles, needs about 3 GB)",
     "Veach bidirectional test, pbrt-v3 (12k triangles, light through a door gap)",
-    "Heterogeneous cloud from a NanoVDB density grid (pass it with --volume FILE.nvdb)",
+    "Heterogeneous cloud from a NanoVDB density grid (models/wdas_cloud/wdas_cloud_quarter.nvdb, or --volume FILE.nvdb)",
     "pbrt-v3 scene file (camera, lights and materials come from the file, pass it with --pbrt)"
 };
 static const int sceneCount = 14;
@@ -1861,8 +1862,9 @@ __host__ void buildSponzaScene(hostScene& scene){
 // diameter of optical depth ~20 reads as a cloud whatever units the file uses.
 __host__ void buildCloudScene(hostScene& scene){
     if (!g_volumeDeviceGrid){
-        std::fprintf(stderr, "the cloud scene needs a density grid, pass --volume FILE.nvdb "
-                             "(.vdb files have to be converted first: vdb_tool -read in.vdb -write out.nvdb)\n");
+        std::fprintf(stderr, "the cloud scene found no density grid at %s, pass one with --volume FILE.nvdb "
+                             "(.vdb files have to be converted first: vdb_tool -read in.vdb -write out.nvdb)\n",
+                     defaultCloudVolumePath);
         return;
     }
 
@@ -4064,8 +4066,10 @@ int main(int argc,char** argv) {
 
     // The grid buffer is self-contained, so the device copy is the same bytes
     // and the material only has to carry a pointer into it.
-    if (!options.volumePath.empty()){
-        if (!loadNanoVdbGrid(options.volumePath.c_str(), g_volumeGrid)) return 1;
+    std::string volumePath = options.volumePath;
+    if (volumePath.empty() && sceneChoice == SceneChoice::Cloud) volumePath = defaultCloudVolumePath;
+    if (!volumePath.empty()){
+        if (!loadNanoVdbGrid(volumePath.c_str(), g_volumeGrid)) return 1;
         void* deviceGridBytes = nullptr;
         CUDA_CHECK(cudaMalloc(&deviceGridBytes, g_volumeGrid.gridBytes.size()));
         CUDA_CHECK(cudaMemcpy(deviceGridBytes, g_volumeGrid.gridBytes.data(), g_volumeGrid.gridBytes.size(), cudaMemcpyHostToDevice));
