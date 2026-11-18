@@ -81,7 +81,7 @@ void fetchDeviceInfo(){
         cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrMemoryClockRate, i);
         printf("Memory Clock Rate (KHz): %d\n", clockRateKHz);
         printf("Memory Bus Width (bits): %d\n",prop.memoryBusWidth);
-        printf("Peak Memory Bandwith (GB/s): %f\n",2.*clockRateKHz*(prop.memoryBusWidth/8)/1.0e6);
+        printf("Peak Memory Bandwidth (GB/s): %f\n",2.*clockRateKHz*(prop.memoryBusWidth/8.0)/1.0e6);
         printf("Total Global Memory: %lu\n",prop.totalGlobalMem);
         printf("Compute Capability: %d.%d\n",prop.major,prop.minor);
         printf("Number of SMs: %d\n",prop.multiProcessorCount);
@@ -228,6 +228,7 @@ __device__ vec3 sampleTexture(const Texture& texture, float u, float v) {
 }
 
 static bool readNextPpmInteger(FILE* file, int& value) {
+    if (feof(file) || ferror(file)) return false;     // an earlier read already reached the end
     int character = fgetc(file);
     while (character != EOF) {
         if (character == '#') {                       // comment line
@@ -264,6 +265,11 @@ static bool loadPpmAsRgba8(const char* filePath, int& imageWidth, int& imageHeig
         return false;
     }
 
+    if (feof(file) || ferror(file)){                  // nothing left after the header
+        fclose(file);
+        return false;
+    }
+
     std::vector<unsigned char> rgbPixels((size_t)imageWidth * imageHeight * 3);
     size_t readCount = fread(rgbPixels.data(), 1, rgbPixels.size(), file);
     fclose(file);
@@ -284,7 +290,7 @@ static bool loadPpmAsRgba8(const char* filePath, int& imageWidth, int& imageHeig
 static cudaTextureObject_t createImageTextureObject(const std::vector<unsigned char>& rgbaPixels, int imageWidth, int imageHeight, cudaArray_t& imageArray) {
     cudaChannelFormatDesc channelDescription = cudaCreateChannelDesc<uchar4>();
     CUDA_CHECK(cudaMallocArray(&imageArray, &channelDescription, imageWidth, imageHeight));
-    CUDA_CHECK(cudaMemcpy2DToArray(imageArray, 0, 0, rgbaPixels.data(), imageWidth * 4, imageWidth * 4, imageHeight, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy2DToArray(imageArray, 0, 0, rgbaPixels.data(), size_t(imageWidth) * 4, size_t(imageWidth) * 4, imageHeight, cudaMemcpyHostToDevice));
 
     cudaResourceDesc resourceDescription = {};
     resourceDescription.resType = cudaResourceTypeArray;
@@ -329,7 +335,10 @@ static bool loadPfmAsRgba32f(const char* filePath, int& imageWidth, int& imageHe
         fclose(file);
         return false;
     }
-    fgetc(file); // exactly one whitespace character separates the header from the pixels
+    if (fgetc(file) == EOF){ // exactly one whitespace character separates the header from the pixels
+        fclose(file);
+        return false;
+    }
     if(scale > 0.0f){
         std::fprintf(stderr, "big-endian PFM files are not supported\n");
         fclose(file);
@@ -571,8 +580,8 @@ public:
     float paddingToMakeMaxIntervalSixteenBytes;
 
 
-    __host__ __device__ AABB(){}
-    __host__ __device__ AABB(const vec3& minInterval_,const vec3& maxInterval_) : minInterval(minInterval_) , maxInterval(maxInterval_){}
+    __host__ __device__ AABB() : paddingToMakeMinIntervalSixteenBytes(0.f), paddingToMakeMaxIntervalSixteenBytes(0.f){}
+    __host__ __device__ AABB(const vec3& minInterval_,const vec3& maxInterval_) : minInterval(minInterval_), paddingToMakeMinIntervalSixteenBytes(0.f), maxInterval(maxInterval_), paddingToMakeMaxIntervalSixteenBytes(0.f){}
 };
 static_assert(sizeof(AABB) == 32,  "AABB must be exactly 32 bytes so one box is two 16-byte vector loads");
 static_assert(alignof(AABB) == 16, "AABB must be 16-byte aligned for LDG.128");
@@ -2047,7 +2056,7 @@ static int pbrtAddMesh(hostScene& scene, const minipbrt::TriangleMesh* mesh, con
 
         vec3 corners[3];
         for (int corner = 0; corner < 3; corner++){
-            const float* position = &mesh->P[cornerIndices[corner] * 3];
+            const float* position = &mesh->P[size_t(cornerIndices[corner]) * 3];
             corners[corner] = (pbrtTransformPoint(toWorld, vec3(position[0], position[1], position[2])));
         }
         if ((corners[1] - corners[0]).cross(corners[2] - corners[0]).length_squared() < 1e-24f) continue;
@@ -2056,14 +2065,14 @@ static int pbrtAddMesh(hostScene& scene, const minipbrt::TriangleMesh* mesh, con
         if (mesh->uv){
             vec2* uvTargets[3] = {&objectTriangle.uv0, &objectTriangle.uv1, &objectTriangle.uv2};
             for (int corner = 0; corner < 3; corner++){
-                const float* uv = &mesh->uv[cornerIndices[corner] * 2];
+                const float* uv = &mesh->uv[size_t(cornerIndices[corner]) * 2];
                 *uvTargets[corner] = vec2(uv[0], uv[1]);
             }
         }
         if (mesh->N){
             vec3* normalTargets[3] = {&objectTriangle.n0, &objectTriangle.n1, &objectTriangle.n2};
             for (int corner = 0; corner < 3; corner++){
-                const float* normal = &mesh->N[cornerIndices[corner] * 3];
+                const float* normal = &mesh->N[size_t(cornerIndices[corner]) * 3];
                 vec3 worldNormal = (pbrtTransformVector(toWorld, vec3(normal[0], normal[1], normal[2])));
                 if (worldNormal.length_squared() > 0.f) *normalTargets[corner] = worldNormal.normalize();
             }
@@ -2549,7 +2558,10 @@ static bool loadObject(hostScene& scene,const char* filePath,Material mat,vec3 t
         } else if (keyword == "mtllib"){
             std::string mtlFileName;
             while (lineStream >> mtlFileName){
-                if (!loadMtlFile(scene, objectDirectory + "/" + mtlFileName, objectDirectory, materialLibrary, textureCache, missingTextureCount)){
+                std::string mtlPath = objectDirectory;
+                mtlPath += '/';
+                mtlPath += mtlFileName;
+                if (!loadMtlFile(scene, mtlPath, objectDirectory, materialLibrary, textureCache, missingTextureCount)){
                     printf("OBJ '%s': could not open material library '%s'\n", filePath, mtlFileName.c_str());
                 }
             }
@@ -3730,7 +3742,6 @@ static RenderOptions parseCommandLine(int argc, char** argv){
             else if(std::strcmp(argv[argumentIndex], "aces") == 0) options.toneMap = ToneMapOption::ACES;
         }else if(std::strcmp(argv[argumentIndex], "--exposure") == 0 && argumentIndex + 1 < argc){
             ++argumentIndex;
-            float parsedExposure = (float)std::atof(argv[argumentIndex]);
             if(std::strcmp(argv[argumentIndex], "auto") == 0){
                 options.autoExposure = true;
             }else{

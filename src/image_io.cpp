@@ -61,5 +61,5 @@ bool loadImageRgbaFloat(const char* filePath, int& imageWidth, int& imageHeight,
 
 bool saveImageRgb8Png(const char* filePath, int imageWidth, int imageHeight, const std::vector<unsigned char>& rgbPixels){
     if ((size_t)imageWidth * imageHeight * 3 != rgbPixels.size()) return false;
-    return stbi_write_png(filePath, imageWidth, imageHeight, 3, rgbPixels.data(), imageWidth * 3) != 0;
+    return stbi_write_png(filePath, imageWidth, imageHeight, 3, rgbPixels.data(), (ptrdiff_t)imageWidth * 3) != 0;
 }
