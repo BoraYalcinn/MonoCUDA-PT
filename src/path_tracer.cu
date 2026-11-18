@@ -482,6 +482,7 @@ struct Material{
     float fuzz;
     float refractionIndex;
     float density = 0.f;
+    float phaseG = 0.f;   // Henyey-Greenstein asymmetry, 0 is isotropic
 };
 
 __device__ vec3 random_unit_vector(curandState* rngState){
@@ -537,6 +538,34 @@ __device__ vec3 isotropic_scatter_direction(curandState* rngState){
     float phi = 2.0f * MONOCUDA_PI * u2;
 
     return vec3(r * cosf(phi), r * sinf(phi), z);
+}
+
+// Henyey-Greenstein, sampled from its inverse CDF. The angle is measured against
+// the direction the ray was already travelling, so g > 0 keeps it going forward,
+// g < 0 turns it back and g = 0 reduces to the isotropic sphere above.
+__device__ vec3 henyeyGreenstein_scatter_direction(const vec3& incomingDirection, float g, curandState* rngState){
+    float u1 = curand_uniform(rngState);
+    float u2 = curand_uniform(rngState);
+
+    float cosTheta;
+    if (fabsf(g) < 1e-3f){
+        cosTheta = 1.0f - 2.0f * u1;                 // the isotropic limit, where the formula below cancels
+    } else {
+        float squareTerm = (1.0f - g * g) / (1.0f + g - 2.0f * g * u1);
+        cosTheta = (1.0f + g * g - squareTerm * squareTerm) / (2.0f * g);
+        cosTheta = fminf(fmaxf(cosTheta, -1.0f), 1.0f);
+    }
+
+    float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
+    float phi = 2.0f * MONOCUDA_PI * u2;
+
+    // an orthonormal basis around the incoming direction
+    vec3 forward = incomingDirection.normalize();
+    vec3 helperAxis = (fabsf(forward.x) > 0.9f) ? vec3(0.f, 1.f, 0.f) : vec3(1.f, 0.f, 0.f);
+    vec3 tangent = helperAxis.cross(forward).normalize();
+    vec3 bitangent = forward.cross(tangent);
+
+    return tangent * (sinTheta * cosf(phi)) + bitangent * (sinTheta * sinf(phi)) + forward * cosTheta;
 }
 
 // Constructors for material types
@@ -729,6 +758,16 @@ __device__ float lambertianCosinePdf(float cosineAtSurface) {
 // isotropic scattering spreads uniformly over the sphere, value and pdf are the same constant
 __device__ float isotropicPhasePdf() {
     return 0.25f / MONOCUDA_PI;
+}
+
+// Henyey-Greenstein phase function. It is normalized over the sphere, so like the
+// isotropic one its value and its pdf are the same number. cosTheta is measured
+// between the incoming and the outgoing propagation direction, and g = 0 gives
+// exactly isotropicPhasePdf() back.
+__device__ float henyeyGreensteinPhasePdf(float cosTheta, float g) {
+    float gSquared = g * g;
+    float denominator = fmaxf(1.0f + gSquared - 2.0f * g * cosTheta, 1e-6f);
+    return (1.0f - gSquared) / (4.0f * MONOCUDA_PI * denominator * sqrtf(denominator));
 }
 
 __device__ float triangleSurfaceArea(const triangle_hot& tri) {
