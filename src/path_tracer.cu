@@ -81,7 +81,7 @@ void fetchDeviceInfo(){
         cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrMemoryClockRate, i);
         printf("Memory Clock Rate (KHz): %d\n", clockRateKHz);
         printf("Memory Bus Width (bits): %d\n",prop.memoryBusWidth);
-        printf("Peak Memory Bandwith (GB/s): %f\n",2.*clockRateKHz*(prop.memoryBusWidth/8)/1.0e6);
+        printf("Peak Memory Bandwidth (GB/s): %f\n",2.*clockRateKHz*(prop.memoryBusWidth/8.0)/1.0e6);
         printf("Total Global Memory: %lu\n",prop.totalGlobalMem);
         printf("Compute Capability: %d.%d\n",prop.major,prop.minor);
         printf("Number of SMs: %d\n",prop.multiProcessorCount);
@@ -2047,7 +2047,7 @@ static int pbrtAddMesh(hostScene& scene, const minipbrt::TriangleMesh* mesh, con
 
         vec3 corners[3];
         for (int corner = 0; corner < 3; corner++){
-            const float* position = &mesh->P[cornerIndices[corner] * 3];
+            const float* position = &mesh->P[size_t(cornerIndices[corner]) * 3];
             corners[corner] = (pbrtTransformPoint(toWorld, vec3(position[0], position[1], position[2])));
         }
         if ((corners[1] - corners[0]).cross(corners[2] - corners[0]).length_squared() < 1e-24f) continue;
@@ -2056,14 +2056,14 @@ static int pbrtAddMesh(hostScene& scene, const minipbrt::TriangleMesh* mesh, con
         if (mesh->uv){
             vec2* uvTargets[3] = {&objectTriangle.uv0, &objectTriangle.uv1, &objectTriangle.uv2};
             for (int corner = 0; corner < 3; corner++){
-                const float* uv = &mesh->uv[cornerIndices[corner] * 2];
+                const float* uv = &mesh->uv[size_t(cornerIndices[corner]) * 2];
                 *uvTargets[corner] = vec2(uv[0], uv[1]);
             }
         }
         if (mesh->N){
             vec3* normalTargets[3] = {&objectTriangle.n0, &objectTriangle.n1, &objectTriangle.n2};
             for (int corner = 0; corner < 3; corner++){
-                const float* normal = &mesh->N[cornerIndices[corner] * 3];
+                const float* normal = &mesh->N[size_t(cornerIndices[corner]) * 3];
                 vec3 worldNormal = (pbrtTransformVector(toWorld, vec3(normal[0], normal[1], normal[2])));
                 if (worldNormal.length_squared() > 0.f) *normalTargets[corner] = worldNormal.normalize();
             }

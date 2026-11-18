@@ -25,3 +25,4 @@ models/*
 /cornell_*.png
 /render_*.png
 /*.ppm
+tidy.txt
