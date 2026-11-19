@@ -11,7 +11,7 @@ The renderer is deliberately kept in one file so that the source reads as a cont
 - **Camera:** pinhole and thin-lens (depth of field), motion blur through time-sampled rays and moving spheres.
 - **Textures:** solid, procedural checker and image textures with hardware-filtered sampling through `cudaTextureObject_t`.
 - **Geometry:** spheres and triangles in an LBVH (Morton codes plus the Karras parallel radix-tree build), traversed iteratively on the device.
-- **Scenes:** twelve selectable scenes, Wavefront OBJ/MTL loading (smooth shaded when the file carries vertex normals) and pbrt-v3 scene import.
+- **Scenes:** thirteen selectable scenes, Wavefront OBJ/MTL loading (smooth shaded when the file carries vertex normals) and pbrt-v3 scene import.
 - **Environment lighting:** any scene can be lit by an equirectangular HDR map, importance sampled from its luminance and combined with BSDF sampling and the area lights through MIS.
 - **Output:** linear accumulation buffer, exposure (manual or automatic), Reinhard/ACES tone mapping, sRGB transfer, PNG.
 - **Two execution models** that produce the same image, described next.
@@ -91,7 +91,7 @@ once after the last sample. `scripts/hdr2pfm.py` still converts `.hdr` to `.pfm`
 
 ## Gallery
 
-The twelve selectable scenes, each rendered at 5000 samples per pixel with Reinhard tone mapping. The scenes built in code render at 600x600; the pbrt scenes take their film resolution from their own `.pbrt` file. The full-size PNGs are in `docs/gallery/`.
+The thirteen selectable scenes, each rendered at 5000 samples per pixel with Reinhard tone mapping. The scenes built in code render at 600x600; the pbrt scenes take their film resolution from their own `.pbrt` file, and the cloud uses the 333x180 of the reference scene shipped with the data set. The full-size PNGs are in `docs/gallery/`.
 
 | | |
 |---|---|
@@ -101,6 +101,7 @@ The twelve selectable scenes, each rendered at 5000 samples per pixel with Reinh
 | <img src="docs/gallery/Scene7_Staircase_Reinhard_5000spp.png" width="420"><br>**`staircase`**: Bitterli's pbrt-v3 staircase, 720x1280. | <img src="docs/gallery/Scene8_Barcelona_Reinhard_5000spp.png" width="420"><br>**`barcelona`**: the pavilion, 1600x850; the architecture only (130k triangles). |
 | <img src="docs/gallery/Scene9_Bathroom_Reinhard_5000spp.png" width="420"><br>**`bathroom`**: the contemporary bathroom, 400x400. | <img src="docs/gallery/Scene10_Book_Reinhard_5000spp.png" width="420"><br>**`book`**: the pbrt book cover scene, 1280x720. |
 | <img src="docs/gallery/Scene11_Sanmiguel_Reinhard_5000spp.png" width="420"><br>**`sanmiguel`**: the San Miguel courtyard, 726x1600. | <img src="docs/gallery/Scene12_Lamps_Reinhard_5000spp.png" width="420"><br>**`veach_bidir`**: the Veach bidirectional test room, 1024x1024 (the file is named `Scene12_Lamps`). |
+| <img src="docs/gallery/Scene13_Cloud_Reinhard_5000spp.png" width="420"><br>**`cloud`**: the Walt Disney Animation Studios cloud, a heterogeneous NanoVDB density grid traced with delta and ratio tracking. Camera, lights, density scale and the 0.877 phase asymmetry come from the reference scene in the data set. | |
 
 The point and spot lights of the pbrt scenes are emulated with small emitters and their `distant` lights with a bright quad far away, so the lighting of the staircase, the bathroom, the book cover and San Miguel approximates what pbrt renders rather than matching it.
 
