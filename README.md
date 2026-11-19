@@ -235,7 +235,6 @@ These are not implemented, although I will be moving on with my next big project
 - SAH BVH build; motion-aware BVH; `const __restrict__` kernel parameters and child bounds stored inside the parent BVH node (the remaining open points of the memory-access audit)
 - Microfacet (GGX) BSDF, energy-conserving material blending, normal mapping, roughness and metallic maps
 - Sphere light sampling; stratified or low-discrepancy sampling
-- Heterogeneous volumes (3D density grid, for smoke and cloud data)
 - Material-sorted shading
 - Denoiser (edge-avoiding à-trous filter on albedo-demodulated irradiance)
 - A benchmark harness reporting rays/s at fixed sample counts
