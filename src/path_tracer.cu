@@ -4101,9 +4101,9 @@ int main(int argc,char** argv) {
     int numberOfPixels_X = 600;
     int numberOfPixels_Y = 600;
     if (sceneChoice == SceneChoice::Cloud){
-        // the reference film is 333x180, kept at three times that
-        numberOfPixels_X = 999;
-        numberOfPixels_Y = 540;
+        // the reference film, exactly
+        numberOfPixels_X = 333;
+        numberOfPixels_Y = 180;
     }
     if (g_pbrtSettings.imageWidth > 0 && g_pbrtSettings.imageHeight > 0){
         numberOfPixels_X = g_pbrtSettings.imageWidth;
@@ -4182,8 +4182,11 @@ int main(int argc,char** argv) {
         cam.backround_color = vec3(0.03f, 0.07f, 0.23f);
         // a cloud needs hundreds of scattering events, so roulette stops culling
         // and the depth limit becomes the thing that ends a path
-        cam.russianRouletteCap = 1.0f;
-        cam.max_depth = 256;
+        // roulette stays unbiased and averages about twenty scattering events,
+        // while the depth limit is only a backstop; capping depth low instead
+        // truncates paths and darkens the cloud
+        cam.russianRouletteCap = 0.95f;
+        cam.max_depth = 1000;
     }
     if (g_pbrtSettings.hasCamera){
         cam.look_from = g_pbrtSettings.lookFrom;
