@@ -1045,11 +1045,9 @@ struct TraversalState{
     ClosestHitCandidate nearestHit;
 
     int stackIdx[TRAVERSAL_STACK_CAPACITY];
-    bool stackIsLeaf[TRAVERSAL_STACK_CAPACITY];
     int stackPointer;
 
     int nodeIdx;
-    bool nodeIsLeaf;
 };
 
 
@@ -1097,14 +1095,12 @@ public:
 
         const int MAX_STACK = 64;
         int stackIdx[MAX_STACK];
-        bool stackIsLeaf[MAX_STACK];
         int stackPtr = 0;
 
         int nodeIdx = 0;
-        bool nodeIsLeaf = false;
 
         while (true) {
-            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+            const BVH_Node& node = d_internalNodes[nodeIdx];
 
             int childLIdx = node.leftChild;
             bool childLIsLeaf = node.leftIsLeaf;
@@ -1141,15 +1137,12 @@ public:
                 if (stackPtr == 0) break;
                 stackPtr--;
                 nodeIdx = stackIdx[stackPtr];
-                nodeIsLeaf = stackIsLeaf[stackPtr];
             } else {
                 if (traverseL && traverseR) {
                     stackIdx[stackPtr] = childRIdx;
-                    stackIsLeaf[stackPtr] = childRIsLeaf;
                     stackPtr++;
                 }
                 nodeIdx = traverseL ? childLIdx : childRIdx;
-                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
             }
         }
 
@@ -1160,14 +1153,12 @@ public:
 
         const int MAX_STACK = 64;
         int stackIdx[MAX_STACK];
-        bool stackIsLeaf[MAX_STACK];
         int stackPtr = 0;
 
         int nodeIdx = 0;
-        bool nodeIsLeaf = false;
 
         while (true) {
-            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+            const BVH_Node& node = d_internalNodes[nodeIdx];
 
             int childLIdx = node.leftChild;
             bool childLIsLeaf = node.leftIsLeaf;
@@ -1204,15 +1195,12 @@ public:
                 if (stackPtr == 0) break;
                 stackPtr--;
                 nodeIdx = stackIdx[stackPtr];
-                nodeIsLeaf = stackIsLeaf[stackPtr];
             } else {
                 if (traverseL && traverseR) {
                     stackIdx[stackPtr] = childRIdx;
-                    stackIsLeaf[stackPtr] = childRIsLeaf;
                     stackPtr++;
                 }
                 nodeIdx = traverseL ? childLIdx : childRIdx;
-                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
             }
         }
         return false;
@@ -1223,14 +1211,12 @@ public:
         int  querySelfIdx = d_primitiveRefs[queryObjectIdx].primitiveIndex;
         const int MAX_STACK = 64;
         int  stackIdx[MAX_STACK];
-        bool stackIsLeaf[MAX_STACK];
         int  stackPtr = 0;
 
-        int  nodeIdx = 0;      // root = d_internalNodes[0]
-        bool nodeIsLeaf = false;
+        int nodeIdx = 0;      // root = d_internalNodes[0]
 
         while (true) {
-            const BVH_Node& node = nodeIsLeaf ? d_leafNode[nodeIdx] : d_internalNodes[nodeIdx];
+            const BVH_Node& node = d_internalNodes[nodeIdx];
 
             int  childLIdx = node.leftChild;
             bool childLIsLeaf = node.leftIsLeaf;
@@ -1263,15 +1249,12 @@ public:
                 if (stackPtr == 0) break;
                 stackPtr--;
                 nodeIdx = stackIdx[stackPtr];
-                nodeIsLeaf = stackIsLeaf[stackPtr];
             } else {
                 if (traverseL && traverseR) {
                     stackIdx[stackPtr] = childRIdx;
-                    stackIsLeaf[stackPtr] = childRIsLeaf;
                     stackPtr++;
                 }
                 nodeIdx = traverseL ? childLIdx : childRIdx;
-                nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
             }
         }
     }
@@ -1287,12 +1270,11 @@ public:
 
         traversal.stackPointer = 0;
         traversal.nodeIdx = 0;
-        traversal.nodeIsLeaf = false;
     }
 
     // Executes exactly one iteration of the traverseRay loop. Returns true when the traversal is finished.
     __device__ bool stepTraversal(TraversalState& traversal, const sphere* spheres, TriangleView triangles) const {
-        const BVH_Node& node = traversal.nodeIsLeaf ? d_leafNode[traversal.nodeIdx] : d_internalNodes[traversal.nodeIdx];
+        const BVH_Node& node = d_internalNodes[traversal.nodeIdx];
 
         int childLIdx = node.leftChild;
         bool childLIsLeaf = node.leftIsLeaf;
@@ -1328,15 +1310,12 @@ public:
             if (traversal.stackPointer == 0) return true;
             traversal.stackPointer--;
             traversal.nodeIdx = traversal.stackIdx[traversal.stackPointer];
-            traversal.nodeIsLeaf = traversal.stackIsLeaf[traversal.stackPointer];
         } else {
             if (traverseL && traverseR) {
                 traversal.stackIdx[traversal.stackPointer] = childRIdx;
-                traversal.stackIsLeaf[traversal.stackPointer] = childRIsLeaf;
                 traversal.stackPointer++;
             }
             traversal.nodeIdx = traverseL ? childLIdx : childRIdx;
-            traversal.nodeIsLeaf = traverseL ? childLIsLeaf : childRIsLeaf;
         }
         return false;
     }
