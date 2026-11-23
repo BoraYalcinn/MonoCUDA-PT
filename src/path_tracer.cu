@@ -1044,11 +1044,6 @@ struct TraversalState{
 
     ClosestHitCandidate nearestHit;
 
-    // Only internal nodes are ever pushed: a child is descended into only when
-    // it is not a leaf, so the node a pop returns cannot be one either. That is
-    // why there is no leaf flag beside the index. Push a leaf here one day and
-    // the flag has to come back, packed into the index's sign bit rather than
-    // as a second array.
     int stackIdx[TRAVERSAL_STACK_CAPACITY];
     int stackPointer;
 
